@@ -93,7 +93,8 @@ func TestGraphOutputPathsReadsOnlyResultRows(t *testing.T) {
 		{"json-line-in-persisted-preview", "<persisted-output>\nOutput too large (31.1KB). Full output saved to: /tmp/x/tool-results/b.txt\n\nPreview (first 2KB):\n" +
 			`{"format_version":1,"partial_failures":[{"file_path":"web/app.min.js"}],"results":[{"file_path":"internal/a/b.go","snippet":"x`, []string{b}},
 		// Escapes in a clipped value are decoded, not cut at the first backslash.
-		{"json-clipped-escaped-path", `{"results":[{"file_path":"internal\u002fa\\x\"y.go"},{"file_path":"internal/a/a.go"}],"resu`, []string{"internal/a\\x\"y.go", a}},
+		// (No backslash in the decoded value: normaliseOverlapPath turns one into "/" on Windows.)
+		{"json-clipped-escaped-path", `{"results":[{"file_path":"internal\u002fa\"y.go"},{"file_path":"internal/a/a.go"}],"resu`, []string{"internal/a\"y.go", a}},
 		{"json-clipped-before-any-answer", `{"partial_failures":[{"file_path":"web/app.min.js"}],"profile":"fast","resu`, nil},
 		// Prose and lowercase selectors are not files, located or not.
 		{"prose-eg", "see e.g. the docs", nil},
