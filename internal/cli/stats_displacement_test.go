@@ -106,6 +106,7 @@ var followUpKeys = map[string]string{
 	"overlapping": "graph_locate_follow_up_read_overlapping", "different": "graph_locate_follow_up_read_different_region",
 	"unknown": "graph_locate_follow_up_read_unknown_span", "censored": "graph_locate_censored",
 	"error": "graph_locate_error", "ineligible": "graph_locate_ineligible",
+	"shared": "graph_locate_follow_up_read_shared",
 }
 
 // assertFollowUp checks EVERY class count; classes not named must be zero.
@@ -116,7 +117,7 @@ func assertFollowUp(t *testing.T, raw map[string]any, want map[string]int64) {
 			t.Errorf("%s = %d, want %d", key, got, want[class])
 		}
 	}
-	reads := want["overlapping"] + want["different"] + want["unknown"]
+	reads := want["overlapping"] + want["different"] + want["unknown"] + want["shared"]
 	if got := rawInt(t, raw, "graph_locate_follow_up_read"); got != reads {
 		t.Errorf("graph_locate_follow_up_read = %d, want %d", got, reads)
 	}
@@ -327,7 +328,8 @@ func TestFollowUpContract3NoDoubleAttribution(t *testing.T) {
 	// Sequential: the second call is a re-query of the first; the read belongs to the second.
 	raw := sessionOf(t, graphSearch(body), graphSearch(body), readFile("/r/a.go", "x"))
 	assertFollowUp(t, raw, map[string]int64{"requery": 1, "overlapping": 1})
-	// Parallel: both delivered before the read. Only the latest delivery gets it.
+	// Parallel: both delivered before the read. Only the latest delivery gets its span; the other
+	// result read the same file, so it is a SHARED read — never censored or no follow-up.
 	ts := statsTime(0)
 	dir := t.TempDir()
 	lines := []string{
@@ -339,7 +341,7 @@ func TestFollowUpContract3NoDoubleAttribution(t *testing.T) {
 	}
 	lines = append(lines, dispLines(t, "r", []dispCall{readFile("/r/a.go", "x")})...)
 	writeTranscript(t, dir, "s.jsonl", lines...)
-	assertFollowUp(t, dispReport(t, dir), map[string]int64{"overlapping": 1, "censored": 1})
+	assertFollowUp(t, dispReport(t, dir), map[string]int64{"overlapping": 1, "shared": 1})
 
 	// Which one gets it: the LATEST delivery. g1 delivered lines 1-3, g2 (delivered last) lines
 	// 50-52 of the same file; a read of lines 1-3 attributed to g2 is a different-region read.
@@ -353,7 +355,7 @@ func TestFollowUpContract3NoDoubleAttribution(t *testing.T) {
 	}
 	lines = append(lines, dispLines(t, "r", []dispCall{readSpan("/r/a.go", 1, 3, "x")})...)
 	writeTranscript(t, dir, "s.jsonl", lines...)
-	assertFollowUp(t, dispReport(t, dir), map[string]int64{"different": 1, "censored": 1})
+	assertFollowUp(t, dispReport(t, dir), map[string]int64{"different": 1, "shared": 1})
 }
 
 // 4. Out-of-order completion binds by tool_use id; a subagent's calls never enter the parent's
@@ -593,7 +595,7 @@ func TestGraphDeliveredSpans(t *testing.T) {
 
 func TestPathsOverlapIsWholeComponentSuffix(t *testing.T) {
 	t.Parallel()
-	named := graphOutputPaths(`{"file_path":"internal/cli/stats.go","symbol_id":"x:Go:internal/cli/stats.go:function:F"} calls fmt.Errorf and store.List at ./main.go:3`)
+	named := graphOutputPaths("1. internal/cli/stats.go:770-790 F [complete]\ncalls fmt.Errorf and store.List at ./main.go:3\n")
 	for _, want := range []string{"internal/cli/stats.go", "main.go"} {
 		if !pathsOverlap(named, []string{want}) {
 			t.Errorf("named %v should contain %q", named, want)
@@ -688,14 +690,14 @@ func TestStatsJSONFollowUpKeysAreAdditive(t *testing.T) {
 // the poisoned class would have been visible.
 func TestFollowUpCacheNeverMixesClassifierVersions(t *testing.T) {
 	t.Parallel()
-	if statsCacheSchema != "v3" {
+	if statsCacheSchema != "v4" {
 		t.Fatalf("statsCacheSchema = %q: a classifier change needs a schema bump and this test updated", statsCacheSchema)
 	}
 	ts := statsTime(0)
 	const count = 10
 	body := searchBody(t, "src/a.go", 1, 3)
 	for run := range 2 {
-		schema := []string{"v2", statsCacheSchema}[run]
+		schema := []string{"v3", statsCacheSchema}[run]
 		t.Run(schema, func(t *testing.T) {
 			t.Parallel()
 			sessions, cacheDir := t.TempDir(), t.TempDir()
