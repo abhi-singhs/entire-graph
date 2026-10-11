@@ -1913,8 +1913,11 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 	// makes anyway — a repo-wide grep, a fumbled test invocation, and the read that discovers a
 	// switch it forgot to extend — which is the property the reference blocks above lack. They are
 	// additive and separately capped; see search_blocks.go.
+	verifyAboveScope, closeVerifyAboveScope := newSearchVerifyAboveScope(ctx, repo, snapshot.Header.Commit, useHead)
+	defer closeVerifyAboveScope()
 	verifyEvidence := searchVerifyEvidence{
 		read: read, files: selection.allFiles, prefix: options.VerifyPrefix, preFixStatus: options.VerifyPreFixStatus,
+		aboveScope: verifyAboveScope,
 	}
 	// The three agent-asked blocks read files the RANKING never asked for: a bounded set of files
 	// containing one literal, a handful of switch sites, and the build manifests above the top hit.

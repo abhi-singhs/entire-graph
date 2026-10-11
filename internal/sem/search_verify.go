@@ -156,6 +156,10 @@ type searchVerifyEvidence struct {
 	// prefix is the caller's --verify-prefix decorator, carried here because the derivations build the
 	// command string and the renderer must not have to re-parse it.
 	prefix string
+	// aboveScope resolves, on first use, the part of the checkout above the searched scope: nil, or
+	// false from it, when --repo is the git toplevel or no toplevel can be read. Lazy, because it
+	// costs a Git subprocess and is only consulted after every in-scope walk has declined.
+	aboveScope func() (searchVerifyAboveScope, bool)
 }
 
 // file returns a repository file's content, or false. It never reads more than
@@ -248,6 +252,17 @@ func buildSearchVerifyCommand(
 			command.Tier = searchVerifyTierSuite
 		}
 	}
+	runnerEvidence := &evidence
+	if command == nil {
+		// Still inside the search, the walks above stopped at --repo. When --repo is a subdirectory of
+		// the checkout the build manifest is routinely above it (a Go module's go.mod at the toplevel,
+		// a workspace's root package.json), and stopping there printed "none derivable" for a tree that
+		// has one. So the walk continues to the git toplevel, narrow before suite as it would have run
+		// from there. See deriveSearchVerifyAboveScope.
+		if above, aboveEvidence := deriveSearchVerifyAboveScope(subject, &evidence); above != nil {
+			command, runnerEvidence = above, aboveEvidence
+		}
+	}
 	if command == nil {
 		// Third rung: does what I just wrote PARSE? A different question from "does it behave", labelled
 		// as such, and the only rung that fires when no manifest in the tree licenses a test command.
@@ -258,7 +273,7 @@ func buildSearchVerifyCommand(
 	}
 	command.Prefix, command.PreFixStatus = evidence.prefix, evidence.preFixStatus
 	// The runner check ANNOTATES; it never suppresses. See searchVerifyRunnerNote.
-	command.RunnerMissing = searchVerifyRunnerMissing(command.Command, &evidence)
+	command.RunnerMissing = searchVerifyRunnerMissing(command.Command, runnerEvidence)
 	// DEGRADE, never delete. Returning nil on overflow reintroduced silent absence through a byte
 	// budget — the exact failure the residual floor exists to prevent. The command line is the
 	// irreducible part, so provenance yields first and the target second.
@@ -529,12 +544,28 @@ func searchVerifyMirrorTest(sourcePath string, evidence *searchVerifyEvidence) s
 // workspace stanza, or a monorepo leaf `package.json` with no test runner in it, is evidence about
 // the tree, not about how to run a test, so the walk continues outward to the manifest that is.
 func deriveSearchVerifyCommand(subject searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
-	dir := path.Dir(subject.sourcePath)
+	return searchVerifyWalk(searchVerifyStartDir(subject.sourcePath), subject, evidence, searchVerifyDerivations)
+}
+
+// searchVerifyStartDir is the directory a manifest walk for filePath begins in, "" for the root.
+func searchVerifyStartDir(filePath string) string {
+	dir := path.Dir(filePath)
 	if dir == "." || dir == "/" {
-		dir = ""
+		return ""
 	}
+	return dir
+}
+
+// searchVerifyWalk consults every derivation at dir and then at each ancestor up to and including
+// the root (""), and returns the first command any of them licenses.
+func searchVerifyWalk(
+	dir string,
+	subject searchVerifySubject,
+	evidence *searchVerifyEvidence,
+	derivations []func(string, searchVerifySubject, *searchVerifyEvidence) *SearchVerifyCommand,
+) *SearchVerifyCommand {
 	for depth := 0; depth <= searchVerifyMaxDepth; depth++ {
-		for _, derive := range searchVerifyDerivations {
+		for _, derive := range derivations {
 			if command := derive(dir, subject, evidence); command != nil {
 				return command
 			}
@@ -573,27 +604,7 @@ var searchVerifyDerivations = []func(string, searchVerifySubject, *searchVerifyE
 // and returns the first recognized ecosystem's canonical suite command. It does not require a
 // covering test; even when one exists, its manifest may not license a narrow command.
 func deriveSearchVerifySuiteCommand(subject searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
-	dir := path.Dir(subject.sourcePath)
-	if dir == "." || dir == "/" {
-		dir = ""
-	}
-	for depth := 0; depth <= searchVerifyMaxDepth; depth++ {
-		for _, derive := range searchVerifySuiteDerivations {
-			if command := derive(dir, subject, evidence); command != nil {
-				return command
-			}
-		}
-		if dir == "" {
-			break
-		}
-		parent := path.Dir(dir)
-		if parent == "." || parent == "/" || parent == dir {
-			dir = ""
-			continue
-		}
-		dir = parent
-	}
-	return nil
+	return searchVerifyWalk(searchVerifyStartDir(subject.sourcePath), subject, evidence, searchVerifySuiteDerivations)
 }
 
 // searchVerifySuiteDerivations mirrors searchVerifyDerivations, language-specific before generic, so
