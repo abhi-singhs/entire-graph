@@ -530,6 +530,13 @@ type ProviderSnapshotOptions struct {
 	// loadOrBuildSearchSnapshotPersisting). Internal wiring: it changes no
 	// snapshot content and is not part of any cache key.
 	coldComplete coldCompletePolicy
+	// onCompleteDerivation receives the header of the complete snapshot a
+	// selective view was successfully derived from (see
+	// loadOrBuildSearchSnapshotPersisting). A search reports the repository's
+	// coverage diagnostics from it, so a cold query that built the complete
+	// snapshot and a warm one that derived from it say the same thing. Internal
+	// wiring: it changes no snapshot content and is not part of any cache key.
+	onCompleteDerivation func(SnapshotHeader)
 }
 
 // coldCompletePolicy is the search's input to the cold-complete decision.
