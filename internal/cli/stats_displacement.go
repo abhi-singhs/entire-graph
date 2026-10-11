@@ -332,7 +332,8 @@ var graphJSONResultKeys = map[string]bool{
 }
 
 var (
-	graphJSONFilePathPattern = regexp.MustCompile(`"file_path"\s*:\s*"([^"\\]*)"`)
+	// The value is a whole JSON string literal, escapes included, decoded before use.
+	graphJSONFilePathPattern = regexp.MustCompile(`"file_path"\s*:\s*("(?:[^"\\]|\\.)*")`)
 	graphJSONOpenerPattern   = regexp.MustCompile(`"([A-Za-z_]+)"\s*:\s*[\[{]`)
 )
 
@@ -400,8 +401,9 @@ func graphClippedJSONPaths(text string) []string {
 				inAnswer = false
 			}
 		}
-		if inAnswer {
-			paths = append(paths, text[match[2]:match[3]])
+		var path string
+		if inAnswer && json.Unmarshal([]byte(text[match[2]:match[3]]), &path) == nil {
+			paths = append(paths, path)
 			if len(paths) >= maxGraphOutputPaths {
 				break
 			}
