@@ -221,3 +221,15 @@ Why sharing is sound: the cache is per user (`os.UserCacheDir`) and the key is a
 an entry depends on where the checkout lives once those fields are rebound.
 `TestCollidingRepoKeysShareEntriesUnderTheirOwnRoot` replaces the test that pinned the opposite.
 
+
+**Path-free is not scope-free (`search-snapshot-v20`, `provider-records-v13`).** The v19/v12 keys
+dropped the checkout path and with it the only term that separated a `--repo <subdir>` (or
+`ENTIRE_REPO_ROOT`) run from a run at the repository root. A subdirectory run lists only that
+subtree, with subdir-relative paths, yet its tree term is still the whole repository's
+`HEAD^{tree}`, so the two shared one address and each was served as the other: a root query after
+a `pkg/` one reported a hit with none of the root's symbols. Both keys now hash the
+checkout-relative scope, Git's `--show-prefix` of the requested directory (empty at the top
+level), and both envelopes record it; the loader restamps `repo_root` only for a checkout of the
+same scope. Worktrees and clones at the same tree and the same prefix still share
+(`TestCommittedTreeCacheKeysCarryTheCheckoutScope`, `TestSearchCacheNeverServesOneScopeToAnother`,
+`TestProviderRecordsCacheNeverReplaysOneScopeToAnother`).

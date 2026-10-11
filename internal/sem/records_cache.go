@@ -26,7 +26,10 @@ import (
 // v11 retires streams carrying the old diagnostic-count completeness status.
 // v12 retires entries keyed on the checkout path and envelopes that do not record
 // the root their header line was written for, which a path-free hit restamps.
-const providerRecordsCacheVersion = "provider-records-v12-" + IdentityRevision
+// v13 retires the path-free v12 entries that omitted the checkout-relative scope,
+// under which a `--repo <subdir>` stream was replayed for the repository root at
+// the same commit, and the other way round.
+const providerRecordsCacheVersion = "provider-records-v13-" + IdentityRevision
 
 // cachedProviderRecords is the on-disk envelope for a cached record stream. The
 // key alone is authoritative (sha256 over version+commit+tree+mode+profile+
@@ -49,9 +52,12 @@ type cachedProviderRecords struct {
 	// line's repo_root carries. The key is path-free, so a hit from another
 	// worktree or clone at the same commit restamps that one field
 	// (restampProviderRecordsRepoRoot) and misses when it cannot.
-	RepoRoot string           `json:"repo_root"`
-	Records  []byte           `json:"records"`
-	Summary  *SnapshotSummary `json:"summary,omitempty"`
+	RepoRoot string `json:"repo_root"`
+	// RepoScope is cacheCheckoutScope of RepoRoot. A hit from another checkout
+	// restamps repo_root only when that checkout has the same scope.
+	RepoScope string           `json:"repo_scope,omitempty"`
+	Records   []byte           `json:"records"`
+	Summary   *SnapshotSummary `json:"summary,omitempty"`
 }
 
 // providerRecordsKey derives the cache key for a record stream. It intentionally
@@ -101,6 +107,10 @@ func providerRecordsKeyForSchema(schemaVersion, absRepo, repositoryKey, provider
 	// Unlike the search cache, the full key is hashed even for local/<basename>:
 	// these bytes are replayed verbatim, so an ID namespace cannot be rewritten.
 	writeCacheKeyString(hash, "repository-key", repositoryKey)
+	// Path-free is not scope-free: a `--repo <subdir>` stream lists only that
+	// subtree, with subdir-relative paths, at the same commit and tree as the
+	// root's. See the "repository-scope" term in searchSnapshotKeyForSchema.
+	writeCacheKeyString(hash, "repository-scope", cacheCheckoutScope(absRepo))
 	writeCacheKeyString(hash, "provider-version", providerVersion)
 	writeCacheKeyString(hash, "commit", commit)
 	writeCacheKeyString(hash, "tree", tree)
@@ -204,6 +214,11 @@ func (transaction *ProviderRecordsCacheTransaction) Load() ([]byte, *SnapshotSum
 	) {
 		return nil, nil, false
 	}
+	// Restamp only between checkouts of the same scope (see cachedProviderRecords.RepoScope);
+	// the same root is the same checkout, so the scope lookup is paid only on a cross-checkout hit.
+	if cache.RepoRoot != transaction.absRepo && cache.RepoScope != cacheCheckoutScope(transaction.absRepo) {
+		return nil, nil, false
+	}
 	records, ok := restampProviderRecordsRepoRoot(cache.Records, cache.RepoRoot, transaction.absRepo)
 	if !ok {
 		return nil, nil, false
@@ -285,6 +300,7 @@ func (transaction *ProviderRecordsCacheTransaction) Store(records []byte, summar
 		Profile:         transaction.options.Profile,
 		MaxParseBytes:   transaction.options.MaxParseBytes,
 		RepoRoot:        transaction.absRepo,
+		RepoScope:       cacheCheckoutScope(transaction.absRepo),
 		Records:         records,
 		Summary:         summary,
 	}

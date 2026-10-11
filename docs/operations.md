@@ -100,7 +100,10 @@ term because working-tree snapshots cannot receive persistent keys.
 over graph-shaping inputs.
 
 The checkout path is not a key term, so every worktree and clone at the same
-tree shares one entry. On a hit the loader rewrites what is specific to the
+tree shares one entry. The checkout-relative scope is: a `--repo <subdir>` run
+indexes only that subtree, so it is keyed on Git's prefix for that directory
+and never shares an entry with the repository root, or with another
+subdirectory. On a hit the loader rewrites what is specific to the
 checkout serving it: `repo_root` (which `def`, `neighbors`, and `impact` read
 source through), the commit, and, for a remote-less checkout, the
 `local/<name>` namespace in every symbol and file ID.

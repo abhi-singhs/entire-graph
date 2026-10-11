@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/entireio/entire-graph/internal/gitutil"
 )
 
 // searchSnapshotCacheVersion names the on-disk cache directory and is hashed
@@ -35,8 +37,11 @@ import (
 // local build — so only the namespace can keep those lines from being served as authoritative.
 // Bump it again whenever the name-line producer's rules change. v19 retires the entries keyed on
 // the checkout path: the key is now path-free (see searchSnapshotKeyForSchema), so every v18 entry
-// is unreachable by hash and would otherwise sit in a live version directory.
-const searchSnapshotCacheVersion = "search-snapshot-v19-" + IdentityRevision
+// is unreachable by hash and would otherwise sit in a live version directory. v20 retires the
+// path-free v19 entries that omitted the checkout-relative scope, under which a `--repo <subdir>`
+// snapshot (only that subtree, subdir-relative paths) was served to the repository root at the
+// same tree, and the other way round.
+const searchSnapshotCacheVersion = "search-snapshot-v20-" + IdentityRevision
 
 type cachedSymbolByteRange struct {
 	Start int `json:"start"`
@@ -88,6 +93,11 @@ type cachedSearchSnapshot struct {
 	// it came from does, and the generation is read before the complete snapshot
 	// is, so such a writer necessarily stamps the generation being retired.
 	DerivedFrom string `json:"derived_from,omitempty"`
+	// RepoScope is the checkout-relative scope the snapshot was built for
+	// (cacheCheckoutScope of Header.RepoRoot). The key already carries it; the
+	// loader re-checks it before restamping Header.RepoRoot for another checkout,
+	// so a root is only ever rewritten between two checkouts of the same scope.
+	RepoScope string `json:"repo_scope,omitempty"`
 	// UnmergedDataFlowEdges carries ProviderSnapshot.unmergedDataFlowEdges as
 	// sorted [from, to] pairs, so a view derived from a cached snapshot discloses
 	// the unmerged DATA_FLOWS edges it retains exactly as one derived in memory.
@@ -729,6 +739,7 @@ func newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom stri
 		Profile:         options.Profile,
 		MaxParseBytes:   options.MaxParseBytes,
 		Worktree:        options.Worktree,
+		RepoScope:       cacheCheckoutScope(snapshot.Header.RepoRoot),
 		Snapshot:        snapshot,
 	}
 	for key := range snapshot.unmergedDataFlowEdges {
@@ -1138,6 +1149,15 @@ func searchSnapshotKeyForSchema(schemaVersion, absRepo, repositoryKey, providerV
 	// one term for all local/<basename> keys, whose IDs the loader rewrites into
 	// the serving checkout's namespace. See searchCacheRepositoryKeyTerm.
 	writeCacheKeyString(hash, "repository-key", searchCacheRepositoryKeyTerm(repositoryKey))
+	// The checkout-relative SCOPE is in the key, because a checkout path is not the
+	// only thing the path-free key dropped. An explicit `--repo <subdir>` (or
+	// ENTIRE_REPO_ROOT) indexes only that subtree, with subdir-relative paths,
+	// while the tree term is still the whole repository's HEAD^{tree}, so without
+	// this term the subtree snapshot and the root snapshot share one address and
+	// each is served as the other: a root query after a subdir one reported a hit
+	// with none of the root's symbols. Two worktrees or clones at the same tree and
+	// the same prefix still share; that is what the path-free key is for.
+	writeCacheKeyString(hash, "repository-scope", cacheCheckoutScope(absRepo))
 	writeCacheKeyString(hash, "provider-version", providerVersion)
 	writeCacheKeyString(hash, "tree", tree)
 	writeCacheKeyString(hash, "profile", string(options.Profile))
@@ -1225,6 +1245,27 @@ func restampCachedSearchSnapshotCommit(cache cachedSearchSnapshot, commit string
 	return cache
 }
 
+// cacheCheckoutScope is the checkout-relative scope term of the committed-tree
+// cache keys: Git's --show-prefix of absRepo ("" at a checkout's top level,
+// "pkg/" for a `--repo <top>/pkg` run), which is what decides the subtree a build
+// lists and the coordinates its paths are written in. It is identical across
+// worktrees and clones of one repository, so they keep sharing entries. When Git
+// cannot answer (or may not be run on this metadata), the term falls back to the
+// absolute path: that entry is then private to the directory, never shared with a
+// scope it might not match.
+func cacheCheckoutScope(absRepo string) string {
+	if absRepo == "" {
+		return "path:"
+	}
+	ctx := context.Background()
+	if gitMetadataSafeForSubprocessContext(ctx, absRepo) {
+		if prefix, err := gitutil.RepoPrefix(ctx, absRepo); err == nil {
+			return "prefix:" + filepath.ToSlash(prefix)
+		}
+	}
+	return "path:" + filepath.Clean(absRepo)
+}
+
 // searchCacheRepositoryKeyTerm is the repository-identity term of a search
 // snapshot key. A gh/<owner>/<name> key is globally unique and is hashed as is.
 // Every local/<basename> key hashes to one term: two remote-less clones of one
@@ -1250,6 +1291,13 @@ func loadCachedSearchSnapshot(
 ) (cachedSearchSnapshot, bool) {
 	cached, err := readSearchSnapshot(entry)
 	if err != nil {
+		return cachedSearchSnapshot{}, false
+	}
+	// Restamp the root only between checkouts of the same scope. The key already
+	// separates scopes; this keeps a hand-edited, colliding or pre-scope entry from
+	// being adopted by a checkout whose subtree it does not describe. Same root
+	// means same checkout, so the scope lookup is paid only on a cross-checkout hit.
+	if cached.Snapshot.Header.RepoRoot != absRepo && cached.RepoScope != cacheCheckoutScope(absRepo) {
 		return cachedSearchSnapshot{}, false
 	}
 	cached = rebindCachedSearchSnapshot(cached, absRepo, repositoryKey)
