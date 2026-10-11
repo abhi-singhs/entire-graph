@@ -225,6 +225,9 @@ type goRouteClosureEffect struct {
 	creationCallback *ast.FuncLit
 	escaped          bool
 	applying         bool
+	// rewrites: some write carries rewrite-middleware evidence. Only such a
+	// descriptor seeds a branch join (visibleClosureRewriteTargets).
+	rewrites bool
 }
 
 type goRouteClosureRewriteTarget struct {
@@ -413,6 +416,11 @@ type goRouteResolver struct {
 	safeClosureUses       map[*ast.Ident]bool
 	closureCollector      *goRouteClosureEffect
 	asyncClosureCall      bool
+	// rewriteClosureNames are the names ever bound in this walk to a closure
+	// descriptor with rewrite writes. A branch looks only these up, instead of
+	// scanning every visible binding (100k package variables made each branch
+	// that scan, and a large file exhausted its budget).
+	rewriteClosureNames map[string]bool
 	// Callback-local writes are undone after analysis, but a descriptor defined
 	// outside that callback can write an outer binding directly. Its invocation
 	// must therefore retain MAY evidence through the conservative escape path.
@@ -583,6 +591,7 @@ func (r *goRouteResolver) walkFile() {
 	r.localClosureLits = map[*ast.FuncLit]bool{}
 	r.immediateClosureLits = map[*ast.FuncLit]bool{}
 	r.closureEffects = map[*ast.FuncLit]*goRouteClosureEffect{}
+	r.rewriteClosureNames = map[string]bool{}
 	r.safeClosureUses = map[*ast.Ident]bool{}
 	r.closureCollector = nil
 	r.asyncClosureCall = false
@@ -721,6 +730,7 @@ func (r *goRouteResolver) noteGroup(name string, binding goRouteBinding) {
 }
 
 func (r *goRouteResolver) set(name string, binding *goRouteBinding, value goRouteBinding) {
+	r.noteRewriteClosure(name, value)
 	r.log = append(r.log, goRouteWrite{binding: binding, old: *binding})
 	clientType, local := binding.httpClientType, binding.local
 	*binding = value
@@ -1072,6 +1082,7 @@ func (r *goRouteResolver) declare(scope *goRouteScope, name string, value goRout
 	}
 	binding := value
 	binding.local = true
+	r.noteRewriteClosure(name, value)
 	scope.vars[name] = &binding
 	r.noteGroup(name, value)
 }
@@ -1489,41 +1500,55 @@ func (r *goRouteResolver) clauses(scope *goRouteScope, body *ast.BlockStmt, bind
 // local closure descriptor may write with rewrite middleware. Lexical names
 // are considered only once so a shadowed outer descriptor cannot seed a join;
 // value aliases of the same descriptor are deduplicated by effect identity.
+//
+// Only names ever bound to a descriptor with rewrite writes can contribute,
+// and the visible binding of a name is its lexical lookup, so each of those
+// names is looked up instead of scanning every binding of every scope.
 func (r *goRouteResolver) visibleClosureRewriteTargets(scope *goRouteScope) []goRouteClosureRewriteTarget {
-	if len(r.closureEffects) == 0 {
+	if len(r.rewriteClosureNames) == 0 {
 		return nil
 	}
-	seenNames := map[string]bool{}
 	seenEffects := map[*goRouteClosureEffect]bool{}
 	seenTargets := map[*goRouteBinding]bool{}
 	var targets []goRouteClosureRewriteTarget
-	for current := scope; current != nil; current = current.parent {
-		for name, binding := range current.vars {
+	for name := range r.rewriteClosureNames {
+		r.step(1)
+		binding := r.lookup(scope, name)
+		if binding == nil {
+			continue
+		}
+		effect := binding.closure
+		if effect == nil || seenEffects[effect] {
+			continue
+		}
+		seenEffects[effect] = true
+		for _, write := range effect.writes {
 			r.step(1)
-			if seenNames[name] {
+			if !goRouteRewriteValue(write.value) {
 				continue
 			}
-			seenNames[name] = true
-			effect := binding.closure
-			if effect == nil || seenEffects[effect] {
+			target := write.target
+			if target == nil || seenTargets[target] {
 				continue
 			}
-			seenEffects[effect] = true
-			for _, write := range effect.writes {
-				r.step(1)
-				if !write.value.stripPrefixMiddleware && write.value.stripPrefixSource == nil && len(write.value.stripPrefixJoins) == 0 {
-					continue
-				}
-				target := write.target
-				if target == nil || seenTargets[target] {
-					continue
-				}
-				seenTargets[target] = true
-				targets = append(targets, goRouteClosureRewriteTarget{name: write.name, binding: target})
-			}
+			seenTargets[target] = true
+			targets = append(targets, goRouteClosureRewriteTarget{name: write.name, binding: target})
 		}
 	}
 	return targets
+}
+
+// goRouteRewriteValue reports a value carrying rewrite-middleware evidence.
+func goRouteRewriteValue(value goRouteBinding) bool {
+	return value.stripPrefixMiddleware || value.stripPrefixSource != nil || len(value.stripPrefixJoins) > 0
+}
+
+// noteRewriteClosure records name when value is a closure descriptor with a
+// rewrite write, so visibleClosureRewriteTargets considers it.
+func (r *goRouteResolver) noteRewriteClosure(name string, value goRouteBinding) {
+	if value.closure != nil && value.closure.rewrites {
+		r.rewriteClosureNames[name] = true
+	}
 }
 
 // branches walks code that may run zero, one, or many times, or instead of a
@@ -1946,6 +1971,9 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 				effect.writes = append(effect.writes, goRouteClosureWrite{
 					name: capture.name, target: capture.outer, value: capture.value,
 				})
+				if goRouteRewriteValue(capture.value) {
+					effect.rewrites = true
+				}
 			}
 		}
 		r.markNames(scope, written, false)
