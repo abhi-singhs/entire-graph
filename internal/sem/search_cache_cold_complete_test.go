@@ -1,6 +1,7 @@
 package sem
 
 import (
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -13,7 +14,9 @@ import (
 func TestColdSelectiveQueryPersistsCompleteSnapshot(t *testing.T) {
 	repo := selectiveFilterFixture(t)
 	cacheDir := t.TempDir()
-	options := SearchOptions{Profile: ProfileFull, TopK: 10, MaxIndexedFiles: 2, CacheDir: cacheDir}
+	// The DEFAULT pool, shrunk to fit the fixture: an explicit MaxIndexedFiles is
+	// a bound on cold parsing and never builds the complete snapshot.
+	options := SearchOptions{Profile: ProfileFull, TopK: 10, defaultIndexedFilesForTest: 2, CacheDir: cacheDir}
 
 	cold, err := SearchRepository(t.Context(), repo, "test-version", "Format ledger entry", options)
 	if err != nil {
@@ -63,7 +66,7 @@ func TestColdSelectiveQueryLeavesLargeRepositoriesToIndex(t *testing.T) {
 	repo := selectiveFilterFixture(t)
 	cacheDir := t.TempDir()
 	cold, err := SearchRepository(t.Context(), repo, "test-version", "Format ledger entry", SearchOptions{
-		Profile: ProfileFull, TopK: 10, MaxIndexedFiles: 2, CacheDir: cacheDir,
+		Profile: ProfileFull, TopK: 10, defaultIndexedFilesForTest: 2, CacheDir: cacheDir,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -73,5 +76,65 @@ func TestColdSelectiveQueryLeavesLargeRepositoriesToIndex(t *testing.T) {
 	}
 	if _, hit, err := loadCachedCompleteSearchSnapshot(t.Context(), repo, "test-version", ProviderSnapshotOptions{Profile: ProfileFull}, cacheDir); err != nil || hit {
 		t.Fatalf("a repository over the bound got a complete snapshot from a cold query: hit=%v err=%v", hit, err)
+	}
+}
+
+// TestColdSelectiveQueryHonoursExplicitIndexedFileBound pins that an explicit
+// MaxIndexedFiles (--max-indexed-files, "bound cold-search parsing to N files")
+// keeps a cold cached query to its selection. Building the complete snapshot
+// instead parses every file the caller asked not to: measured on an 838-file
+// repository at a bound of 5, 21.0s and a 2.8MB entry against 0.3s uncached.
+func TestColdSelectiveQueryHonoursExplicitIndexedFileBound(t *testing.T) {
+	repo := selectiveFilterFixture(t)
+	cacheDir := t.TempDir()
+	builds := 0
+	previous := beforeColdCompleteBuild
+	beforeColdCompleteBuild = func() { builds++ }
+	t.Cleanup(func() { beforeColdCompleteBuild = previous })
+
+	cold, err := SearchRepository(t.Context(), repo, "test-version", "Format ledger entry", SearchOptions{
+		Profile: ProfileFull, TopK: 10, MaxIndexedFiles: 2, CacheDir: cacheDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cold.Stats.IndexCacheHit || len(cold.Results) == 0 || cold.Stats.FilesIndexed == 0 || cold.Stats.FilesIndexed > 2 {
+		t.Fatalf("premise lost: want a cold query indexing at most the 2 files it was bounded to: %#v", cold.Stats)
+	}
+	if builds != 0 {
+		t.Fatalf("an explicitly bounded cold query built the complete snapshot %d time(s)", builds)
+	}
+	if _, hit, err := loadCachedCompleteSearchSnapshot(t.Context(), repo, "test-version", ProviderSnapshotOptions{Profile: ProfileFull}, cacheDir); err != nil || hit {
+		t.Fatalf("an explicitly bounded cold query persisted the complete snapshot: hit=%v err=%v", hit, err)
+	}
+	// The bounded query is still cached as its own selection.
+	warm, err := SearchRepository(t.Context(), repo, "test-version", "Format ledger entry", SearchOptions{
+		Profile: ProfileFull, TopK: 10, MaxIndexedFiles: 2, CacheDir: cacheDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !warm.Stats.IndexCacheHit || !reflect.DeepEqual(warm.Results, cold.Results) {
+		t.Fatalf("the repeated bounded query was not served its own cached selection: %#v", warm.Stats)
+	}
+}
+
+// TestColdCompleteAffordabilityReusesTheSearchListing pins that a count the
+// search already has answers the bound without listing the tree again: on a
+// large repository that second listing was most of a cold miss's cost. A
+// directory that cannot be listed at all proves no listing happened.
+func TestColdCompleteAffordabilityReusesTheSearchListing(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "not-a-repository")
+	options := ProviderSnapshotOptions{Profile: ProfileFull}
+	if completeSnapshotAffordableOnColdQuery(t.Context(), missing, options) {
+		t.Fatal("premise lost: an unlistable directory must be unaffordable when it has to be listed")
+	}
+	options.coldComplete.sourceFiles = coldCompleteSnapshotMaxFiles
+	if !completeSnapshotAffordableOnColdQuery(t.Context(), missing, options) {
+		t.Fatal("a known count at the bound was not used")
+	}
+	options.coldComplete.sourceFiles = coldCompleteSnapshotMaxFiles + 1
+	if completeSnapshotAffordableOnColdQuery(t.Context(), missing, options) {
+		t.Fatal("a known count over the bound was reported affordable")
 	}
 }

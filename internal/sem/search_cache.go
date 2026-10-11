@@ -417,7 +417,15 @@ func loadOrBuildSearchSnapshotPersisting(
 		// repository the complete build is the cost `index` exists to pay ahead of
 		// time, and charging it to an interactive query that selected a few dozen
 		// files would turn a seconds-long cold query into minutes.
-		if persistBuilt && generationKnown && completeSnapshotAffordableOnColdQuery(ctx, absRepo, completeOptions) {
+		//
+		// Never when the caller bounded cold parsing itself (--max-indexed-files):
+		// the complete build parses every file regardless of that bound, so it
+		// would turn the flag's promise into its opposite. Measured on an 838-file
+		// repository at --max-indexed-files 5: 21.0s and a 2.8MB complete entry,
+		// against 0.3s uncached. The default pool is not such a bound and keeps
+		// the complete build, which is what makes the next different query a hit.
+		if persistBuilt && generationKnown && !options.coldComplete.disabled &&
+			completeSnapshotAffordableOnColdQuery(ctx, absRepo, completeOptions) {
 			selective, hit, done, buildErr := func() (ProviderSnapshot, bool, bool, error) {
 				// Concurrent cold queries on this tree, typically parallel agents in
 				// separate processes, would each build the same complete snapshot.
@@ -503,10 +511,18 @@ func loadOrBuildSearchSnapshotPersisting(
 // so a test can lower it.
 var coldCompleteSnapshotMaxFiles = 3000
 
-// completeSnapshotAffordableOnColdQuery lists the files a complete build would
-// parse and reports whether there are few enough to build them all on a cold
-// query. A listing failure answers no: the selective build then reports it.
+// completeSnapshotAffordableOnColdQuery reports whether a complete build has few
+// enough files to run on a cold query. A search has already listed exactly those
+// files for preselection, with the same ignore rules and file cap, and passes
+// the count in options.coldComplete.sourceFiles; listing the tree a second time
+// was most of the miss cost on a large repository (a 50k-file repository's cold
+// index latency went from ~1.1s to ~2.0s for an answer that is always no).
+// Without a count it lists the files itself. A listing failure answers no: the
+// selective build then reports it.
 func completeSnapshotAffordableOnColdQuery(ctx context.Context, absRepo string, options ProviderSnapshotOptions) bool {
+	if known := options.coldComplete.sourceFiles; known > 0 {
+		return known <= coldCompleteSnapshotMaxFiles
+	}
 	source, err := prepareSource(ctx, absRepo, options)
 	if err != nil {
 		return false

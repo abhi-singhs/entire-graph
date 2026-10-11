@@ -22,7 +22,7 @@ const (
 	coldBuildLockRoleHold     = "hold"
 )
 
-var coldBuildLockQueryOptions = SearchOptions{Profile: ProfileFull, TopK: 10, MaxIndexedFiles: 2}
+var coldBuildLockQueryOptions = SearchOptions{Profile: ProfileFull, TopK: 10, defaultIndexedFilesForTest: 2}
 
 // TestColdBuildLockChild is not a test on its own: it is the body a
 // re-executed test binary runs as one of several concurrent processes.

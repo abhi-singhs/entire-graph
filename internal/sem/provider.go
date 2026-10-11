@@ -525,6 +525,22 @@ type ProviderSnapshotOptions struct {
 	// cachePolicy is an immutable, bounded capture of external ignore inputs.
 	// Cache pipelines set it once and carry it through keying and construction.
 	cachePolicy *capturedIgnorePolicy
+	// coldComplete carries what a search already knows about whether a cold
+	// selective miss may build the complete snapshot instead (see
+	// loadOrBuildSearchSnapshotPersisting). Internal wiring: it changes no
+	// snapshot content and is not part of any cache key.
+	coldComplete coldCompletePolicy
+}
+
+// coldCompletePolicy is the search's input to the cold-complete decision.
+type coldCompletePolicy struct {
+	// disabled says the caller bounded cold parsing explicitly
+	// (--max-indexed-files), which a complete build would ignore.
+	disabled bool
+	// sourceFiles is the size of the listing the search already made with the
+	// same options a complete build lists with, so the bound can be checked
+	// without listing the tree again. Zero means unknown.
+	sourceFiles int
 }
 
 type BuildPhase string

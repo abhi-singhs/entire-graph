@@ -1318,7 +1318,9 @@ func IdentitySensitiveTarget() bool { return true }
 	}
 
 	selective, err := SearchRepository(t.Context(), repo, "test-version", "IdentitySensitiveTarget repository identity", SearchOptions{
-		Profile: ProfileSyntaxOnly, TopK: 5, MaxIndexedFiles: 1, CacheDir: cacheDir,
+		// The default pool, shrunk to the fixture: an explicit MaxIndexedFiles bounds
+		// cold parsing and would not persist the complete snapshot asserted below.
+		Profile: ProfileSyntaxOnly, TopK: 5, defaultIndexedFilesForTest: 1, CacheDir: cacheDir,
 	})
 	if err != nil {
 		t.Fatal(err)
