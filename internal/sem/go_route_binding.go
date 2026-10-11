@@ -343,6 +343,13 @@ type goRouteResolver struct {
 	// boundNames are every name this file declares or assigns anywhere. A
 	// name outside it can only come from the caller's constant table.
 	boundNames map[string]bool
+	// stripParams: per same-file function name (methods by name, merged),
+	// the parameters it hands to http.StripPrefix as the handler, directly or
+	// through another such function. stripFactories name functions that build
+	// such a middleware closure. stripLits caches the answer per closure.
+	stripParams    map[string][]bool
+	stripFactories map[string]bool
+	stripLits      map[*ast.FuncLit]bool
 	// pkgWritten collects package variables assigned from inside a function.
 	pkgWritten map[string]bool
 	pkgUnknown map[string]bool
@@ -498,6 +505,7 @@ func (r *goRouteResolver) resolve() (ok bool) {
 		}
 	}()
 	r.computeSafe()
+	r.computeStripHelpers()
 	r.pkgStrings = r.packageStrings()
 	r.boundNames = r.fileBoundNames()
 	r.pkgWritten = map[string]bool{}
@@ -1101,9 +1109,15 @@ func (r *goRouteResolver) groupValue(expr ast.Expr, lookup goRouteLookup) goRout
 	case *ast.ParenExpr:
 		return r.groupValue(expr.X, lookup)
 	case *ast.FuncLit:
-		return goRouteBinding{kind: goRouteUnknown, closure: r.closureEffects[expr]}
+		// A middleware closure that hands its handler to http.StripPrefix
+		// rewrites the path before the router sees it.
+		return goRouteBinding{kind: goRouteUnknown, closure: r.closureEffects[expr], stripPrefixMiddleware: r.funcLitStrips(expr)}
 	case *ast.Ident:
-		value, _ := lookup(expr.Name)
+		value, declared := lookup(expr.Name)
+		if !declared && goRouteAnyTrue(r.stripParams[expr.Name]) {
+			// A same-file middleware function that strips its handler's prefix.
+			value.stripPrefixMiddleware = true
+		}
 		return value
 	case *ast.CallExpr:
 		if r.isStripPrefixMiddlewareCall(expr, lookup) {
@@ -1112,6 +1126,12 @@ func (r *goRouteResolver) groupValue(expr ast.Expr, lookup goRouteLookup) goRout
 		if fun, ok := expr.Fun.(*ast.Ident); ok && fun.Name == "new" && len(expr.Args) == 1 && !expr.Ellipsis.IsValid() {
 			if _, declared := lookup(fun.Name); !declared && r.isHTTPClientType(expr.Args[0]) {
 				return goRouteBinding{kind: goRouteUnknown, httpClient: true, httpClientType: true}
+			}
+		}
+		if fun, ok := goRouteUnparen(expr.Fun).(*ast.Ident); ok && r.stripFactories[fun.Name] {
+			if _, declared := lookup(fun.Name); !declared {
+				// A same-file constructor of a StripPrefix middleware.
+				return goRouteBinding{kind: goRouteUnknown, stripPrefixMiddleware: true}
 			}
 		}
 		selector, ok := expr.Fun.(*ast.SelectorExpr)
@@ -1793,6 +1813,7 @@ func (r *goRouteResolver) expr(expr ast.Expr, scope *goRouteScope) {
 			r.noteCall(node, scope)
 			r.noteMount(node, scope)
 			r.noteStripPrefix(node, scope)
+			r.noteStripHelper(node, scope)
 			r.noteUseStripPrefix(node, scope)
 			r.noteServe(node, scope)
 			r.noteParamArgs(node, scope)
@@ -3064,4 +3085,190 @@ func (r *goRouteResolver) fileBoundNames() map[string]bool {
 		return true
 	})
 	return names
+}
+
+func goRouteAnyTrue(values []bool) bool {
+	for _, value := range values {
+		if value {
+			return true
+		}
+	}
+	return false
+}
+
+// goRouteCallName is the function a call names: f(...) or x.f(...).
+func goRouteCallName(call *ast.CallExpr) string {
+	switch fun := goRouteUnparen(call.Fun).(type) {
+	case *ast.Ident:
+		return fun.Name
+	case *ast.SelectorExpr:
+		return fun.Sel.Name
+	}
+	return ""
+}
+
+// goRouteIsStripPrefixCall reports a two-argument StripPrefix(prefix, h).
+func goRouteIsStripPrefixCall(call *ast.CallExpr) bool {
+	selector, ok := goRouteUnparen(call.Fun).(*ast.SelectorExpr)
+	return ok && selector.Sel.Name == "StripPrefix" && len(call.Args) == 2
+}
+
+// goRouteParamNames lists a function type's parameter names by index ("" for
+// an unnamed or blank parameter).
+func goRouteParamNames(typ *ast.FuncType) []string {
+	if typ == nil || typ.Params == nil {
+		return nil
+	}
+	var names []string
+	for _, field := range typ.Params.List {
+		if len(field.Names) == 0 {
+			names = append(names, "")
+			continue
+		}
+		for _, name := range field.Names {
+			if name.Name == "_" {
+				names = append(names, "")
+			} else {
+				names = append(names, name.Name)
+			}
+		}
+	}
+	return names
+}
+
+// strippedParams reports which of params body hands to http.StripPrefix as
+// its handler, or to a stripping parameter of a same-file function. A name
+// counts anywhere inside that argument (wrapped in other calls, a method
+// value), ignoring shadowing: a miss would publish a path the server never
+// serves, a false hit only withholds routes.
+func (r *goRouteResolver) strippedParams(params []string, body *ast.BlockStmt) []bool {
+	stripped := make([]bool, len(params))
+	if body == nil {
+		return stripped
+	}
+	index := map[string]int{}
+	for i, name := range params {
+		if name != "" {
+			index[name] = i
+		}
+	}
+	if len(index) == 0 {
+		return stripped
+	}
+	markIn := func(arg ast.Expr) {
+		ast.Inspect(arg, func(n ast.Node) bool {
+			r.step(1)
+			if ident, ok := n.(*ast.Ident); ok {
+				if i, ok := index[ident.Name]; ok {
+					stripped[i] = true
+				}
+			}
+			return true
+		})
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		r.step(1)
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if goRouteIsStripPrefixCall(call) {
+			markIn(call.Args[1])
+			return true
+		}
+		for i, strips := range r.stripParams[goRouteCallName(call)] {
+			if strips && i < len(call.Args) {
+				markIn(call.Args[i])
+			}
+		}
+		return true
+	})
+	return stripped
+}
+
+// funcLitStrips reports a closure that hands one of its parameters to
+// http.StripPrefix: used as router middleware, it rewrites every request
+// before the router matches it.
+func (r *goRouteResolver) funcLitStrips(lit *ast.FuncLit) bool {
+	if strips, ok := r.stripLits[lit]; ok {
+		return strips
+	}
+	strips := goRouteAnyTrue(r.strippedParams(goRouteParamNames(lit.Type), lit.Body))
+	r.stripLits[lit] = strips
+	return strips
+}
+
+// computeStripHelpers finds the same-file functions that wrap a parameter in
+// http.StripPrefix (directly or through each other) and those that build a
+// closure that does.
+func (r *goRouteResolver) computeStripHelpers() {
+	r.stripParams = map[string][]bool{}
+	r.stripFactories = map[string]bool{}
+	r.stripLits = map[*ast.FuncLit]bool{}
+	var funcs []*ast.FuncDecl
+	for _, decl := range r.file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Body != nil {
+			funcs = append(funcs, fn)
+		}
+	}
+	for round := 0; round < 8; round++ {
+		changed := false
+		for _, fn := range funcs {
+			current := r.stripParams[fn.Name.Name]
+			for i, strips := range r.strippedParams(goRouteParamNames(fn.Type), fn.Body) {
+				if !strips {
+					continue
+				}
+				for len(current) <= i {
+					current = append(current, false)
+				}
+				if !current[i] {
+					current[i] = true
+					changed = true
+				}
+			}
+			if current != nil {
+				r.stripParams[fn.Name.Name] = current
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	for _, fn := range funcs {
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if lit, ok := n.(*ast.FuncLit); ok && goRouteAnyTrue(r.strippedParams(goRouteParamNames(lit.Type), lit.Body)) {
+				r.stripFactories[fn.Name.Name] = true
+				return false
+			}
+			return true
+		})
+	}
+}
+
+// noteStripHelper handles a same-file helper that wraps an argument in
+// http.StripPrefix (wrap(r) where wrap returns http.StripPrefix("/api", h)):
+// every router instance in that argument is served under a prefix its own
+// registrations do not show.
+func (r *goRouteResolver) noteStripHelper(call *ast.CallExpr, scope *goRouteScope) {
+	for i, strips := range r.stripParams[goRouteCallName(call)] {
+		if strips && i < len(call.Args) {
+			r.makeOpaqueIn(call.Args[i], scope)
+		}
+	}
+}
+
+// makeOpaqueIn marks every router instance named in expr opaque.
+func (r *goRouteResolver) makeOpaqueIn(expr ast.Expr, scope *goRouteScope) {
+	ast.Inspect(expr, func(n ast.Node) bool {
+		r.step(1)
+		ident, ok := n.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if binding := r.lookup(scope, ident.Name); binding != nil && binding.origin != nil {
+			binding.origin.opaque = true
+		}
+		return true
+	})
 }
