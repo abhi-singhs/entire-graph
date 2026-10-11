@@ -33,6 +33,9 @@ type goRouteCandidate struct {
 	// the enclosing symbol.
 	inline   bool
 	receiver goRouteBinding
+	// constants resolve the route argument at its call (lexically scoped);
+	// nil in the unparseable-file fallback, which has no scopes.
+	constants map[string]string
 }
 
 // goRouteInline is a registration with an inline handler and its composed
@@ -105,7 +108,11 @@ func goRouteEmit(candidates []goRouteCandidate, constants map[string]string) goR
 	})
 	var detail goRouteDetail
 	for _, candidate := range sorted {
-		route, ok := goRouteCandidateRoute(candidate, constants)
+		candidateConstants := constants
+		if candidate.constants != nil {
+			candidateConstants = candidate.constants
+		}
+		route, ok := goRouteCandidateRoute(candidate, candidateConstants)
 		if !ok {
 			// The receiver's prefix at this call is not determined: emitting
 			// the bare path, or another binding's prefix, would invent a route.
@@ -305,7 +312,8 @@ func (r *goRouteResolver) noteCall(call *ast.CallExpr, scope *goRouteScope) {
 	if index < 0 || len(call.Args) < index+2 {
 		return
 	}
-	candidate := goRouteCandidate{offset: r.offset(call.Pos()), route: r.text(call.Args[index])}
+	lookup := r.lookupIn(scope)
+	candidate := goRouteCandidate{offset: r.offset(call.Pos()), route: r.text(call.Args[index]), constants: r.constantsFor(call.Args[index], lookup)}
 	chainOrder, chainEvidence := 2, "go_router_method"
 	// Only the two-argument forms name their handler; Method/MethodFunc,
 	// middleware arguments and wrapped handlers are inline.
@@ -361,6 +369,7 @@ func (r *goRouteResolver) noteCall(call *ast.CallExpr, scope *goRouteScope) {
 				return
 			}
 			candidate.route = r.text(call.Args[1])
+			candidate.constants = r.constantsFor(call.Args[1], lookup)
 			candidate.handler, candidate.inline = "", true
 		}
 	}

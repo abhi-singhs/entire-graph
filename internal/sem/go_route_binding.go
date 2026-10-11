@@ -111,6 +111,14 @@ type goRouteBinding struct {
 	// closure is present only for a provably local function literal. Aliases
 	// copy the descriptor; an ordinary assignment replaces it.
 	closure *goRouteClosureEffect
+	// local marks a binding declared inside a function (a parameter, a local
+	// variable or constant, a range or type-switch name). Its identifier
+	// shadows any package-level constant of the same name, so a route or
+	// prefix argument that reads it is not a static string unless it is a
+	// local constant (isConst, with constValue). A write keeps local.
+	local      bool
+	isConst    bool
+	constValue string
 }
 
 // goRouteOrigin is one router instance created by a constructor call. Every
@@ -328,6 +336,13 @@ type goRouteResolver struct {
 	imports    map[string]string
 	log        []goRouteWrite
 	groupNames map[string]bool
+	// pkgStrings are the static string values of package-level constants and
+	// never-reassigned package variables: the only names a route or prefix
+	// argument may resolve without a local binding.
+	pkgStrings map[string]string
+	// boundNames are every name this file declares or assigns anywhere. A
+	// name outside it can only come from the caller's constant table.
+	boundNames map[string]bool
 	// pkgWritten collects package variables assigned from inside a function.
 	pkgWritten map[string]bool
 	pkgUnknown map[string]bool
@@ -446,10 +461,11 @@ func (r *goRouteResolver) read(binding *goRouteBinding) goRouteBinding {
 	}
 	value := *binding
 	if r.escaped[binding] {
-		clientType := value.httpClientType
+		clientType, local := value.httpClientType, value.local
 		value = goRouteUnknownBinding
 		value.httpClientType = clientType
 		value.httpClient = clientType
+		value.local = local
 	}
 	if r.escapedStripPrefixWrites[binding] {
 		value.stripPrefixMiddleware = true
@@ -482,6 +498,8 @@ func (r *goRouteResolver) resolve() (ok bool) {
 		}
 	}()
 	r.computeSafe()
+	r.pkgStrings = r.packageStrings()
+	r.boundNames = r.fileBoundNames()
 	r.pkgWritten = map[string]bool{}
 	r.collecting = true
 	r.walkFile()
@@ -696,9 +714,10 @@ func (r *goRouteResolver) noteGroup(name string, binding goRouteBinding) {
 
 func (r *goRouteResolver) set(name string, binding *goRouteBinding, value goRouteBinding) {
 	r.log = append(r.log, goRouteWrite{binding: binding, old: *binding})
-	clientType := binding.httpClientType
+	clientType, local := binding.httpClientType, binding.local
 	*binding = value
 	binding.httpClientType = clientType
+	binding.local = local
 	if clientType {
 		binding.httpClient = true
 	}
@@ -1044,6 +1063,7 @@ func (r *goRouteResolver) declare(scope *goRouteScope, name string, value goRout
 		value = goRouteUnknownBinding
 	}
 	binding := value
+	binding.local = true
 	scope.vars[name] = &binding
 	r.noteGroup(name, value)
 }
@@ -1149,10 +1169,11 @@ func (r *goRouteResolver) groupValue(expr ast.Expr, lookup goRouteLookup) goRout
 			return goRouteUnknownBinding
 		}
 		argument := r.text(expr.Args[0])
-		prefix, ok := goRouteLiteral(parent.framework, argument, r.constants)
+		constants := r.constantsFor(expr.Args[0], lookup)
+		prefix, ok := goRouteLiteral(parent.framework, argument, constants)
 		if !ok {
 			// Group("") is the parent itself: a known empty prefix, not unknown.
-			if value, isStatic := staticStringExpressionValue(argument, r.constants); isStatic && value == "" {
+			if value, isStatic := staticStringExpressionValue(argument, constants); isStatic && value == "" {
 				prefix, ok = "", true
 			}
 		}
@@ -1260,7 +1281,14 @@ func (r *goRouteResolver) walkStmt(stmt ast.Stmt, scope *goRouteScope) {
 		r.assign(stmt, scope)
 	case *ast.DeclStmt:
 		gen, ok := stmt.Decl.(*ast.GenDecl)
-		if !ok || gen.Tok != token.VAR {
+		if !ok {
+			return
+		}
+		if gen.Tok == token.CONST {
+			r.declareConsts(gen, scope)
+			return
+		}
+		if gen.Tok != token.VAR {
 			return
 		}
 		for _, spec := range gen.Specs {
@@ -1848,6 +1876,7 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 		}
 		unknown.httpClientType = binding.httpClientType
 		unknown.httpClient = binding.httpClientType
+		unknown.local = binding.local
 		// Preserve the exact lexical binding. A later escaped write to this
 		// binding must remain visible even when its current value points farther
 		// outward through another captured source.
@@ -2378,7 +2407,7 @@ func (r *goRouteResolver) noteMount(call *ast.CallExpr, scope *goRouteScope) {
 		return
 	}
 	parent := r.groupValue(selector.X, lookup)
-	prefix, ok := goRouteLiteral(origin.framework, r.text(call.Args[0]), r.constants)
+	prefix, ok := goRouteLiteral(origin.framework, r.text(call.Args[0]), r.constantsFor(call.Args[0], lookup))
 	if !ok || parent.kind == goRouteUnknown {
 		origin.opaque = true
 		return
@@ -2500,7 +2529,7 @@ func (r *goRouteResolver) subrouterValue(call *ast.CallExpr, selector *ast.Selec
 	default:
 		return goRouteUnknownBinding
 	}
-	prefix, ok := goRouteLiteral("mux", r.text(pathPrefix.Args[0]), r.constants)
+	prefix, ok := goRouteLiteral("mux", r.text(pathPrefix.Args[0]), r.constantsFor(pathPrefix.Args[0], lookup))
 	if !ok || parent.kind == goRouteUnknown {
 		return goRouteUnknownBinding
 	}
@@ -2876,4 +2905,163 @@ func (r *goRouteResolver) noteUseStripPrefix(call *ast.CallExpr, scope *goRouteS
 		}
 		r.observeStripPrefixValue(middleware, router.origin, true)
 	}
+}
+
+// declareConsts binds a function-local const declaration. A static string
+// constant resolves inside its scope; any other constant (a number, an iota
+// repetition, a value from another package) is a local that shadows a
+// package-level constant of the same name, so it is not a static route.
+func (r *goRouteResolver) declareConsts(gen *ast.GenDecl, scope *goRouteScope) {
+	for _, spec := range gen.Specs {
+		valueSpec, ok := spec.(*ast.ValueSpec)
+		if !ok {
+			continue
+		}
+		values := make([]goRouteBinding, len(valueSpec.Names))
+		if len(valueSpec.Values) == len(valueSpec.Names) {
+			lookup := r.lookupIn(scope)
+			for i, value := range valueSpec.Values {
+				if text, ok := staticStringExpressionValue(r.text(value), r.constantsFor(value, lookup)); ok {
+					values[i] = goRouteBinding{isConst: true, constValue: text}
+				}
+			}
+		}
+		for i, name := range valueSpec.Names {
+			r.declare(scope, name.Name, values[i])
+		}
+	}
+}
+
+// constantsFor is the constant table a route or prefix argument may use: each
+// identifier it reads resolves through the lexical scope at that point. A
+// parameter or local variable is not static (it is absent, so the argument is
+// unknown); a local string constant has its value; only a name no function
+// scope declares reaches the package-level constants and variables.
+func (r *goRouteResolver) constantsFor(expr ast.Expr, lookup goRouteLookup) map[string]string {
+	constants := map[string]string{}
+	var visit func(node ast.Node) bool
+	visit = func(node ast.Node) bool {
+		r.step(1)
+		switch node := node.(type) {
+		case *ast.SelectorExpr:
+			// pkg.Name or value.Field: only the base can be a variable.
+			ast.Inspect(node.X, visit)
+			return false
+		case *ast.FuncLit:
+			return false
+		case *ast.Ident:
+			binding, declared := lookup(node.Name)
+			if declared && binding.local {
+				if binding.isConst {
+					constants[node.Name] = binding.constValue
+				}
+				return false
+			}
+			if value, ok := r.pkgStrings[node.Name]; ok {
+				constants[node.Name] = value
+			} else if value, ok := r.constants[node.Name]; ok && !declared && !r.boundNames[node.Name] {
+				// Declared nowhere in this file: the caller's table is the only
+				// source, and no binding here can shadow it.
+				constants[node.Name] = value
+			}
+		}
+		return true
+	}
+	ast.Inspect(expr, visit)
+	return constants
+}
+
+// packageStrings evaluates the static string values of package-level const
+// and var declarations in this file. A variable assigned or addressed
+// anywhere in the file (by name, ignoring shadowing) may hold another value
+// at any call, so it is left out; so is a name declared more than once.
+func (r *goRouteResolver) packageStrings() map[string]string {
+	exprs := map[string]ast.Expr{}
+	skip := map[string]bool{}
+	vars := map[string]bool{}
+	for _, decl := range r.file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || (gen.Tok != token.CONST && gen.Tok != token.VAR) {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			valueSpec, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for i, name := range valueSpec.Names {
+				if _, seen := exprs[name.Name]; seen || len(valueSpec.Values) != len(valueSpec.Names) {
+					skip[name.Name] = true
+					continue
+				}
+				exprs[name.Name] = valueSpec.Values[i]
+				if gen.Tok == token.VAR {
+					vars[name.Name] = true
+				}
+			}
+		}
+	}
+	if len(vars) > 0 {
+		for name := range r.writtenNames(r.file) {
+			if vars[name] {
+				skip[name] = true
+			}
+		}
+	}
+	values := map[string]string{}
+	for round := 0; round < 8; round++ {
+		changed := false
+		for name, expr := range exprs {
+			r.step(1)
+			if skip[name] {
+				continue
+			}
+			if _, done := values[name]; done {
+				continue
+			}
+			if value, ok := staticStringExpressionValue(r.text(expr), values); ok {
+				values[name] = value
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return values
+}
+
+// fileBoundNames lists every name the file binds: declarations, parameters,
+// results, fields, range and assignment targets.
+func (r *goRouteResolver) fileBoundNames() map[string]bool {
+	names := map[string]bool{}
+	add := func(expr ast.Expr) {
+		if ident, ok := goRouteUnparen(expr).(*ast.Ident); ok {
+			names[ident.Name] = true
+		}
+	}
+	ast.Inspect(r.file, func(n ast.Node) bool {
+		r.step(1)
+		switch n := n.(type) {
+		case *ast.Field:
+			for _, name := range n.Names {
+				names[name.Name] = true
+			}
+		case *ast.ValueSpec:
+			for _, name := range n.Names {
+				names[name.Name] = true
+			}
+		case *ast.AssignStmt:
+			for _, lhs := range n.Lhs {
+				add(lhs)
+			}
+		case *ast.RangeStmt:
+			add(n.Key)
+			add(n.Value)
+		case *ast.IncDecStmt:
+			add(n.X)
+		}
+		return true
+	})
+	return names
 }
