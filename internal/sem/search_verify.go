@@ -2627,13 +2627,77 @@ func searchVerifyShellStatements(script string) ([]string, bool) {
 //
 // A runner counts when it is the HEAD of a statement, after environment assignments and the
 // usual wrappers are stepped over. Anything else -- a flag value, a path, prose -- does not.
+// searchVerifyShellWords preserves shell word boundaries through quoting and escapes.
+// It does not evaluate expansions; a quoted environment value cannot become a command.
+func searchVerifyShellWords(statement string) ([]string, bool) {
+	var words []string
+	var word strings.Builder
+	var quote byte
+	active := false
+	flush := func() {
+		if active {
+			words = append(words, word.String())
+			word.Reset()
+			active = false
+		}
+	}
+	for i := 0; i < len(statement); i++ {
+		c := statement[i]
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+				continue
+			}
+			if c == '\\' && quote == '"' && i+1 < len(statement) {
+				next := statement[i+1]
+				if strings.ContainsRune("\\$`\"\n", rune(next)) {
+					i++
+					if next != '\n' {
+						word.WriteByte(next)
+					}
+					continue
+				}
+			}
+			word.WriteByte(c)
+			continue
+		}
+		switch c {
+		case ' ', '\t', '\r', '\n':
+			flush()
+		case '\'', '"':
+			quote = c
+			active = true
+		case '\\':
+			if i+1 >= len(statement) {
+				return nil, false
+			}
+			i++
+			if statement[i] != '\n' {
+				word.WriteByte(statement[i])
+				active = true
+			}
+		default:
+			word.WriteByte(c)
+			active = true
+		}
+	}
+	if quote != 0 {
+		return nil, false
+	}
+	flush()
+	return words, true
+}
+
 func searchVerifyScriptInvokesRunner(script, runner string) bool {
 	statements, parsed := searchVerifyShellStatements(script)
 	if !parsed {
 		return false // a form we do not model: fail closed rather than guess
 	}
 	for _, statement := range statements {
-		fields := strings.Fields(statement)
+		fields, valid := searchVerifyShellWords(statement)
+		if !valid {
+			continue
+		}
 		index := 0
 		// Assignments and wrappers INTERLEAVE and must be consumed in one loop, not in two
 		// passes: `cross-env NODE_ENV=test jest` puts a wrapper before the assignment, and a
@@ -2659,6 +2723,9 @@ func searchVerifyScriptInvokesRunner(script, runner string) bool {
 				for index < len(fields) && (fields[index] == "-s" || fields[index] == "--silent") {
 					index++
 				}
+				continue
+			case "bunx":
+				index++
 				continue
 			case "npx":
 				// npx has options of its own -- moving it in with the environment wrappers
