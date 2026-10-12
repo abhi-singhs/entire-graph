@@ -160,7 +160,7 @@ jobs:
           if ($actualVersion -ne $env:VERSION) {
             throw "unexpected version: expected $env:VERSION, got $actualVersion"
           }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
