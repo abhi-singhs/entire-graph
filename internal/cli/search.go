@@ -2459,12 +2459,33 @@ const agentSearchRankWeightScale int64 = 1 << 30
 
 // agentSearchLocationCost is the size of a result's rich location line, the floor its block is
 // guaranteed before any rank is given body bytes.
+func agentSearchPrimaryFocus(result sem.SearchResult, lineCount int) (int, int, int) {
+	snippetStart := result.SnippetStartLine
+	if snippetStart <= 0 {
+		snippetStart = result.StartLine
+	}
+	if snippetStart <= 0 {
+		snippetStart = 1
+	}
+	focusLine := result.FocusLine
+	if focusLine <= 0 {
+		focusLine = snippetStart
+	}
+	focus := focusLine - snippetStart
+	if focus < 0 || focus >= lineCount {
+		focus = lineCount / 2
+		focusLine = snippetStart + focus
+	}
+	return snippetStart, focusLine, focus
+}
+
 func agentSearchLocationCost(result sem.SearchResult) int {
 	result = searchResultOnOneLine(result)
-	focus := searchResultLocatorLine(result)
-	if focus <= 0 {
-		focus = 1
+	lines := strings.Split(result.Snippet, "\n")
+	if len(lines) > 1 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
 	}
+	_, focus, _ := agentSearchPrimaryFocus(result, len(lines))
 	return len(agentSearchLocationHeaders(result.Rank, result.FilePath, focus, focus, focus,
 		searchResultDisplayName(result), agentSearchSectionTag(result), agentSearchScoreTag(result))[0])
 }
@@ -2581,22 +2602,7 @@ func agentSearchPrimaryBlock(result sem.SearchResult, budget int) []byte {
 	if len(lines) > 1 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
-	snippetStart := result.SnippetStartLine
-	if snippetStart <= 0 {
-		snippetStart = result.StartLine
-	}
-	if snippetStart <= 0 {
-		snippetStart = 1
-	}
-	focusLine := result.FocusLine
-	if focusLine <= 0 {
-		focusLine = snippetStart
-	}
-	focus := focusLine - snippetStart
-	if focus < 0 || focus >= len(lines) {
-		focus = len(lines) / 2
-		focusLine = snippetStart + focus
-	}
+	snippetStart, focusLine, focus := agentSearchPrimaryFocus(result, len(lines))
 	if len(lines) == 0 {
 		return fitAgentSearchLocation(result.Rank, result.FilePath, focusLine, name, tag, scored, budget)
 	}
