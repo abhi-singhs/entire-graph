@@ -341,7 +341,7 @@ func parserAcceptsFlag(command, flag string) (accepted, reachable bool) {
 	case "symbols", "edges", "snapshot":
 		_, rest, err := parseProviderFlags([]string{flag})
 		return err != nil || len(rest) == 0, true
-	case "search":
+	case "query", "search":
 		_, rest, err := parseSearchFlags([]string{flag})
 		return err != nil || len(rest) == 0, true
 	case "index":

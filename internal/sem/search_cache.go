@@ -27,7 +27,8 @@ import (
 // retires the flat selective entries written before a derived snapshot was
 // nested beneath the complete entry it came from, which would otherwise sit
 // unreachable inside a live version directory and defeat that cleanup rule.
-const searchSnapshotCacheVersion = "search-snapshot-v15-" + IdentityRevision
+// v16 retires the diagnostic-count status in favor of source-file health.
+const searchSnapshotCacheVersion = "search-snapshot-v16-" + IdentityRevision
 
 type cachedSymbolByteRange struct {
 	Start int `json:"start"`
@@ -1054,17 +1055,18 @@ func populateSelectiveHeader(selective *ProviderSnapshot, warnings []ProviderWar
 	selective.Header.Warnings = warnings
 	selective.Header.PartialFailures = failures
 	selective.Header.Stats = ProviderStats{
-		Files:             len(selective.Files),
-		ParsedFiles:       parsedFiles,
-		Symbols:           len(selective.Symbols),
-		Relations:         len(selective.Relations),
-		PartialFailures:   len(failures),
-		CompletenessLevel: completenessLevel(failures, len(selective.Files), parsedFiles, len(selective.Symbols)),
+		Files:           len(selective.Files),
+		ParsedFiles:     parsedFiles,
+		Symbols:         len(selective.Symbols),
+		Relations:       len(selective.Relations),
+		PartialFailures: len(failures),
 	}
 	selective.Header.Completeness = CompletenessReport{
 		Languages: completenessLanguages,
 		Relations: relationsByType,
+		Health:    calculateGraphHealth(selective.Files, failures, selective.Header.Stats),
 	}
+	selective.Header.Stats.CompletenessLevel = selective.Header.Completeness.Health.Status
 }
 
 // finalizeSelectiveOrdering populates selective.Externals from externalsByID

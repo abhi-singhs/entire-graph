@@ -13,7 +13,7 @@ import (
 // here and give it a commandDoc.
 var dispatchCommands = []string{
 	"diff", "commit", "checkpoint", "analyze", "doctor", "capabilities",
-	"snapshot", "snapshot-query", "symbols", "edges", "search", "index", "def",
+	"snapshot", "snapshot-query", "symbols", "edges", "query", "search", "index", "health", "def",
 	"explain", "neighbors", "impact", "verify", "stats", "agent-guide",
 	"init-agents", "version", "help",
 }

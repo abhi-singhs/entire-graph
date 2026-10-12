@@ -46,12 +46,25 @@ type indexResponse struct {
 }
 
 func runIndex(ctx context.Context, opts Options, args []string) error {
+	return runIndexCommand(ctx, opts, args, false)
+}
+
+// Health uses exactly the index transaction, including cache matching,
+// persistence checks and force-refresh invalidation of derived query entries.
+func runIndexCommand(ctx context.Context, opts Options, args []string, health bool) error {
 	flags, rest, err := parseIndexFlags(args)
 	if err != nil {
 		return err
 	}
 	if len(rest) != 0 {
-		return unexpectedArgumentsError("index", opts.Version, rest)
+		command := "index"
+		if health {
+			command = "health"
+		}
+		return unexpectedArgumentsError(command, opts.Version, rest)
+	}
+	if health && flags.Format == "" {
+		flags.Format = "text"
 	}
 	// Format resolution: an explicit --format wins; otherwise pick by audience —
 	// a human at a terminal gets the readable summary, a pipe/CI gets the
@@ -94,6 +107,19 @@ func runIndex(ctx context.Context, opts Options, args []string) error {
 		bar = newProgressBar(opts.Stderr, "indexing")
 		snapOptions.Progress = func(e sem.ProgressEvent) { bar.update(e) }
 	}
+	if health {
+		progress := snapOptions.Progress
+		announced := false
+		snapOptions.Progress = func(e sem.ProgressEvent) {
+			if !announced {
+				fmt.Fprintln(opts.Stderr, "Building committed HEAD index for health report...")
+				announced = true
+			}
+			if progress != nil {
+				progress(e)
+			}
+		}
+	}
 	started := time.Now()
 	snapshot, cacheHit, err := sem.PreindexProviderSnapshot(ctx, repo, opts.Version, snapOptions, cacheDir)
 	if bar != nil {
@@ -124,6 +150,9 @@ func runIndex(ctx context.Context, opts Options, args []string) error {
 		Warnings:        warnings,
 		PartialFailures: partialFailures,
 		Completeness:    snapshot.Header.Completeness,
+	}
+	if health {
+		return writeHealth(opts.Stdout, response, outputText, flags.Force)
 	}
 	if flags.Report != "" {
 		// writeOutputFile, not os.WriteFile: --report names a path anywhere on the

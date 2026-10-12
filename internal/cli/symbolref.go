@@ -420,13 +420,13 @@ func writeNoFocusMatch(out interface {
 	fmt.Fprintf(out, "No symbols matched %q", query)
 	switch {
 	case file != "" && line > 0:
-		fmt.Fprintf(out, " in %s at line %d. Drop --line (or --file) to widen, or run `entire graph search --query %q` to find the name.\n", file, line, query)
+		fmt.Fprintf(out, " in %s at line %d. Drop --line (or --file) to widen, or run `entire graph query --query %q` to find the name.\n", file, line, query)
 	case file != "":
-		fmt.Fprintf(out, " in %s. Drop --file to widen, or run `entire graph search --query %q` to find the name.\n", file, query)
+		fmt.Fprintf(out, " in %s. Drop --file to widen, or run `entire graph query --query %q` to find the name.\n", file, query)
 	case line > 0:
-		fmt.Fprintf(out, " at line %d. Drop --line to widen, or run `entire graph search --query %q` to find the name.\n", line, query)
+		fmt.Fprintf(out, " at line %d. Drop --line to widen, or run `entire graph query --query %q` to find the name.\n", line, query)
 	default:
-		fmt.Fprintf(out, ". Run `entire graph search --query %q` to find the name, or `entire graph symbols --repo .` for the full definition inventory.\n", query)
+		fmt.Fprintf(out, ". Run `entire graph query --query %q` to find the name, or `entire graph symbols --repo .` for the full definition inventory.\n", query)
 	}
 }
 

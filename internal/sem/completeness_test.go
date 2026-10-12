@@ -3,6 +3,7 @@ package sem
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -17,11 +18,10 @@ func TestCompletenessFailureCountExcludesIntentionalSkips(t *testing.T) {
 		{Code: "E_PARSE_ERROR"},
 		{Code: "E_UNSUPPORTED_LANGUAGE"},
 	}
-	if got := completenessFailureCount(failures); got != 2 {
-		t.Fatalf("completenessFailureCount = %d, want 2 (only E_PARSE_ERROR + E_UNSUPPORTED_LANGUAGE)", got)
-	}
-	if got := completenessFailureCount([]PartialFailure{{Code: "E_FILE_TOO_LARGE"}, {Code: "E_MINIFIED"}}); got != 0 {
-		t.Fatalf("only intentional skips should count 0, got %d", got)
+	for i, failure := range failures {
+		if got := IsIntentionalSkip(failure.Code); got != (i < 2) {
+			t.Fatalf("IsIntentionalSkip(%s) = %t", failure.Code, got)
+		}
 	}
 }
 
@@ -56,45 +56,94 @@ func TestGraphIgnoreFileHonored(t *testing.T) {
 	}
 }
 
-// hardFailures builds n partial failures that count as real gaps, so the table
-// below still reads as "n failures" now that completenessLevel takes records.
-func hardFailures(n int) []PartialFailure {
-	failures := make([]PartialFailure, 0, n)
-	for i := 0; i < n; i++ {
-		failures = append(failures, PartialFailure{Code: "E_PARSE_ERROR"})
-	}
-	return failures
-}
-
 func TestCompletenessLevel(t *testing.T) {
 	cases := []struct {
-		name                  string
-		failures              []PartialFailure
-		files, parsed, symbol int
-		want                  string
+		name                            string
+		failures, files, parsed, symbol int
+		want                            string
 	}{
-		{"empty scope", nil, 0, 0, 0, "ok"},
-		{"clean full parse", nil, 100, 100, 4000, "ok"},
+		{"empty scope", 0, 0, 0, 0, "ok"},
+		{"clean full parse", 0, 100, 100, 4000, "ok"},
 		// The subdir/mis-scope bug: a stray config file parses fine (no failure)
 		// but the real source was never discovered. Must NOT report "ok".
-		{"parsed but no symbols", nil, 3, 3, 0, "degraded"},
-		{"majority unparsed", nil, 100, 30, 500, "unsafe"},
-		{"a few hard failures", hardFailures(2), 100, 98, 4000, "degraded"},
-		{"mostly failures", hardFailures(30), 100, 70, 500, "unsafe"},
-		// Intentional skips still do not count as gaps.
-		{"intentional skips only", []PartialFailure{{Code: "E_FILE_TOO_LARGE"}, {Code: "E_MINIFIED"}}, 100, 100, 4000, "ok"},
-		// A wall-clock truncation is never "ok" and never merely "degraded":
-		// the unreached suffix of the repository is unknown and unbounded.
-		{"truncated empty", []PartialFailure{{Code: AnalysisBudgetExceededCode}}, 0, 0, 0, "unsafe"},
-		{"truncated large prefix", []PartialFailure{{Code: AnalysisBudgetExceededCode}}, 1000, 1000, 40000, "unsafe"},
+		{"parsed but no symbols", 0, 3, 3, 0, "degraded"},
+		{"majority unparsed", 0, 100, 30, 500, "unsafe"},
+		{"immediately below threshold", 1, 21, 21, 4000, "ok"},
+		{"exactly at threshold", 1, 20, 20, 4000, "degraded"},
+		{"above threshold", 1, 19, 19, 4000, "degraded"},
+		{"a few hard failures", 2, 100, 98, 4000, "ok"},
+		{"mostly failures", 30, 100, 70, 500, "unsafe"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := completenessLevel(tc.failures, tc.files, tc.parsed, tc.symbol)
 			if got != tc.want {
 				t.Fatalf("completenessLevel(f=%d files=%d parsed=%d sym=%d) = %q, want %q",
-					len(tc.failures), tc.files, tc.parsed, tc.symbol, got, tc.want)
+					tc.failures, tc.files, tc.parsed, tc.symbol, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestCompletenessLevelDegradesOnALargeShareOfSkips is the backstop the
+// intentional-skip exclusion always claimed to have. Skips are removed from the
+// failure count on purpose, and the parsed-file ratio was supposed to catch a
+// corpus that is genuinely mostly unread — but that guard only fires past a
+// strict majority, so a repository whose whole dist/ tree was skipped (200 of
+// 500 files never opened) still reported "ok" and every trust gate keyed on that
+// level stayed silent.
+//
+// The other direction is the constraint that makes this safe: a handful of
+// vendored bundles among hundreds of sources must keep reporting "ok", or the
+// exclusion is undone.
+func TestCompletenessLevelDegradesOnALargeShareOfSkips(t *testing.T) {
+	cases := []struct {
+		name                            string
+		failures, files, parsed, symbol int
+		want                            string
+	}{
+		{"one vendored bundle among many", 0, 500, 499, 4000, "ok"},
+		{"a tenth skipped", 0, 500, 450, 4000, "ok"},
+		{"a quarter skipped", 0, 500, 300, 4000, "degraded"},
+		{"half skipped", 0, 2, 1, 20, "degraded"},
+		// A ratio downgrade must never soften a louder verdict.
+		{"majority unparsed stays unsafe", 0, 100, 30, 500, "unsafe"},
+		{"mostly failures stays unsafe", 30, 100, 70, 500, "unsafe"},
+		{"empty scope", 0, 0, 0, 0, "ok"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := completenessLevel(tc.failures, tc.files, tc.parsed, tc.symbol)
+			if got != tc.want {
+				t.Fatalf("completenessLevel(f=%d files=%d parsed=%d sym=%d) = %q, want %q",
+					tc.failures, tc.files, tc.parsed, tc.symbol, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestOversizeSkipCannotReportOkOnASmallCorpus is the end-to-end half: half the
+// repository is never opened, so the snapshot must not call itself complete.
+func TestOversizeSkipCannotReportOkOnASmallCorpus(t *testing.T) {
+	repo := t.TempDir()
+	initRepo(t, repo)
+	writeFile(t, repo, "huge.py", "def big_one():\n    return 1\n"+strings.Repeat("# padding to exceed the cap\n", 200))
+	writeFile(t, repo, "plain.py", "def helper(value):\n    return value\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "initial")
+
+	snapshot, err := BuildProviderSnapshotWithOptions(
+		t.Context(), repo, "test", ProviderSnapshotOptions{MaxParseBytes: 1024},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := snapshot.Header.Stats
+	if stats.ParsedFiles >= stats.Files {
+		t.Fatalf("fixture parsed every file (%d of %d); the oversize skip did not happen",
+			stats.ParsedFiles, stats.Files)
+	}
+	if stats.CompletenessLevel == "ok" {
+		t.Fatalf("completeness = ok with %d of %d files parsed", stats.ParsedFiles, stats.Files)
 	}
 }

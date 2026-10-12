@@ -7,7 +7,7 @@ Date: 2026-07-03
 
 `entire-graph` emits a semantic index consumed by downstream tools (notably
 `entire-brain`). The wire format carries `schema_version` in `major.minor` form.
-The provider currently advertises **`1.2`** (`internal/sem/provider.go`
+The provider currently advertises **`1.3`** (`internal/sem/provider.go`
 `SchemaVersion`), where the `1.1` minor adds *optional, additive* relation fields
 that tolerant readers ignore. A compatibility policy already exists in the
 [semantic provider requirements](../semantic-provider-requirements.md), but it
@@ -19,7 +19,7 @@ against it and so future changes have clear, non-breaking rules.
 
 ## Decision
 
-**GA ships on schema `1.x`, with `1.2` as the current minor. `1.x` is the frozen,
+**GA ships on schema `1.x`, with `1.3` as the current minor. `1.x` is the frozen,
 stable GA contract.** We do NOT roll back to `1.0`; `1.1` is strictly additive
 over `1.0` and every `1.0` reader already tolerates it.
 
@@ -116,14 +116,31 @@ as a need to refresh derived semantic data. History consumers must also migrate
 previously persisted entity deltas rather than merely append newly parsed ones.
 
 This is one global revision for parser identity rules across all languages.
-The value is a decimal revision encoded as a string, currently `"2"`. Consumers
+The value is a decimal revision encoded as a string, currently `"3"`. Consumers
 compare the complete opaque string for equality rather than relying on numeric
 ordering. The field name supplies its meaning; the value names no language or
 feature. A bump invalidates both snapshot and search
 cache namespaces even when the source tree and provider release are unchanged.
 It does not change the individual symbol-ID format.
 
-The current revision `"2"` includes trail 154's JS/TS callable-scope
+The current revision `"3"` adds the Python nested-callable correction
+(issue #199). A callable declared inside a Python method body was qualified by
+the enclosing CLASS, so `def helper(...)` inside `C.m` emitted the method
+`C.helper` — a member no instance of `C` has ever had, because the name binds in
+the method's local frame when the method runs and is gone when it returns. It is
+now qualified by the enclosing CALLABLE: `C.m.helper`, kind `function`, marked
+local. Two kinds of ID move as a result:
+
+- Every Python nested-callable symbol is re-keyed from
+  `…:method:<Class>.<name>` to `…:function:<Class>.<method>.<name>`.
+- Real class members whose names collided with a nested callable are re-keyed in
+  the opposite direction — *back* to their bare ID. Before this revision,
+  `C.helper` (phantom) and a real `C.helper` shared one base ID, so the
+  signature-disambiguation branch fired for both and pushed the real member onto
+  `…:method:C.helper#sig:<hash>`. With the phantom gone the collision is gone and
+  the real member returns to `…:method:C.helper`.
+
+Revision `"2"` included trail 154's JS/TS callable-scope
 corrections and trail 163's anonymous default-export corrections. Callable exports
 previously classified as classes receive corrected function IDs, phantom exports
 in comments and literals are removed, and corrected source ranges/signatures can
@@ -145,3 +162,14 @@ the same ceiling on encoding and decoding. Older readers can still reject summar
 records larger than 16 MiB; upgrade readers before exchanging these larger
 artifacts. The identity revision describes parser identity rules, not compact
 reader compatibility, and does not remove this reader upgrade requirement.
+
+### Source-file health accounting (schema 1.3)
+
+Schema 1.3 adds optional `completeness.health` counts, percentages, threshold,
+status and language totals, plus an optional partial-failure `language` for
+source classification when no file record is available. The existing completeness status still describes
+indexing usability; its heuristic now uses unique eligible source files and an
+inclusive 5% degradation threshold, retaining stronger safeguards. Diagnostic
+arrays remain intact. Both cache families are versioned to discard obsolete
+calculations. The persisted Result shape and symbol identity revision are
+unchanged. See [operations](../operations.md#graph-health) for denominator policy.

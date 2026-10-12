@@ -22,7 +22,8 @@ import (
 // resource policy and surfaced refusals; v9 retires entries whose DATA_FLOWS
 // records carry a single evidence entry per edge rather than every flow; v10
 // retires entries written before truncated records counted what they dropped.
-const providerRecordsCacheVersion = "provider-records-v10-" + IdentityRevision
+// v11 retires streams carrying the old diagnostic-count completeness status.
+const providerRecordsCacheVersion = "provider-records-v11-" + IdentityRevision
 
 // cachedProviderRecords is the on-disk envelope for a cached record stream. The
 // key alone is authoritative (sha256 over version+commit+tree+mode+profile+

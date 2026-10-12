@@ -25,18 +25,18 @@ default**; `--head` switches to the committed tree.
 
 | Command | What it does |
 | --- | --- |
-| `search` | Ranked source regions for a plain-language query. Defaults: `--format json`, `--profile fast` (the installed agent guide asks for `--profile full`). Formats: `json`, `ndjson`, `text`, `agent`. See [search results](search.md). |
+| `query` | Ranked source regions for a plain-language query. Defaults: `--format json`, `--profile fast` (the installed agent guide asks for `--profile full`). Formats: `json`, `ndjson`, `text`, `agent`. See [search results](search.md). |
 | `def` | One name's declaration, fields, and method surface. Default format is text. |
 | `explain` | Resolves symbols named by a failing build or test into definitions and context. |
 | `neighbors` | Direct relations of one symbol (`--relation`, `--direction`, `--depth 1\|2`). Ambiguous names return a definition list; disambiguate with `--file`. |
 | `impact` | One-shot blast radius for a symbol: direct and transitive callers (depth ≤ 2), callees, type consumers, data flows, co-change files, siblings. |
 
-Cache visibility differs by command and format. JSON from `search`, `impact`,
+Cache visibility differs by command and format. JSON from `query`, `impact`,
 and `neighbors` includes cache fields. Text output from `impact` and
 `neighbors` starts with an `Index: cache-hit` or `cache-miss` header. Agent
-output from `search` and `neighbors` normally uses that header, compacting it
+output from `query` and `neighbors` normally uses that header, compacting it
 to `I:hit`/`I:miss` under a tight byte budget and potentially omitting it under
-an extreme cap. `search --format text` and `explain` report no cache state.
+an extreme cap. `query --format text` and `explain` report no cache state.
 `def` and `explain` also skip the per-user fallback cache directory that the
 other query commands use; details are in the
 [operations cache guide](operations.md#cache).
@@ -58,7 +58,7 @@ Bulk NDJSON streams. These default to the **committed tree**; pass
 | Command | What it does |
 | --- | --- |
 | `snapshot` | The whole graph: header, files, externals, symbols, relations, summary. Also supports `--format compact-ndjson` and the experimental `--format scip`. |
-| `symbols` | Symbol records only. There is no name filter; grep the stream, or use `search`/`def` for a targeted lookup. |
+| `symbols` | Symbol records only. There is no name filter; grep the stream, or use `query`/`def` for a targeted lookup. |
 | `edges` | Relation records, filterable server-side with `--to`, `--from`, `--relation`. |
 | `snapshot-query` | Queries a saved compact snapshot without rebuilding the graph. |
 

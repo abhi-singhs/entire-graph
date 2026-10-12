@@ -222,13 +222,16 @@ func (cw *contextChunkWriter) Write(b []byte) (int, error) {
 			cw.scratch = nil
 			return written, cw.ctx.Err()
 		case res := <-done:
-			if res.err != nil {
-				return written, res.err
-			}
-			if res.n == 0 {
+			if res.n < 0 || res.n > n {
 				return written, io.ErrShortWrite
 			}
 			written += res.n
+			if res.err != nil {
+				return written, res.err
+			}
+			if res.n < n {
+				return written, io.ErrShortWrite
+			}
 			b = b[res.n:]
 		}
 	}
@@ -313,10 +316,12 @@ func Run(ctx context.Context, opts Options, args []string) error {
 		return runProviderRecords(ctx, opts, args[1:], "symbols")
 	case "edges":
 		return runProviderRecords(ctx, opts, args[1:], "edges")
-	case "search":
+	case "query", "search":
 		return runSearch(ctx, opts, args[1:])
 	case "index":
 		return runIndex(ctx, opts, args[1:])
+	case "health":
+		return runHealth(ctx, opts, args[1:])
 	case "def":
 		return runDef(ctx, opts, args[1:])
 	case "explain":

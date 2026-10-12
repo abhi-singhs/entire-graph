@@ -6,7 +6,7 @@ provider consumed by Entire Brain, and the ownership boundary between the two.
 Entire Graph owns everything repository-local: tree-sitter parsing and
 semantic extraction, repository indexing and its derivative caches, cache
 freshness for one requested repository view, the interactive query surface
-(`search`, `def`, `explain`, `neighbors`, `impact`), and distribution of the
+(`query`, `def`, `explain`, `neighbors`, `impact`), and distribution of the
 agent instruction files via `init-agents`. Entire Brain owns durable and
 cross-repository state: persistence of ingested snapshots, memory that
 outlives one command, cross-project reconciliation, and the MCP/presentation
@@ -77,7 +77,7 @@ reference.
 ### Indexing profiles
 
 `--profile full|fast|syntax-only` selects indexing depth. Provider snapshot
-commands (`snapshot`, `symbols`, and `edges`) default to `full`; search defaults
+commands (`snapshot`, `symbols`, and `edges`) default to `full`; `query` defaults
 to `fast` unless the caller selects a profile explicitly. The snapshot header
 reports the selected `profile`, its `profile_limits` (evidence, call
 resolution), the emitted `relation_set`, and the

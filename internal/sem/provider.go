@@ -33,17 +33,25 @@ import (
 )
 
 const (
-	// SchemaVersion is bumped to 1.2 for optional parser identity metadata.
+	// SchemaVersion 1.3 adds optional source-file health accounting; 1.2 added
+	// optional parser identity metadata.
 	// Schema 1.1 added the snapshot fields introduced
 	// alongside boundary source locations (the `external` flag on external records
 	// and the per-symbol source-location fields). The shape is backward compatible
 	// for tolerant readers; the bump lets consumers detect the new fields.
-	SchemaVersion         = "1.2"
+	SchemaVersion         = "1.3"
 	ProviderName          = "entire-graph"
 	StableSymbolIDVersion = "compound-v1"
 	// IdentityRevision is a global, opaque revision of parser identity rules across
 	// all languages. Change it when corrections re-key existing symbols.
-	IdentityRevision     = "2"
+	//
+	// Revision 3: Python nested callables are qualified by the enclosing
+	// CALLABLE rather than the enclosing class, so a helper defined inside a
+	// method is `C.m.helper` (kind "function") instead of the phantom member
+	// `C.helper` (kind "method"). This re-keys every Python nested-callable
+	// symbol, and it un-keys the `#sig:` suffixes that the phantom forced onto
+	// real same-named members.
+	IdentityRevision     = "3"
 	defaultMaxParseBytes = 4 * 1024 * 1024
 	// defaultMaxSourceFiles bounds how many files one snapshot will list. The
 	// per-file indexes a snapshot keeps (one file record and its retained symbols)
@@ -205,6 +213,7 @@ var ooRelationSupport = map[string][]string{
 var schemaFeatures = []string{
 	"boundary_source_locations",
 	"completeness_breakdown",
+	"completeness_health",
 	"language_versions",
 	"relation_evidence",
 	"relation_evidence_dropped",
@@ -264,6 +273,7 @@ type ProfileLimits struct {
 type CompletenessReport struct {
 	Languages map[string]LanguageCompleteness `json:"languages"`
 	Relations map[string]int                  `json:"relations"`
+	Health    GraphHealth                     `json:"health,omitzero"`
 }
 
 type LanguageCompleteness struct {
@@ -292,6 +302,7 @@ type PartialFailure struct {
 	Code                 string `json:"code"`
 	Severity             string `json:"severity"`
 	FilePath             string `json:"file_path,omitempty"`
+	Language             string `json:"language,omitempty"`
 	EffectOnCompleteness string `json:"effect_on_semantic_completeness"`
 	Detail               string `json:"detail,omitempty"`
 }
@@ -575,6 +586,17 @@ type ProviderSnapshotOptions struct {
 	// (see searchSnapshotKey), so a forced rebuild refreshes the same entry every
 	// other reader serves.
 	ForceRebuild bool
+	// trackRepoIgnored opts into the repoIgnoreLedger accounting inside
+	// openSource: without it the ledger stays nil and every ledger method is a
+	// no-op (see repoIgnoreLedger's nil receivers), so no extra directory reads
+	// or nested-.gitignore parsing happen for a caller that never looks at the
+	// result. Only preselectSearchFiles reads sourceContext.repoIgnored today
+	// (into SearchResponse.RepoIgnored); every other prepareSource caller
+	// (snapshot/index/symbol/edge building) discarded the report, yet paid the
+	// walk-into-every-pruned-directory cost of producing it on every open.
+	// Deliberately unexported: it is an internal wiring detail, not a documented
+	// option, and is not part of the cache key (it changes no snapshot content).
+	trackRepoIgnored bool
 	// cachePolicy is an immutable, bounded capture of external ignore inputs.
 	// Cache pipelines set it once and carry it through keying and construction.
 	cachePolicy *capturedIgnorePolicy
@@ -987,6 +1009,9 @@ type sourceContext struct {
 	ignores  ignoreMatcher
 	close    func() error
 	warnings []ProviderWarning
+	// repoIgnored reports what the REPOSITORY's own ignore files removed from the
+	// listing Git produced, or nil when they removed nothing.
+	repoIgnored *RepoIgnoreReport
 }
 
 // oversizeAt reports the oversize record for path when the source has one.
@@ -1128,6 +1153,107 @@ func collectRegistrationAliases(stop func() bool, paths []string, read contentRe
 		aliasesByHandler[handler] = dedupeSortedStrings(aliases)
 	}
 	return aliasesByHandler
+}
+
+// registrationBindableKind reports whether a symbol kind is one a registration
+// table can bind a command verb to. A commands/<name>.json entry names a
+// FUNCTION; the corpus may also hold a type, field, constant or variable with
+// that same bare name, and those are not rival handlers — counting them as
+// ambiguity suppressed the only real binding.
+func registrationBindableKind(kind string) bool {
+	switch kind {
+	case "function", "method", "constructor", "procedure", "subroutine", "macro", "closure", "lambda":
+		return true
+	}
+	return false
+}
+
+// registrationCandidateCounts counts, across the whole corpus, how many symbols
+// of a kind a registration table can bind carry each handler name. A verb is
+// attached only to a name that is counted exactly once, so the count has to be
+// complete before the FIRST candidate is emitted.
+//
+// It is a separate pass because the file pipeline cannot supply it. That
+// pipeline reduces results as workers finish -- the coordinator admits only
+// twice the worker count of unreduced results -- so at the moment a handler's
+// own file is reduced, the files after it have not been parsed and its rivals
+// are not yet knowable. Holding the candidate RECORDS back until the loop ended
+// answered that, but it moved them out of their file's place in the record
+// stream: a symbol from the first file was written after the last file's record
+// and its symbols, which the snapshot format documents as impossible ("file
+// records, then symbol records, emitted per file as parsing progresses"), and a
+// consumer that closes file-scoped state when the next file record arrives has
+// nowhere to put them. Buffering the DECISION instead keeps every symbol in its
+// own file's block.
+//
+// The cost is confined to repositories that ship a registration table: with no
+// commands/<name>.json the map is empty and this returns immediately. Where
+// there is one, every file is read and tokenized once more, and only the files
+// that MENTION a handler name -- the identifier has to appear for the file to
+// define it -- are parsed a second time.
+func registrationCandidateCounts(
+	ctx context.Context,
+	sc sourceContext,
+	spec profileSpec,
+	maxParseBytes int,
+	workers int,
+	aliasesByHandler map[string][]string,
+	gates ...budgetGate,
+) (map[string]int, error) {
+	counts := map[string]int{}
+	if len(aliasesByHandler) == 0 {
+		return counts, nil
+	}
+	gate := newBudgetGate(ctx, time.Time{}, time.Now)
+	if len(gates) > 0 {
+		gate = gates[0]
+	}
+	err := runProviderFilePipeline(ctx, gate.err, sc.paths, workers,
+		func(workerCtx context.Context, index int, path string) providerFileResult {
+			content, readable := sc.read(path)
+			if !readable || !mentionsRegistrationHandlerInFile(path, content, aliasesByHandler) {
+				return providerFileResult{index: index, path: path}
+			}
+			return processProviderFile(workerCtx, gate, sc, spec, maxParseBytes, index, path)
+		},
+		func(result providerFileResult) error {
+			for _, symbol := range result.symbols {
+				if len(aliasesByHandler[symbol.Name]) > 0 && registrationBindableKind(symbol.Kind) {
+					counts[symbol.Name]++
+				}
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return counts, nil
+}
+
+// mentionsRegistrationHandler reports whether the content writes a handler name
+// as a whole identifier. Content is tokenized once and each token looked up,
+// rather than searched once per handler, so a table of several hundred verbs
+// costs the same single pass as one verb. A file that never writes the
+// identifier cannot define it, which is what keeps the census from parsing the
+// whole corpus twice.
+func mentionsRegistrationHandler(content string, aliasesByHandler map[string][]string) bool {
+	for index := 0; index < len(content); {
+		character := content[index]
+		if !(character == '_' || (character >= 'A' && character <= 'Z') || (character >= 'a' && character <= 'z')) {
+			index++
+			continue
+		}
+		end := index
+		for end < len(content) && isIdentifierByte(content[end]) {
+			end++
+		}
+		if _, isHandler := aliasesByHandler[content[index:end]]; isHandler {
+			return true
+		}
+		index = end
+	}
+	return false
 }
 
 // dedupeSortedStrings removes adjacent duplicates from a sorted slice in place.
@@ -1385,7 +1511,19 @@ func streamSnapshotWithWorkerCount(ctx context.Context, repo, providerVersion st
 	// pipeline's timer to notice.
 	budgetedRead := gate.reader(sc.read)
 	aliasesByHandler := collectRegistrationAliases(gate.expired, sc.paths, budgetedRead)
-	if err := noteStop(); err != nil {
+	censusSource := sc
+	censusSource.read = budgetedRead
+	// A command verb names ONE callable. The verb was attached to every symbol
+	// that happened to share the handler's unqualified name, so a repository
+	// with a same-named function in another package — or a method, or a
+	// declaration in a different language entirely — answered the command query
+	// with symbols that are not the handler, ranked as an exact alias hit.
+	// Uniqueness is only knowable once the corpus is parsed, so it is decided
+	// by its own census pass BEFORE the file loop; the candidate symbols
+	// themselves are then emitted in their own file's place, as every other
+	// symbol is.
+	aliasCandidateCount, err := registrationCandidateCounts(workCtx, censusSource, spec, maxParseBytes, workers, aliasesByHandler, gate)
+	if err = classifyStop(err); err != nil {
 		return err
 	}
 
@@ -1418,12 +1556,23 @@ func streamSnapshotWithWorkerCount(ctx context.Context, repo, providerVersion st
 
 			if result.parsed {
 				parsedFileCount++
-				for i := range result.symbols {
-					if aliases := aliasesByHandler[result.symbols[i].Name]; len(aliases) > 0 {
-						result.symbols[i].Aliases = aliases
+				applyCppSpecializationAliases(result.symbols)
+				for index := range result.symbols {
+					symbol := &result.symbols[index]
+					// Only a callable can carry the verb: a registration table
+					// binds it to a function, never to a type, field, constant
+					// or variable, so counting those kinds turned an unrelated
+					// same-named struct into a phantom rival and suppressed the
+					// one real handler. An ambiguous name carries none, because
+					// a symbol that claims to be a command it does not implement
+					// is worse than a command with no symbol.
+					if len(aliasesByHandler[symbol.Name]) == 0 || !registrationBindableKind(symbol.Kind) {
+						continue
+					}
+					if aliasCandidateCount[symbol.Name] == 1 {
+						symbol.Aliases = appendUnique(symbol.Aliases, aliasesByHandler[symbol.Name]...)
 					}
 				}
-				applyCppSpecializationAliases(result.symbols)
 				for _, symbol := range result.symbols {
 					if err := emit(symbol); err != nil {
 						return err
@@ -1626,15 +1775,16 @@ func streamSnapshotWithWorkerCount(ctx context.Context, repo, providerVersion st
 		Warnings:        warnings,
 		PartialFailures: failures,
 		Stats: ProviderStats{
-			Files:             len(files),
-			ParsedFiles:       parsedFileCount,
-			Symbols:           symbolCount,
-			Relations:         relationCount,
-			PartialFailures:   len(failures),
-			CompletenessLevel: completenessLevel(failures, len(files), parsedFileCount, symbolCount),
+			Files:           len(files),
+			ParsedFiles:     parsedFileCount,
+			Symbols:         symbolCount,
+			Relations:       relationCount,
+			PartialFailures: len(failures),
 		},
 		Completeness: CompletenessReport{Languages: completenessLangs, Relations: relationsByType},
 	}
+	summary.Completeness.Health = calculateGraphHealth(files, failures, summary.Stats)
+	summary.Stats.CompletenessLevel = summary.Completeness.Health.Status
 	// Progress callbacks and the last external record can cancel as well.
 	// Never publish a success summary for a canceled snapshot.
 	if err := ctx.Err(); err != nil {
@@ -1918,11 +2068,12 @@ func prepareSource(ctx context.Context, repo string, options ProviderSnapshotOpt
 		committedRevision = commit
 	}
 	opened, err := openSource(ctx, absRepo, committedRevision, sourceOptions{
-		ignoreFiles:  options.IgnoreFiles,
-		includeFiles: options.IncludeFiles,
-		cachePolicy:  options.cachePolicy,
-		maxReadBytes: resolveMaxParseBytes(options.MaxParseBytes),
-		maxFiles:     options.MaxFiles,
+		ignoreFiles:      options.IgnoreFiles,
+		includeFiles:     options.IncludeFiles,
+		cachePolicy:      options.cachePolicy,
+		maxReadBytes:     resolveMaxParseBytes(options.MaxParseBytes),
+		maxFiles:         options.MaxFiles,
+		trackRepoIgnored: options.trackRepoIgnored,
 	})
 	if err != nil {
 		return sourceContext{}, err
@@ -1966,17 +2117,18 @@ func prepareSource(ctx context.Context, repo string, options ProviderSnapshotOpt
 		})
 	}
 	return sourceContext{
-		absRepo:    absRepo,
-		key:        key,
-		commit:     commit,
-		tree:       tree,
-		paths:      paths,
-		read:       opened.read,
-		readPrefix: opened.readPrefix,
-		oversize:   opened.oversize,
-		ignores:    opened.ignores,
-		close:      opened.close,
-		warnings:   warnings,
+		absRepo:     absRepo,
+		key:         key,
+		commit:      commit,
+		tree:        tree,
+		paths:       paths,
+		read:        opened.read,
+		readPrefix:  opened.readPrefix,
+		oversize:    opened.oversize,
+		ignores:     opened.ignores,
+		close:       opened.close,
+		warnings:    warnings,
+		repoIgnored: opened.repoIgnored,
 	}, nil
 }
 
@@ -5215,6 +5367,11 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 		}
 	}
 	manifestImports := buildManifestImportResolver(files, readContent, shouldStop)
+	// Import blocks of files OTHER than the one being scanned, which the Go
+	// interface-implementation hop needs to decide package qualifiers across the
+	// declaring files. Lazy and memoised: only files that actually reach a
+	// signature comparison are read.
+	goFileImportIndex := newGoFileImports(readContent, files, manifestImports.goModules)
 
 	// pythonModuleExists reports whether the repo contains a Python file that the
 	// strict dotted-module matcher resolves `module` to (the module's own source
@@ -6245,7 +6402,7 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 			// symbol still reached it and matched a `x.y(...)` shape anywhere
 			// in the file against another language's methods.
 			if spec.callResolution == "full" && callExtractionLanguage(file.Language) {
-				for _, r := range receiverCallRelations(from, body, methodsByContainer, superContainerByID, implementersByContainer, symbolsByShortName, returnTypesBySymbolNameAndFile, returnTypesBySymbolNameAndDir, importsByName, manifestImports.goModule, pkgVarTypesByDir[filepath.ToSlash(filepath.Dir(file.Path))], phpPropTypes, kotlinPropTypes, typeScriptPropTypes, fieldsByContainer, swiftTypes) {
+				for _, r := range receiverCallRelations(from, body, methodsByContainer, superContainerByID, implementersByContainer, symbolsByShortName, returnTypesBySymbolNameAndFile, returnTypesBySymbolNameAndDir, importsByName, manifestImports.goModules, goFileImportIndex, pkgVarTypesByDir[filepath.ToSlash(filepath.Dir(file.Path))], phpPropTypes, kotlinPropTypes, typeScriptPropTypes, fieldsByContainer, swiftTypes) {
 					emit(r)
 				}
 				for _, r := range importedReceiverCallRelations(from, body, importsByName, symbolsByShortName) {
@@ -7335,17 +7492,23 @@ func collectPackageVarTypes(content string) map[string]pkgQualType {
 }
 
 // resolveQualifiedType picks the type-like symbol for a package-qualified
-// reference by the Go convention that a package's import alias equals its
-// directory basename (json.Encoder -> the Encoder in .../json/). Requires a
-// unique match so an ambiguous alias resolves to nothing rather than wrongly.
-func resolveQualifiedType(from SymbolRecord, qt pkgQualType, symbolsByShortName map[string][]SymbolRecord) (SymbolRecord, bool) {
+// reference. The written qualifier is only a spelling: `import foo "m/realpkg"`
+// binds foo to realpkg, and a different in-module package whose directory is
+// literally foo/ is an unrelated package. So when the file's imports resolve the
+// qualifier, the candidate's directory must match that import PATH; the Go
+// convention that a qualifier equals a directory basename (json.Encoder -> the
+// Encoder in .../json/) only stands in when the qualifier is unresolved.
+// Requires a unique match so an ambiguous qualifier resolves to nothing rather
+// than wrongly.
+func resolveQualifiedType(from SymbolRecord, qt pkgQualType, importsByName map[string][]string, symbolsByShortName map[string][]SymbolRecord, goModules goModuleIndex) (SymbolRecord, bool) {
+	importPaths := importsByName[qt.alias]
 	var match SymbolRecord
 	found := 0
 	for _, cand := range sharedTypeCandidates(from, symbolsByShortName[qt.typeName]) {
 		if !typeLikeKind(cand.Kind) {
 			continue
 		}
-		if filepath.Base(filepath.Dir(filepath.ToSlash(cand.FilePath))) == qt.alias {
+		if qualifiedTypeDirMatches(cand.FilePath, qt.alias, goModules, importPaths) {
 			match = cand
 			found++
 		}
@@ -7356,7 +7519,46 @@ func resolveQualifiedType(from SymbolRecord, qt pkgQualType, symbolsByShortName 
 	return SymbolRecord{}, false
 }
 
-func receiverCallRelations(from SymbolRecord, body symbolBody, methodsByContainer map[string]map[string]SymbolRecord, superContainerByID map[string]string, implementersByContainer map[string][]string, symbolsByShortName map[string][]SymbolRecord, returnTypesBySymbolNameAndFile, returnTypesBySymbolNameAndDir map[string]map[string][]string, importsByName map[string][]string, goModule string, pkgVarTypes map[string]pkgQualType, phpPropTypes, kotlinPropTypes, typeScriptPropTypes map[string]string, fieldsByContainer map[string]map[string]SymbolRecord, swiftTypes swiftFileTypes) []RelationRecord {
+// qualifiedTypeDirMatches reports whether a declaration's directory is the
+// package a qualifier names.
+//
+// With resolved import paths the import must be one a MODULE OF THIS REPOSITORY
+// owns, and the declaration's repo-relative directory must be exactly the part
+// of that path below its module — the layout Go requires of an in-module
+// package. A path SUFFIX is not that test: `foo "external.example/realpkg"` ends
+// in `/realpkg`, so a suffix rule let a third-party import bind the repository's
+// own `realpkg/` directory and emit a CALLS edge into a package the file never
+// imported. An import outside every module in the repository resolves to
+// nothing, because no repository symbol can be its declaration.
+//
+// The owning module is resolved per directory rather than assumed to be the root
+// one. A repository may hold several go.mod files (a tools/ module, a local
+// `replace` target, a test module), and each re-roots the import paths beneath
+// it: with tools/go.mod declaring example.com/tool, tools/lib is
+// example.com/tool/lib. Keying that directory off the ROOT module produced
+// <root-module>/tools/lib, matched no import, and deleted every qualified
+// receiver edge into a nested module.
+//
+// With no resolved path for the qualifier the alias-equals-basename convention
+// (json.Encoder -> the Encoder in .../json/) is all the evidence there is.
+func qualifiedTypeDirMatches(filePath, alias string, goModules goModuleIndex, importPaths []string) bool {
+	dir := normalizeRepoDir(filepath.Dir(filepath.ToSlash(filePath)))
+	if len(importPaths) == 0 {
+		return dir != "" && path.Base(dir) == alias
+	}
+	want, ok := goModules.importPathFor(dir)
+	if !ok {
+		return false
+	}
+	for _, importPath := range importPaths {
+		if strings.Trim(filepath.ToSlash(importPath), "/") == want {
+			return true
+		}
+	}
+	return false
+}
+
+func receiverCallRelations(from SymbolRecord, body symbolBody, methodsByContainer map[string]map[string]SymbolRecord, superContainerByID map[string]string, implementersByContainer map[string][]string, symbolsByShortName map[string][]SymbolRecord, returnTypesBySymbolNameAndFile, returnTypesBySymbolNameAndDir map[string]map[string][]string, importsByName map[string][]string, goModules goModuleIndex, goImports *goFileImports, pkgVarTypes map[string]pkgQualType, phpPropTypes, kotlinPropTypes, typeScriptPropTypes map[string]string, fieldsByContainer map[string]map[string]SymbolRecord, swiftTypes swiftFileTypes) []RelationRecord {
 	if typeLikeKind(from.Kind) {
 		return nil
 	}
@@ -7752,14 +7954,14 @@ func receiverCallRelations(from SymbolRecord, body symbolBody, methodsByContaine
 			}
 		}
 	}
-	importedReceiverVars := importedReceiverVarTypes(from.Signature, body, importsByName, goModule)
+	importedReceiverVars := importedReceiverVarTypes(from.Signature, body, importsByName, goModules)
 	// Receivers declared with an in-module package-qualified type
 	// (`comm communicator.Communicator`). parameterVarTypes cannot see these, so
 	// without this tier an interface-typed parameter — the ordinary way Go passes
 	// a collaborator — carries no receiver type at all.
 	goQualifiedReceiverVars := map[string]pkgQualType{}
 	if from.Language == "Go" {
-		goQualifiedReceiverVars = goInModuleQualifiedReceiverTypes(from.Signature, body, importsByName, goModule)
+		goQualifiedReceiverVars = goInModuleQualifiedReceiverTypes(from.Signature, body, importsByName, goModules)
 	}
 	deepReturnedCallSuffixes := receiverDeepChainSuffixes(deepChainedReturnCalls, returnedDeepChainCalls)
 	paramTypes := parameterVarTypes(from.Signature)
@@ -7905,7 +8107,7 @@ func receiverCallRelations(from SymbolRecord, body symbolBody, methodsByContaine
 				// convention resolveQualifiedType already encodes) so the method
 				// lookup below runs against the right declaration. For an interface
 				// that declaration's members are its method requirements.
-				sym, ok := resolveQualifiedType(from, qt, symbolsByShortName)
+				sym, ok := resolveQualifiedType(from, qt, importsByName, symbolsByShortName, goModules)
 				if !ok {
 					continue
 				}
@@ -7917,7 +8119,7 @@ func receiverCallRelations(from SymbolRecord, body symbolBody, methodsByContaine
 				// Package-level var of a package-qualified type (alias.Type). Resolve
 				// the specific imported type so an ambiguous bare name (Encoder in
 				// both json and cbor) maps to the right one.
-				sym, ok := resolveQualifiedType(from, qt, symbolsByShortName)
+				sym, ok := resolveQualifiedType(from, qt, importsByName, symbolsByShortName, goModules)
 				if !ok {
 					continue
 				}
@@ -9171,7 +9373,7 @@ func receiverCallRelations(from SymbolRecord, body symbolBody, methodsByContaine
 			break
 		}
 	}
-	return appendGoInterfaceImplementationCalls(relations, from, symbolsByShortName, methodsByContainer)
+	return appendGoInterfaceImplementationCalls(relations, from, symbolsByShortName, methodsByContainer, goImports)
 }
 
 func receiverQualifiedMethodTarget(from SymbolRecord, call receiverCall, candidates []SymbolRecord, returnTypesBySymbolNameAndFile map[string]map[string][]string) (SymbolRecord, float64, string, string, string, bool) {
@@ -9248,7 +9450,7 @@ func goInterfaceRequirementMethod(symbol SymbolRecord) bool {
 //
 // The interface-method edge itself is always emitted by the caller; this is only
 // the extra implementation hop.
-func goInterfaceImplementationMethods(ifaceMethod SymbolRecord, symbolsByShortName map[string][]SymbolRecord, methodsByContainer map[string]map[string]SymbolRecord) []SymbolRecord {
+func goInterfaceImplementationMethods(ifaceMethod SymbolRecord, symbolsByShortName map[string][]SymbolRecord, methodsByContainer map[string]map[string]SymbolRecord, goImports *goFileImports) []SymbolRecord {
 	if !goInterfaceRequirementMethod(ifaceMethod) || ifaceMethod.ContainerID == "" {
 		return nil
 	}
@@ -9287,7 +9489,8 @@ func goInterfaceImplementationMethods(ifaceMethod SymbolRecord, symbolsByShortNa
 		implMembers := methodsByContainer[candidate.ContainerID]
 		satisfied := true
 		for _, requirement := range requirements {
-			if _, ok := implMembers[requirement]; !ok {
+			implMember, ok := implMembers[requirement]
+			if !ok || !goImports.signaturesMatch(members[requirement], implMember) {
 				satisfied = false
 				break
 			}
@@ -9312,6 +9515,163 @@ func goInterfaceImplementationMethods(ifaceMethod SymbolRecord, symbolsByShortNa
 		return out[i].StartLine < out[j].StartLine
 	})
 	return out
+}
+
+// goMethodSignaturesMatch compares signatures using only explicit import evidence.
+// The relation path also supplies package declarations through goFileImports.
+func goMethodSignaturesMatch(requirement, implementation string, requirementImports, implementationImports map[string]string) bool {
+	return compareGoSignatures(requirement, implementation,
+		&goTypeScope{imports: requirementImports}, &goTypeScope{imports: implementationImports}) == goTypeMatch
+}
+
+// goNormalizedMethodSignature renders a Go method signature — an interface
+// requirement (`Upload(path string, r io.Reader) error`) or a concrete
+// declaration (`func (c *Communicator) Upload(path string, r io.Reader) error`)
+// — as `(paramTypes)(resultTypes)`. The receiver, the method name and every
+// parameter/result name are dropped. It declines (false) on a generic
+// type-parameter list and on any list it cannot split into types.
+func goNormalizedMethodSignature(signature string) (string, bool) {
+	rest := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(signature), "{"))
+	if after, ok := strings.CutPrefix(rest, "func"); ok {
+		rest = strings.TrimSpace(after)
+		if strings.HasPrefix(rest, "(") { // method receiver
+			closing := matchingParen(rest, 0)
+			if closing < 0 {
+				return "", false
+			}
+			rest = strings.TrimSpace(rest[closing+1:])
+		}
+	}
+	name := 0
+	for name < len(rest) && identifierByte(rest[name]) && rest[name] != '.' {
+		name++
+	}
+	if name == 0 {
+		return "", false
+	}
+	rest = strings.TrimSpace(rest[name:])
+	if strings.HasPrefix(rest, "[") { // generic method: decline rather than guess
+		return "", false
+	}
+	if !strings.HasPrefix(rest, "(") {
+		return "", false
+	}
+	closing := matchingParen(rest, 0)
+	if closing < 0 {
+		return "", false
+	}
+	params, ok := goSignatureTypeList(rest[1:closing])
+	if !ok {
+		return "", false
+	}
+	results := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(rest[closing+1:]), "{"))
+	if strings.HasPrefix(results, "(") {
+		end := matchingParen(results, 0)
+		if end < 0 || strings.TrimSpace(results[end+1:]) != "" {
+			return "", false
+		}
+		results = results[1:end]
+	}
+	resultTypes, ok := goSignatureTypeList(results)
+	if !ok {
+		return "", false
+	}
+	return "(" + strings.Join(params, ",") + ")(" + strings.Join(resultTypes, ",") + ")", true
+}
+
+// goSignatureTypeList reduces a Go parameter or result list to its types. Go
+// requires a list to be entirely named or entirely unnamed, so one part of the
+// form `ident <type>` marks the whole list named; in a named list a bare
+// identifier is a grouped name that borrows the type declared to its right
+// (`a, b string`).
+func goSignatureTypeList(list string) ([]string, bool) {
+	list = strings.TrimSpace(list)
+	if list == "" {
+		return nil, true
+	}
+	parts := splitTopLevelParameters(list)
+	named := false
+	for _, part := range parts {
+		if _, _, ok := goNamedParamSplit(part); ok {
+			named = true
+			break
+		}
+	}
+	types := make([]string, len(parts))
+	if !named {
+		for i, part := range parts {
+			typeText := goCanonicalTypeText(part)
+			if typeText == "" {
+				return nil, false
+			}
+			types[i] = typeText
+		}
+		return types, true
+	}
+	pending := ""
+	for i := len(parts) - 1; i >= 0; i-- {
+		part := strings.TrimSpace(parts[i])
+		if _, typeText, ok := goNamedParamSplit(part); ok {
+			pending = goCanonicalTypeText(typeText)
+		} else if !isTypeName(part) {
+			// In a named list every remaining part must be a grouped name.
+			return nil, false
+		}
+		if pending == "" {
+			return nil, false
+		}
+		types[i] = pending
+	}
+	return types, true
+}
+
+// goTypeLeadKeywords are the words that open a type expression, so a part
+// beginning with one (`chan int`, `func(int) error`) is an unnamed type and not
+// a `name type` pair.
+var goTypeLeadKeywords = map[string]bool{"chan": true, "func": true, "map": true, "struct": true, "interface": true}
+
+// goNamedParamSplit splits `name type` when the part is unambiguously that.
+func goNamedParamSplit(part string) (string, string, bool) {
+	part = strings.TrimSpace(part)
+	i := 0
+	for i < len(part) && identifierByte(part[i]) && part[i] != '.' {
+		i++
+	}
+	if i == 0 || i >= len(part) || (part[i] != ' ' && part[i] != '\t') {
+		return "", "", false
+	}
+	name := part[:i]
+	if goTypeLeadKeywords[name] {
+		return "", "", false
+	}
+	typeText := strings.TrimSpace(part[i:])
+	if typeText == "" {
+		return "", "", false
+	}
+	return name, typeText, true
+}
+
+// goCanonicalTypeText drops whitespace that is not separating two identifier
+// characters, so `map[string] int` and `map[string]int` compare equal while
+// `chan int` keeps its word break.
+func goCanonicalTypeText(text string) string {
+	var out strings.Builder
+	prevIdent, pendingSpace := false, false
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			pendingSpace = out.Len() > 0
+			continue
+		}
+		cur := identifierByte(c)
+		if pendingSpace && prevIdent && cur {
+			out.WriteByte(' ')
+		}
+		pendingSpace = false
+		out.WriteByte(c)
+		prevIdent = cur
+	}
+	return out.String()
 }
 
 // uniqueGoConcreteMethodByShortName is uniqueMethodByShortName restricted to Go
@@ -9360,7 +9720,7 @@ func goMethodSymbolByID(id string, symbolsByShortName map[string][]SymbolRecord)
 // never rewritten — this is purely additive, and the interface node keeps the
 // incoming edge that used to be impossible (a Go interface had no method symbols
 // at all, so terraform's communicator.Communicator was a dead end).
-func appendGoInterfaceImplementationCalls(relations []RelationRecord, from SymbolRecord, symbolsByShortName map[string][]SymbolRecord, methodsByContainer map[string]map[string]SymbolRecord) []RelationRecord {
+func appendGoInterfaceImplementationCalls(relations []RelationRecord, from SymbolRecord, symbolsByShortName map[string][]SymbolRecord, methodsByContainer map[string]map[string]SymbolRecord, goImports *goFileImports) []RelationRecord {
 	if from.Language != "Go" || len(relations) == 0 {
 		return relations
 	}
@@ -9383,7 +9743,7 @@ func appendGoInterfaceImplementationCalls(relations []RelationRecord, from Symbo
 		if !ok {
 			continue
 		}
-		for _, impl := range goInterfaceImplementationMethods(ifaceMethod, symbolsByShortName, methodsByContainer) {
+		for _, impl := range goInterfaceImplementationMethods(ifaceMethod, symbolsByShortName, methodsByContainer, goImports) {
 			if impl.ID == from.ID || existing[impl.ID] {
 				continue
 			}
@@ -13172,6 +13532,9 @@ type sourceOptions struct {
 	// maxFiles caps how many paths the listing returns. Zero uses the provider
 	// default; negative removes the cap.
 	maxFiles int
+	// trackRepoIgnored opts into building a real repoIgnoreLedger. See
+	// ProviderSnapshotOptions.trackRepoIgnored for why this defaults to off.
+	trackRepoIgnored bool
 }
 
 // openedSource is what openSource resolves: the file list, the per-file readers,
@@ -13188,6 +13551,9 @@ type openedSource struct {
 	prime    func([]string) error
 	close    func() error
 	warnings []ProviderWarning
+	// repoIgnored reports what the REPOSITORY's own ignore files removed from the
+	// listing Git produced, or nil when they removed nothing. See RepoIgnoreReport.
+	repoIgnored *RepoIgnoreReport
 }
 
 // openSource lists the repository's files and returns a per-file content reader
@@ -13216,7 +13582,10 @@ func openSource(ctx context.Context, repo, committedRevision string, options sou
 		if err != nil {
 			return openedSource{}, err
 		}
-		paths, err := gitutil.ListFiles(ctx, repo, committedRevision)
+		// Regular files only. A tracked symlink is a blob whose content is its
+		// target path, so listing one as source hands that path to a parser as
+		// if it were code; the worktree branch below already refuses them.
+		paths, err := gitutil.ListRegularFiles(ctx, repo, committedRevision)
 		if err != nil {
 			return openedSource{}, err
 		}
@@ -13225,7 +13594,16 @@ func openSource(ctx context.Context, repo, committedRevision string, options sou
 			return openedSource{}, err
 		}
 		paths = filterVendoredPaths(paths, vendorRules)
-		paths = filterIgnoredPaths(paths, ignores)
+		// Every path in a committed-tree listing is tracked by construction, so
+		// anything the ignore rules drop here is source Git itself would show the
+		// reader. That is precisely the set worth disclosing. A nil ledger (every
+		// caller but search) makes every method below a no-op: see
+		// trackRepoIgnored.
+		var ledger *repoIgnoreLedger
+		if options.trackRepoIgnored {
+			ledger = &repoIgnoreLedger{listingLimit: resolveMaxSourceFiles(options.maxFiles)}
+		}
+		paths = filterIgnoredPaths(paths, ignores, ledger)
 		paths, capWarnings := capSourceFiles(paths, options.maxFiles)
 		warnings := capWarnings
 		treePathPrefix, err := gitutil.RepoPrefix(ctx, repo)
@@ -13319,21 +13697,30 @@ func openSource(ctx context.Context, repo, committedRevision string, options sou
 			return limited.Prime(unsafeTreePaths)
 		}
 		return openedSource{
-			paths:      paths,
-			read:       read,
-			readPrefix: readPrefix,
-			oversize:   oversize,
-			ignores:    ignores,
-			prime:      prime,
-			close:      closeReaders,
-			warnings:   warnings,
+			paths:       paths,
+			read:        read,
+			readPrefix:  readPrefix,
+			oversize:    oversize,
+			ignores:     ignores,
+			prime:       prime,
+			close:       closeReaders,
+			warnings:    warnings,
+			repoIgnored: ledger.report(),
 		}, nil
 	}
 	ignores, err := loadWorktreeIgnoreMatcher(repo, options.ignoreFiles, options.includeFiles)
 	if err != nil {
 		return openedSource{}, err
 	}
-	paths, sweepWarnings, err := worktreeSourceFiles(ctx, repo, ignores, len(options.includeFiles) > 0)
+	// A nil ledger (every caller but search) makes every method below a
+	// no-op, including the pruned-directory walk that would otherwise descend
+	// into an ignored tree just to produce a report nobody reads: see
+	// trackRepoIgnored.
+	var worktreeLedger *repoIgnoreLedger
+	if options.trackRepoIgnored {
+		worktreeLedger = &repoIgnoreLedger{listingLimit: resolveMaxSourceFiles(options.maxFiles)}
+	}
+	paths, sweepWarnings, err := worktreeSourceFiles(ctx, repo, ignores, len(options.includeFiles) > 0, worktreeLedger)
 	if err != nil {
 		return openedSource{}, err
 	}
@@ -13385,7 +13772,14 @@ func openSource(ctx context.Context, repo, committedRevision string, options sou
 		// reports per-file read failures, but make every content read fail closed.
 		// The listing preflight already refuses a persistently execute-only root;
 		// this branch covers permissions changing between listing and reading.
-		return openManuallyConfinedWorktreeSource(repo, paths, ignores, warnings, maxReadBytes), nil
+		// The listing above already ran the ignore rules and filled the ledger,
+		// so the disclosure is owed on this branch exactly as on the one below.
+		// Losing it here would make an unreadable repository root the one place a
+		// repo-controlled exclusion goes unreported, which is the silence this
+		// report exists to close.
+		confined := openManuallyConfinedWorktreeSource(repo, paths, ignores, warnings, maxReadBytes)
+		confined.repoIgnored = worktreeLedger.report()
+		return confined, nil
 	}
 	// Taken once, from the descriptor os.OpenRoot just pinned, and consulted by
 	// every fallback read below. See pinnedRootIdentity.
@@ -13457,8 +13851,9 @@ func openSource(ctx context.Context, repo, committedRevision string, options sou
 		// This field was nil while the working-tree reader held no handle. The root
 		// outlives every closure above, so the caller that closes the source is what
 		// releases it; every consumer already guards for a nil closer.
-		close:    root.Close,
-		warnings: warnings,
+		close:       root.Close,
+		warnings:    warnings,
+		repoIgnored: worktreeLedger.report(),
 	}, nil
 }
 
@@ -14001,6 +14396,12 @@ func isInstalledDependencyDirName(rel, name string) bool {
 // .gitignore files can answer it.
 type vendorIgnoreRules interface {
 	ReincludesDescendant(rel string) bool
+	// ReincludesPath is the same question asked about one path rather than
+	// about a whole subtree. Directory pruning needs the subtree answer (a
+	// re-included package can only be reached by descending); a per-file
+	// verdict needs this one, or a single negation anywhere under a vendored
+	// tree re-admits all of it.
+	ReincludesPath(rel string) bool
 }
 
 // hasGitDirComponent reports whether a repo-relative path IS a git directory, or
@@ -14452,6 +14853,12 @@ type gitDirExcluder struct {
 	// be inspected. hiddenEvidence already drives the fail-closed exclusion;
 	// this list makes that wider omission visible to callers and cache identity.
 	unreadablePointers []string
+	// unreadableIgnorePolicyDirs samples the readable directories whose OWN
+	// .gitignore could not be read within its per-file bounds, capped like
+	// unreadableWalkDirs. The directory itself is readable, so
+	// unreadableWalkWarning's wording would be untrue; these get their own
+	// disclosure.
+	unreadableIgnorePolicyDirs []string
 }
 
 // maxUnreadableWalkDirSample bounds unreadableWalkDirs and sweepUnreadableDirs.
@@ -14475,6 +14882,33 @@ var errGitDirSweepHalted = errors.New("git directory sweep halted")
 // to say so itself.
 func (g *gitDirExcluder) noteUnreadableWalkDir(rel string) {
 	retainSmallestPathSample(&g.unreadableWalkDirs, rel)
+}
+
+// noteUnreadableIgnorePolicyDir records one readable directory whose own
+// .gitignore could not be read within its per-file bounds, for
+// unreadableIgnorePolicyWarning. The subtree is excluded rather than admitted,
+// so the omission is a completeness fact the caller has to be told about.
+func (g *gitDirExcluder) noteUnreadableIgnorePolicyDir(rel string) {
+	retainSmallestPathSample(&g.unreadableIgnorePolicyDirs, rel)
+}
+
+// unreadableIgnorePolicyWarning discloses the subtrees excluded because their
+// own .gitignore was unreadable. Reporting nothing would leave the corpus
+// quietly smaller than the caller believes; failing the whole listing, which is
+// what this replaced, made one such file an outage for the entire repository.
+func (g *gitDirExcluder) unreadableIgnorePolicyWarning() []ProviderWarning {
+	if len(g.unreadableIgnorePolicyDirs) == 0 {
+		return nil
+	}
+	return []ProviderWarning{{
+		Code:     "W_WALK_UNREADABLE_IGNORE_POLICY",
+		Severity: "warning",
+		EffectOnCompleteness: "one or more directories have a .gitignore that could not be read within its " +
+			"size and rule-length bounds, so their rules are unknown and everything under them is excluded " +
+			"from this listing rather than indexed against unknown policy",
+		Detail: fmt.Sprintf("unreadable ignore policy: %s",
+			termsafe.Line(strings.Join(g.unreadableIgnorePolicyDirs, ", "))),
+	}}
 }
 
 // unreadableWalkWarning reports the shortfall noteUnreadableWalkDir recorded:
@@ -16531,7 +16965,18 @@ func (g *gitDirExcluder) descendObserving(queue []string, queued map[string]stru
 			// is exhausted; after exhaustion hiddenEvidence's promotion determines
 			// the result independently of which later entries were not inspected.
 			entries, readErr := opened.ReadDir(256)
-			sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+			// listingOrderKey, not plain Name(): the ledger's position counter is
+			// only meaningful against the order capSourceFiles truncates — the flat
+			// sorted listing — and those two disagree at every directory/file name
+			// collision. `a.go` sorts before `a/hidden.go` in a flat listing ('.' is
+			// below '/'), but a Name()-ordered walk descends into `a/` first, which
+			// both blamed a rule for a path the file cap had already discarded and
+			// silenced a path the rule really did remove. Sorting by the key that
+			// carries the separator makes this depth-first walk visit paths in the
+			// same order the flat listing holds them.
+			sort.Slice(entries, func(i, j int) bool {
+				return listingOrderKey(entries[i]) < listingOrderKey(entries[j])
+			})
 			for _, entry := range entries {
 				if !g.admitSweepEntry() {
 					_ = opened.Close()
@@ -17033,9 +17478,15 @@ func skipVendoredDir(rel, name string, ignores vendorIgnoreRules, dirTracked fun
 	if hasGitDirComponent(rel) {
 		return true
 	}
+	return vendoredScanDirName(rel, name, dirTracked) && !ignores.ReincludesDescendant(rel)
+}
+
+// vendoredScanDirName is skipVendoredDir's name-and-tracked-ness half, without
+// the re-inclusion question. Splitting it lets directory pruning keep asking
+// about the subtree while a per-path verdict asks about the path.
+func vendoredScanDirName(rel, name string, dirTracked func(string) bool) bool {
 	untrackedOnly := isAmbiguousVendoredDirName(name) || isInstalledDependencyDirName(rel, name)
-	vendored := isVendoredScanDir(rel, name) || (untrackedOnly && !dirTracked(rel))
-	return vendored && !ignores.ReincludesDescendant(rel)
+	return isVendoredScanDir(rel, name) || (untrackedOnly && !dirTracked(rel))
 }
 
 // trackedDirSet returns every repo-relative directory (slash-separated) that
@@ -18981,9 +19432,10 @@ func walkWorktreeFilesAfterGitFailure(
 	repo string,
 	ignores ignoreMatcher,
 	dirTracked func(string) bool,
+	ledger *repoIgnoreLedger,
 	cause error,
 ) ([]string, []ProviderWarning, error) {
-	paths, warnings, err := walkWorktreeFiles(ctx, repo, ignores, dirTracked)
+	paths, warnings, err := walkWorktreeFiles(ctx, repo, ignores, dirTracked, ledger)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -19076,8 +19528,8 @@ func repositoryHasGitMetadata(repo string) bool {
 // .gitignore files itself.
 type worktreeFilesLister func(context.Context, string) ([]string, error)
 
-func worktreeSourceFiles(ctx context.Context, repo string, ignores ignoreMatcher, hasIncludeFiles bool) ([]string, []ProviderWarning, error) {
-	return worktreeSourceFilesWithLister(ctx, repo, ignores, hasIncludeFiles, gitutil.ListWorktreeFiles)
+func worktreeSourceFiles(ctx context.Context, repo string, ignores ignoreMatcher, hasIncludeFiles bool, ledger *repoIgnoreLedger) ([]string, []ProviderWarning, error) {
+	return worktreeSourceFilesWithLister(ctx, repo, ignores, hasIncludeFiles, ledger, gitutil.ListWorktreeFiles)
 }
 
 func worktreeSourceFilesWithLister(
@@ -19085,6 +19537,7 @@ func worktreeSourceFilesWithLister(
 	repo string,
 	ignores ignoreMatcher,
 	hasIncludeFiles bool,
+	ledger *repoIgnoreLedger,
 	listWorktreeFiles worktreeFilesLister,
 ) ([]string, []ProviderWarning, error) {
 	if !gitMetadataSafeForSubprocessContext(ctx, repo) {
@@ -19093,7 +19546,7 @@ func worktreeSourceFilesWithLister(
 		// directory as potentially tracked so unsafe metadata cannot cause source
 		// omissions, and the warning reports the Git-only policy that is unavailable.
 		dirTracked := func(string) bool { return true }
-		return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, err)
+		return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, err)
 	}
 	trackedDirs, trackedErr := trackedDirSet(ctx, repo)
 	if trackedErr != nil {
@@ -19102,10 +19555,10 @@ func worktreeSourceFilesWithLister(
 		}
 		if repositoryHasGitMetadata(repo) {
 			dirTracked := func(string) bool { return true }
-			return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, trackedErr)
+			return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, trackedErr)
 		}
 		dirTracked := func(string) bool { return false }
-		return walkWorktreeFiles(ctx, repo, ignores, dirTracked)
+		return walkWorktreeFiles(ctx, repo, ignores, dirTracked, ledger)
 	}
 	dirTracked := func(rel string) bool {
 		_, ok := trackedDirs[rel]
@@ -19115,18 +19568,38 @@ func worktreeSourceFilesWithLister(
 		if errors.Is(err, errGitWorktreeFallbackUnsafe) {
 			return nil, nil, err
 		}
-		return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, err)
+		return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, err)
 	}
 	listed, err := listWorktreeFiles(ctx, repo)
 	if err != nil {
+		// The fallback accounts for its own exclusions: this listing mode narrows
+		// the corpus the same way, so a disclosure that stopped at the Git-backed
+		// path would leave the identical blind spot behind wherever Git cannot
+		// enumerate the tree.
 		if errors.Is(err, gitutil.ErrWorktreeListingTruncated) {
 			return nil, nil, fmt.Errorf("list Git worktree paths: %w", err)
 		}
 		if repositoryHasGitMetadata(repo) {
-			return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, err)
+			return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, err)
 		}
-		return walkWorktreeFiles(ctx, repo, ignores, dirTracked)
+		return walkWorktreeFiles(ctx, repo, ignores, dirTracked, ledger)
 	}
+	// Git listed the tree, so it has already applied the checkout's own
+	// .git/info/exclude to the only content that list governs — untracked files.
+	// Anything those rules could still match here is TRACKED, which Git never
+	// hides for them, and dropping it would take source out of the corpus with no
+	// disclosure, because the list belongs to the local operator rather than to
+	// the repository.
+	//
+	// That stripped copy is for the FINAL ignore verdict below only. The
+	// vendored-directory heuristic answers a different question — is a path
+	// Git already decided to list one the operator or project means to keep —
+	// and a local `!vendor/mypkg/` in .git/info/exclude is exactly the kind of
+	// rule Git itself used to decide to list that path as untracked in the
+	// first place. Stripping it before it reaches ReincludesDescendant made
+	// vendoredScanPath drop a path Git had just re-included, so vendorRules
+	// below is built from the FULL matcher, local excludes included.
+	finalIgnores := ignores.withoutLocalExcludes()
 	if hasIncludeFiles {
 		// An explicit include file's negations are allowed to reach into ignored
 		// content; nothing else is, so the ignored listing is only ever requested
@@ -19136,7 +19609,7 @@ func worktreeSourceFilesWithLister(
 			return nil, nil, fmt.Errorf("list ignored Git worktree paths for explicit includes: %w", ignoredErr)
 		}
 		for _, rel := range ignored {
-			if ignores.Reincluded(filepath.ToSlash(rel), false) {
+			if finalIgnores.Reincluded(filepath.ToSlash(rel), false) {
 				listed = append(listed, rel)
 			}
 		}
@@ -19144,6 +19617,18 @@ func worktreeSourceFilesWithLister(
 	// The vendored-directory heuristic consults the project's own re-inclusion
 	// rules wherever they live, not only at the root, so a tree the project
 	// deliberately keeps under a vendored-looking name is not dropped.
+	// Sorted BEFORE the ignore decision, because the ledger counts each candidate's
+	// position in the listing this repository would have had with none of its own
+	// ignore rules — and the cap that position is tested against truncates the
+	// SORTED listing (capSourceFiles, below, on the sorted `paths`).
+	//
+	// Arrival order is not sorted order here, twice over. `git ls-files --cached
+	// --others` emits the untracked group before the index group (git 2.54.0), so a
+	// tracked path that sorts first can arrive last; and an include file's
+	// re-included paths are appended after everything git listed. Counting arrival
+	// order therefore both suppressed the disclosure of a lexically-early excluded
+	// path and disclosed a lexically-late one the cap alone had already discarded.
+	sort.Strings(listed)
 	// A .gitignore can itself be ignored while Git still applies its rules to
 	// sibling paths. Enumerate the bounded ignored-ignore stream as policy
 	// evidence instead of assuming every effective rule file appears in listed.
@@ -19163,15 +19648,42 @@ func worktreeSourceFilesWithLister(
 	// deleted and can list a symlink or a gitlink directory; the snapshot reads
 	// only regular files, and the gitlink entries are exactly what the excluder
 	// must examine for a `.git` pointer.
+	// The index decides what a tracked entry IS, because lstat cannot. With
+	// core.symlinks=false Git writes a mode-120000 entry to disk as an ordinary
+	// file holding the link target, so lstat calls it regular and the worktree
+	// listing would admit a symlink the committed listing excludes by mode --
+	// the same divergence, reappearing from the other side. Classification
+	// failures must be reported rather than silently admitting index symlinks.
+	indexNonRegular, indexErr := gitutil.IndexNonRegularPaths(ctx, repo)
+	if indexErr != nil {
+		return nil, nil, fmt.Errorf("list Git index modes: %w", indexErr)
+	}
+	// The index alone cannot tell a materialized symlink from a replaced one.
+	// Both leave mode 120000 in the index with an ordinary file on disk: the
+	// first because core.symlinks=false writes the link target as file content,
+	// the second because the user deleted the link and wrote a real file there.
+	// Only the second holds different bytes than the index entry, and only the
+	// second is source a worktree query is supposed to show -- vetoing both made
+	// an uncommitted replacement invisible until it was staged, which is the one
+	// thing a worktree listing promises not to do.
+	indexReplaced, err := gitutil.IndexReplacedNonRegularPaths(ctx, repo, indexNonRegular)
+	if err != nil {
+		return nil, nil, err
+	}
 	kinds := make([]listedPathKind, len(listed))
 	var listedDirs []string
 	for index, entry := range listed {
 		info, statErr := os.Lstat(filepath.Join(repo, filepath.FromSlash(entry)))
+		_, nonRegularInIndex := indexNonRegular[filepath.ToSlash(entry)]
+		_, replacedInWorktree := indexReplaced[filepath.ToSlash(entry)]
 		switch {
 		case statErr != nil:
 		case info.IsDir():
 			kinds[index] = listedPathDir
 			listedDirs = append(listedDirs, entry)
+		case nonRegularInIndex && !replacedInWorktree:
+			// Tracked as a symlink or gitlink and untouched since; not source,
+			// whatever it looks like on this filesystem.
 		case info.Mode()&fs.ModeSymlink == 0 && info.Mode().IsRegular():
 			kinds[index] = listedPathRegular
 		}
@@ -19207,11 +19719,30 @@ func worktreeSourceFilesWithLister(
 		}
 		// Explicit ignore/include rules still arbitrate: an include file may have
 		// pulled this path back in, and its own rules may then exclude part of
-		// what it re-included.
-		if ignores.Ignored(rel, false) {
+		// what it re-included. That verdict is taken BELOW, against finalIgnores
+		// and after the ledger has counted the candidate — dropping the path here
+		// would hide from the disclosure the very exclusion it exists to report,
+		// and would take the verdict from the matcher that still carries the
+		// checkout's own .git/info/exclude.
+		//
+		// Git lists index entries for files staged as deleted and can list a
+		// symlink; the snapshot reads neither. Eligibility is decided BEFORE the
+		// ledger hears the path, because a disclosure may only name a file the
+		// ignore rules are what removed — a path the snapshot would have discarded
+		// anyway was never in the corpus to hide, and reporting it as hidden is a
+		// claim about the repository that is not true.
+		if kinds[index] != listedPathRegular {
 			continue
 		}
-		if kinds[index] != listedPathRegular {
+		ledger.noteListingCandidate()
+		if finalIgnores.Ignored(rel, false) {
+			// Git's listing already applied the repository's exclude stack to
+			// UNTRACKED content (`--exclude-standard`), so a path that reaches
+			// this line and is dropped here is one Git would still show — a
+			// tracked file, or one an include file reopened. Disclosing those and
+			// nothing else is what keeps the report free of the ordinary
+			// build-output noise every repository gitignores.
+			finalIgnores.noteRepoExclusion(ledger, rel, false)
 			continue
 		}
 		seen[rel] = struct{}{}
@@ -19308,10 +19839,92 @@ func gitSweepRootsFromGit(ctx context.Context, repo string, gitDirs *gitDirExclu
 	return roots, true
 }
 
+// listingOrderWalk walks the tree rooted at root exactly as filepath.WalkDir
+// does — same callback contract, same SkipDir/SkipAll handling, same second call
+// for a directory it cannot read — except for the order in which it visits the
+// entries of a directory.
+//
+// filepath.WalkDir visits them sorted by NAME, which is not the order of the
+// flat path listing this walk produces. A directory `a` sorts before the file
+// `a.go` by name, yet every path inside it sorts after `a.go`, because '.'
+// (0x2E) is below '/' (0x2F). Name order therefore both reaches `a/hidden.go`
+// before `a.go` and reaches `a.go` after everything under `a/`.
+//
+// That matters because the ledger counts each candidate's position as it is
+// visited, and the cap those positions are tested against (capSourceFiles)
+// truncates the SORTED listing. Counting arrival order blamed a committed rule
+// for a path the cap alone had already discarded, and silenced the disclosure of
+// one the rule really did remove — the same two failures that arrival order
+// caused on the Git-backed listing, which is sorted before it is counted.
+//
+// Keying a directory as name+"/" and recursing in that order visits every path
+// in exactly the order sort.Strings puts them in — it is how Git itself orders
+// tree entries — so the position a candidate takes here is the position it holds
+// in the listing the cap truncates.
+func listingOrderWalk(root string, fn fs.WalkDirFunc) error {
+	info, err := os.Lstat(root)
+	if err != nil {
+		err = fn(root, nil, err)
+	} else {
+		err = listingOrderWalkDir(root, fs.FileInfoToDirEntry(info), fn)
+	}
+	if err == filepath.SkipDir || err == filepath.SkipAll {
+		return nil
+	}
+	return err
+}
+
+func listingOrderWalkDir(path string, entry fs.DirEntry, fn fs.WalkDirFunc) error {
+	if err := fn(path, entry, nil); err != nil || !entry.IsDir() {
+		if err == filepath.SkipDir && entry.IsDir() {
+			err = nil
+		}
+		return err
+	}
+	entries, readErr := os.ReadDir(path)
+	if readErr != nil {
+		// Second call, to report the ReadDir error, as filepath.WalkDir does.
+		if err := fn(path, entry, readErr); err != nil {
+			if err == filepath.SkipDir {
+				return nil
+			}
+			return err
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return listingOrderKey(entries[i]) < listingOrderKey(entries[j])
+	})
+	for _, child := range entries {
+		if err := listingOrderWalkDir(filepath.Join(path, child.Name()), child, fn); err != nil {
+			if err == filepath.SkipDir {
+				break
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// listingOrderKey is the sort key that makes a per-directory ordering agree with
+// a flat sort of the full relative paths: a directory contributes only paths
+// prefixed with its name and a separator, so it must be compared with that
+// separator present.
+func listingOrderKey(entry fs.DirEntry) string {
+	if entry.IsDir() {
+		return entry.Name() + "/"
+	}
+	return entry.Name()
+}
+
 // walkWorktreeFiles is the non-git fallback listing. It honours the ignore stack
 // per directory (root .gitignore plus every nested one on the path) so a
 // directory Git cannot enumerate is still filtered the way the project asked.
-func walkWorktreeFiles(ctx context.Context, repo string, ignores ignoreMatcher, dirTracked func(string) bool) ([]string, []ProviderWarning, error) {
+//
+// It records into ledger what a repository-controlled rule Git does not apply —
+// .graphignore — removed. See nestedIgnoreStack.noteRepoExclusion for why that
+// narrower test, and not every ignored path, is what this mode can disclose
+// honestly.
+func walkWorktreeFiles(ctx context.Context, repo string, ignores ignoreMatcher, dirTracked func(string) bool, ledger *repoIgnoreLedger) ([]string, []ProviderWarning, error) {
 	// Every filesystem fallback enters through here, including paths selected
 	// before Git's index listing succeeds. Require the same complete held-root
 	// safety proof so an earlier Git failure cannot bypass mount detection.
@@ -19319,7 +19932,7 @@ func walkWorktreeFiles(ctx context.Context, repo string, ignores ignoreMatcher, 
 		return nil, nil, err
 	}
 	var paths []string
-	warnings, err := visitWalkWorktreeFiles(ctx, repo, ignores, dirTracked, func(rel string) bool {
+	warnings, err := visitWalkWorktreeFiles(ctx, repo, ignores, dirTracked, ledger, func(rel string) bool {
 		paths = append(paths, rel)
 		return true
 	})
@@ -19335,9 +19948,10 @@ func visitWalkWorktreeFiles(
 	repo string,
 	ignores ignoreMatcher,
 	dirTracked func(string) bool,
+	ledger *repoIgnoreLedger,
 	visit func(string) bool,
 ) ([]ProviderWarning, error) {
-	return visitWalkWorktreeFilesWithRawLimit(ctx, repo, ignores, dirTracked, 0, visit)
+	return visitWalkWorktreeFilesWithRawLimit(ctx, repo, ignores, dirTracked, ledger, 0, visit)
 }
 
 var errWorktreeRawPathLimit = errors.New("filesystem worktree raw path limit exceeded")
@@ -19406,6 +20020,7 @@ func visitWalkWorktreeFilesWithRawLimit(
 	repo string,
 	ignores ignoreMatcher,
 	dirTracked func(string) bool,
+	ledger *repoIgnoreLedger,
 	rawPathLimit int,
 	visit func(string) bool,
 ) ([]ProviderWarning, error) {
@@ -19451,16 +20066,36 @@ func visitWalkWorktreeFilesWithRawLimit(
 			}
 			// Enter first: this directory's own .gitignore is part of the evidence
 			// for whether the project re-includes something inside it.
+			// The corpus walk keeps per-directory policy failures visible through
+			// walk warnings; prune accounting instead records an incomplete count.
 			if err := stack.enter(rel); err != nil {
 				// If the directory itself is unreadable, none of its source can be
 				// listed and a nested policy inside it cannot affect a sibling. Keep
 				// the repository available, but disclose the omission and make hidden
 				// pointer evidence fail closed. An unreadable .gitignore inside a
-				// READABLE directory remains a hard error: silently discarding policy
-				// there could admit content the policy excludes.
+				// READABLE directory is handled below by excluding its subtree.
 				if errors.Is(err, fs.ErrPermission) && !stack.directoryReadable(rel) {
 					gitDirs.hiddenEvidence++
 					gitDirs.noteUnreadableWalkDir(rel)
+					frames = frames[:len(frames)-1]
+					continue
+				}
+				// One directory's own .gitignore that cannot be read within its
+				// per-file bounds (over 1 MiB, a rule line over 64 KiB, mode
+				// 000, replaced mid-read) used to fail the WHOLE listing, so a
+				// single such file made a non-Git repository — or a Git
+				// checkout whose `git ls-files` failed — completely
+				// unindexable. Its rules are unknown for this subtree only, so
+				// exclude that subtree and disclose it: nothing the unknown
+				// policy might have excluded can be admitted, which is the
+				// property the hard error was protecting, and the rest of the
+				// repository stays searchable. The operation-wide rule
+				// allowance and the nested-file count are NOT this, and both
+				// still abort.
+				if errors.Is(err, errNestedIgnorePolicyUnreadable) {
+					gitDirs.hiddenEvidence++
+					gitDirs.noteUnreadableIgnorePolicyDir(rel)
+					gitDirs.observePrunedSubtree(rel)
 					frames = frames[:len(frames)-1]
 					continue
 				}
@@ -19477,6 +20112,11 @@ func visitWalkWorktreeFilesWithRawLimit(
 			// prune, so the set of walked FILES is unchanged.
 			if rel != "" && stack.Ignored(rel, true) && !stack.MayIncludeDescendant(rel) {
 				gitDirs.observePrunedSubtree(rel)
+				// Disclose before pruning: skipping this directory means no child of
+				// it ever reaches the per-file noteRepoExclusion below, so a single
+				// `hidden/` line would otherwise remove an entire source tree from
+				// the corpus with nothing recorded at all.
+				stack.notePrunedRepoExclusion(ledger, rel, dirTracked)
 				frames = frames[:len(frames)-1]
 				continue
 			}
@@ -19547,7 +20187,18 @@ func visitWalkWorktreeFilesWithRawLimit(
 			if walkErr != nil {
 				break
 			}
-			sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+			// listingOrderKey, not plain Name(): the ledger's position counter is
+			// only meaningful against the order capSourceFiles truncates — the flat
+			// sorted listing — and the two disagree at every directory/file name
+			// collision. `a.go` sorts before `a/hidden.go` in a flat listing ('.' is
+			// below '/'), but a Name()-ordered walk descends into `a/` first, which
+			// both blamed a rule for a path the file cap had already discarded and
+			// silenced a path the rule really did remove. Sorting by the key that
+			// carries the separator makes this depth-first walk visit paths in the
+			// same order the flat listing holds them.
+			sort.Slice(entries, func(i, j int) bool {
+				return listingOrderKey(entries[i]) < listingOrderKey(entries[j])
+			})
 			frame.entries = entries
 			frame.ready = true
 			continue
@@ -19591,7 +20242,9 @@ func visitWalkWorktreeFilesWithRawLimit(
 		if isVendoredScanFile(rel, name) {
 			continue
 		}
+		ledger.noteListingCandidate()
 		if stack.Ignored(rel, false) {
+			stack.noteRepoExclusion(ledger, rel, false)
 			continue
 		}
 		if rawPathLimit > 0 && len(paths) >= rawPathLimit {
@@ -19618,6 +20271,7 @@ func visitWalkWorktreeFilesWithRawLimit(
 	}
 	sort.Strings(paths)
 	warnings := append(gitDirs.sweepWarnings(), gitDirs.unreadableWalkWarning()...)
+	warnings = append(warnings, gitDirs.unreadableIgnorePolicyWarning()...)
 	warnings = append(warnings, gitDirs.sweepUnreadableDirWarning()...)
 	for _, rel := range paths {
 		if !visit(rel) {
@@ -19638,11 +20292,15 @@ func filterVendoredPaths(paths []string, ignores vendorIgnoreRules) []string {
 	return filtered
 }
 
-func filterIgnoredPaths(paths []string, ignores ignoreMatcher) []string {
+func filterIgnoredPaths(paths []string, ignores ignoreMatcher, ledger *repoIgnoreLedger) []string {
 	filtered := paths[:0]
 	for _, rel := range paths {
 		rel = filepath.ToSlash(rel)
+		// Kept or excluded, this path is one position of the listing this
+		// repository would have had with no ignore rules of its own.
+		ledger.noteListingCandidate()
 		if ignores.Ignored(rel, false) {
+			ignores.noteRepoExclusion(ledger, rel, false)
 			continue
 		}
 		filtered = append(filtered, rel)
@@ -19764,7 +20422,7 @@ func loadHeadNestedIgnoreRules(
 		return nil, err
 	}
 	if present {
-		rootMatcher, err = loadNestedIgnoreMatcher(rootContent, budget)
+		rootMatcher, err = loadNestedIgnoreMatcher(rootContent, budget, repoIgnoreOrigin(labels[0]))
 		if err != nil {
 			return nil, fmt.Errorf("read ignore file %q: %w", ".gitignore", err)
 		}
@@ -19840,16 +20498,33 @@ func vendoredScanPath(rel string, ignores vendorIgnoreRules, dirTracked func(str
 	if len(parts) == 0 {
 		return false
 	}
+	// This repository's own git directory is decided BEFORE any negation, for
+	// the reason skipVendoredDir states: `!.git/config` in a repo-committed
+	// .gitignore must not cancel the skip.
+	if hasGitDirComponent(rel) {
+		return true
+	}
 	if isVendoredScanFile(rel, parts[len(parts)-1]) {
 		return true
 	}
+	vendored := false
 	for i, part := range parts[:len(parts)-1] {
-		dirRel := strings.Join(parts[:i+1], "/")
-		if skipVendoredDir(dirRel, part, ignores, dirTracked) {
-			return true
+		if vendoredScanDirName(strings.Join(parts[:i+1], "/"), part, dirTracked) {
+			vendored = true
+			break
 		}
 	}
-	return false
+	if !vendored {
+		return false
+	}
+	// A negation inside a vendored tree spares the paths it names, not the
+	// tree. Asking ReincludesDescendant about the ANCESTOR here made one
+	// `!mypkg/` in `vendor/.gitignore` re-admit every tracked file under
+	// `vendor/` — and in HEAD mode nothing downstream filters them, because
+	// filterIgnoredPaths applies only explicit CLI ignore files, so a
+	// force-tracked dependency tree beside the re-included package was parsed
+	// in full and could spend the file ceiling on third-party code.
+	return !ignores.ReincludesPath(rel)
 }
 
 func firstError(errs ...error) error {
@@ -20008,8 +20683,102 @@ func resolveCFamilyLocalInclude(importingPath, spec string, knownFiles map[strin
 	return "", false
 }
 
+// goModuleRoot is one go.mod in the repository: the repo-relative directory it
+// sits in ("" for the root module) and the module path it declares.
+type goModuleRoot struct {
+	Dir  string
+	Path string
+}
+
+// goModuleIndex answers which Go module OWNS a repo-relative directory, and
+// whether an import path names a package this repository builds.
+//
+// A repository is not one module. A nested go.mod (tools/go.mod declaring
+// example.com/tool, a local `replace` target, a test module) re-roots every
+// directory beneath it: tools/lib is example.com/tool/lib, NOT
+// <root-module>/tools/lib. Deciding ownership against the root module alone
+// therefore declares those packages external, and every qualified receiver
+// pointing into them loses its edge. Roots are held longest-directory-first so
+// the innermost enclosing module wins.
+type goModuleIndex struct {
+	roots []goModuleRoot
+}
+
+// newGoModuleIndex sorts the roots innermost-first and drops incomplete entries.
+func newGoModuleIndex(roots []goModuleRoot) goModuleIndex {
+	kept := make([]goModuleRoot, 0, len(roots))
+	for _, root := range roots {
+		if root.Path == "" {
+			continue
+		}
+		kept = append(kept, goModuleRoot{Dir: normalizeRepoDir(root.Dir), Path: root.Path})
+	}
+	sort.SliceStable(kept, func(i, j int) bool {
+		if len(kept[i].Dir) != len(kept[j].Dir) {
+			return len(kept[i].Dir) > len(kept[j].Dir)
+		}
+		return kept[i].Dir < kept[j].Dir
+	})
+	return goModuleIndex{roots: kept}
+}
+
+// normalizeRepoDir renders a repo-relative directory as a slash path with no
+// leading or trailing separator; the repository root is "".
+func normalizeRepoDir(dir string) string {
+	dir = strings.Trim(filepath.ToSlash(dir), "/")
+	if dir == "." {
+		return ""
+	}
+	return dir
+}
+
+// empty reports whether the repository declares no Go module at all.
+func (index goModuleIndex) empty() bool { return len(index.roots) == 0 }
+
+// owner returns the innermost module whose directory contains dir.
+func (index goModuleIndex) owner(dir string) (goModuleRoot, bool) {
+	dir = normalizeRepoDir(dir)
+	for _, root := range index.roots {
+		if root.Dir == "" || dir == root.Dir || strings.HasPrefix(dir, root.Dir+"/") {
+			return root, true
+		}
+	}
+	return goModuleRoot{}, false
+}
+
+// importPathFor renders the import path of the package declared in dir, using
+// the module that owns it.
+func (index goModuleIndex) importPathFor(dir string) (string, bool) {
+	root, ok := index.owner(dir)
+	if !ok {
+		return "", false
+	}
+	dir = normalizeRepoDir(dir)
+	rest := strings.TrimPrefix(strings.TrimPrefix(dir, root.Dir), "/")
+	if rest == "" {
+		return root.Path, true
+	}
+	return root.Path + "/" + rest, true
+}
+
+// ownsImport reports whether an import path names a package built by ANY module
+// in this repository.
+func (index goModuleIndex) ownsImport(importPath string) bool {
+	importPath = strings.Trim(filepath.ToSlash(strings.TrimSpace(importPath)), "/")
+	if importPath == "" {
+		return false
+	}
+	for _, root := range index.roots {
+		if importPath == root.Path || strings.HasPrefix(importPath, root.Path+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 type manifestImportResolver struct {
 	goModule            string
+	goModules           goModuleIndex
 	goPackages          map[string]string
 	jsPackageName       string
 	jsPackageExports    map[string]string
@@ -20254,6 +21023,30 @@ func buildManifestImportResolver(files []FileRecord, readContent contentReader, 
 			cargoPaths = append(cargoPaths, filepath.ToSlash(file.Path))
 		}
 	}
+	// Every go.mod in the tree, not just the root one: a nested module re-roots
+	// the import paths of everything beneath it, and code inside it importing its
+	// own sibling packages is importing REPOSITORY source, not a dependency.
+	// go.mod carries no supported extension, so it is not among `files`; the
+	// manifests are found by walking each Go file's ancestor directories, the
+	// same way Rust crates are located from .rs paths.
+	moduleRoots := []goModuleRoot{}
+	if resolver.goModule != "" {
+		moduleRoots = append(moduleRoots, goModuleRoot{Dir: "", Path: resolver.goModule})
+	}
+	for _, modPath := range inferGoModulesFromGoPaths(goPaths, readContent) {
+		dir := normalizeRepoDir(filepath.Dir(modPath))
+		if dir == "" {
+			continue // the root module is already recorded from readContent("go.mod")
+		}
+		content, ok := readContent(modPath)
+		if !ok {
+			continue
+		}
+		if modulePath := parseGoModulePath(content); modulePath != "" {
+			moduleRoots = append(moduleRoots, goModuleRoot{Dir: dir, Path: modulePath})
+		}
+	}
+	resolver.goModules = newGoModuleIndex(moduleRoots)
 	cargoPaths = append(cargoPaths, inferCargoManifestsFromRustPaths(rustPaths, readContent)...)
 	cargoPaths = uniqueStrings(cargoPaths)
 	sort.Slice(goPaths, func(i, j int) bool {
@@ -21159,6 +21952,40 @@ func cargoRustSourceRootDir(cargoPath, content string) string {
 		return "src"
 	}
 	return dir + "/src"
+}
+
+// inferGoModulesFromGoPaths returns every go.mod that governs at least one Go
+// file, found by walking each file's ancestor directories to the repository
+// root. Mirrors inferCargoManifestsFromRustPaths: a manifest with no supported
+// extension never reaches the file list, so it has to be looked up by path.
+func inferGoModulesFromGoPaths(goPaths []string, readContent contentReader) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, path := range goPaths {
+		dir := filepath.ToSlash(filepath.Dir(path))
+		for {
+			candidate := "go.mod"
+			if dir != "." && dir != "" {
+				candidate = dir + "/go.mod"
+			}
+			if !seen[candidate] {
+				seen[candidate] = true
+				if _, ok := readContent(candidate); ok {
+					out = append(out, candidate)
+				}
+			}
+			if dir == "." || dir == "" {
+				break
+			}
+			parent := filepath.ToSlash(filepath.Dir(dir))
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func inferCargoManifestsFromRustPaths(rustPaths []string, readContent contentReader) []string {
@@ -28188,38 +29015,10 @@ var intentionalSkipFailureCodes = map[string]bool{
 	"E_MINIFIED":       true,
 }
 
-// completenessFailureCount counts only the partial failures that reflect a real
-// gap in understanding code the graph attempted — the input to completenessLevel.
-// Intentional skips (see intentionalSkipFailureCodes) are excluded.
-func completenessFailureCount(failures []PartialFailure) int {
-	n := 0
-	for _, failure := range failures {
-		if intentionalSkipFailureCodes[failure.Code] {
-			continue
-		}
-		n++
-	}
-	return n
-}
-
-// completenessLevel takes the failure RECORDS rather than a count so that the
-// one failure whose meaning is not "n gaps in an otherwise known scope" --
-// E_ANALYSIS_BUDGET_EXCEEDED -- can be read for what it is. Every other code
-// describes a bounded, enumerated gap inside a scope the provider fully
-// discovered; a wall-clock truncation instead means an UNKNOWN and unbounded
-// suffix of the repository was never reached, so neither the "files == 0" arm
-// (which reads an empty graph as a genuinely empty repository) nor the
-// failures-per-file ratio arms describe it.
-func completenessLevel(failures []PartialFailure, files, parsedFiles, symbols int) string {
-	if partialFailuresTruncated(failures) {
-		// "unsafe" is the only honest level: the caller cannot tell an empty
-		// truncation from an empty repository, nor a 1%-retained prefix from a
-		// 99% one, and the missing symbols would otherwise read as confident
-		// negatives. This is the same reason a truncated snapshot is refused by
-		// both cache writers (see ErrTruncatedSnapshotNotCacheable).
-		return "unsafe"
-	}
-	switch failureCount := completenessFailureCount(failures); {
+// completenessLevel takes unique flagged source files and eligible source files.
+// It also serves the recorded-file safeguards with a zero failure count.
+func completenessLevel(failures, files, parsedFiles, symbols int) string {
+	switch {
 	case files == 0:
 		// Genuinely empty repo/scope — nothing to parse, so "ok" (not "unsafe":
 		// there is no missing coverage to warn about).
@@ -28233,12 +29032,24 @@ func completenessLevel(failures []PartialFailure, files, parsedFiles, symbols in
 		// Files were parsed but zero symbols came out — the graph is empty and
 		// unusable even though no hard parse failure occurred.
 		return "degraded"
-	case failureCount == 0:
-		return "ok"
-	case failureCount*4 > files:
+	case failures*4 > files:
 		return "unsafe"
-	default:
+	case parsedFiles*4 < files*3:
+		// More than a quarter of the RECORDED files were never parsed. Only an
+		// intentional skip can land here — every other unparsed file leaves no
+		// file record at all — so this is the backstop intentionalSkipFailureCodes
+		// promises above. Its exclusion is deliberate and must stay (one vendored
+		// bundle among five hundred sources is not a degraded graph), but the
+		// ratio guard it names only fires past a strict MAJORITY, so a repository
+		// whose whole dist/ tree was skipped — 200 of 500 files never opened —
+		// reported "ok" with no stderr banner while every trust gate keyed on this
+		// level stayed quiet about 40% of the code. It sits AFTER the failure
+		// ratio so it can never soften an "unsafe".
 		return "degraded"
+	case failures*100 >= files*DegradationThresholdPercent:
+		return "degraded"
+	default:
+		return "ok"
 	}
 }
 

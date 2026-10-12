@@ -72,10 +72,10 @@ func TestTF142R5TruncatedSnapshotNeverReportsCompletenessOK(t *testing.T) {
 // direction: narrowing "ok" must not swallow the legitimate cases. A genuinely
 // empty scope and a clean full parse both still report "ok".
 func TestTF142R5CompletenessLevelUnaffectedWithoutTruncation(t *testing.T) {
-	if got := completenessLevel(nil, 0, 0, 0); got != "ok" {
+	if got := completenessLevel(0, 0, 0, 0); got != "ok" {
 		t.Fatalf("an empty scope with no truncation must stay %q, got %q", "ok", got)
 	}
-	if got := completenessLevel([]PartialFailure{{Code: "E_FILE_TOO_LARGE"}}, 100, 100, 4000); got != "ok" {
+	if got := completenessLevel(0, 100, 100, 4000); got != "ok" {
 		t.Fatalf("a clean parse with only intentional skips must stay %q, got %q", "ok", got)
 	}
 }

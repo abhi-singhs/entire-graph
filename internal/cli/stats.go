@@ -36,7 +36,7 @@ const savingsModelShort = "each graph locate call is credited with one explorati
 	"priced from this session's own measured per-call costs"
 
 const savingsModelText = "Model (assumption, not a measurement): each graph locate call " +
-	"(search/neighbors/impact) is credited with the ONE exploration call (Read/Grep/Glob/bash " +
+	"(query/neighbors/impact) is credited with the ONE exploration call (Read/Grep/Glob/bash " +
 	"grep-find-read) it displaced. Both prices are MEASURED from the same session's own " +
 	"transcript: graph bytes per locate call, and exploration bytes per exploration call. Saving " +
 	"per substitution = exploration bytes/call minus graph bytes/call, floored at 0, converted at " +
@@ -60,6 +60,7 @@ const substitutionRatio = 1
 // the only ones credited with savings. Bulk/ingest verbs (snapshot, edges, symbols) and
 // change verbs (diff, analyze) replace nothing a human would have read whole.
 var graphLocateVerbs = map[string]bool{
+	"query":     true,
 	"search":    true,
 	"neighbors": true,
 	"impact":    true,
@@ -68,10 +69,19 @@ var graphLocateVerbs = map[string]bool{
 // graphVerbs is the closed set of verbs the plugin dispatches. Matching against it (rather
 // than "any word after entire-graph") is what stops a path argument from being read as an
 // invocation — e.g. `find /repos/entire-graph -path '*.go'` is exploration, not a graph call.
+//
+// It MUST list every command in the dispatch switch. A verb missing here is not merely
+// uncounted: it falls through BOTH classifications, counting as neither a graph call nor an
+// exploration call, so real usage of it is invisible in every report and in the status-line
+// badge. That is how def, explain, verify, health and snapshot-query — all shipped, all in
+// `entire graph help` — went unmeasured while adoption was being diagnosed from these numbers.
+// The drift is the defect, so TestGraphVerbsCoverEveryCommand fails the build on the next one
+// rather than trusting this list to be maintained by hand.
 var graphVerbs = map[string]bool{
-	"search": true, "neighbors": true, "impact": true, "diff": true, "commit": true,
+	"query": true, "search": true, "neighbors": true, "impact": true, "diff": true, "commit": true,
 	"checkpoint": true, "analyze": true, "doctor": true, "capabilities": true,
-	"snapshot": true, "symbols": true, "edges": true, "index": true, "stats": true,
+	"snapshot": true, "snapshot-query": true, "symbols": true, "edges": true, "index": true,
+	"stats": true, "def": true, "explain": true, "verify": true, "health": true,
 	"agent-guide": true, "init-agents": true, "version": true, "help": true,
 }
 
@@ -1007,7 +1017,7 @@ func toolResultText(raw json.RawMessage) string {
 }
 
 // graphVerbFromToolUse detects a graph invocation inside a Bash command. Both the plugin form
-// (`entire graph search`) and the direct binary form (`/path/to/entire-graph search`) count,
+// (`entire graph query`) and the direct binary form (`/path/to/entire-graph query`) count,
 // but only in COMMAND position of a pipeline segment and only when followed by a known verb —
 // otherwise a repo path that merely ends in "entire-graph" would be mistaken for a call.
 func graphVerbFromToolUse(block contentBlock) (string, bool) {
@@ -1320,7 +1330,7 @@ func writeStatsText(out io.Writer, report statsResponse) {
 		fmt.Fprintf(out, "  sessions: not found (looked in %s)\n", report.SessionsDir)
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, "No coding-agent session transcripts exist for this repo yet, so there is")
-		fmt.Fprintln(out, "nothing to compare. Run some work with `entire graph search` and re-run this.")
+		fmt.Fprintln(out, "nothing to compare. Run some work with `entire graph query` and re-run this.")
 		return
 	}
 	fmt.Fprintf(out, "  sessions: %s\n", report.SessionsDir)
@@ -1381,7 +1391,7 @@ func writeStatsText(out io.Writer, report statsResponse) {
 		fmt.Fprintf(out, "  (~%.2f%% of billed session tokens)", report.EstimatedSavingsPct)
 	}
 	fmt.Fprintln(out)
-	fmt.Fprintf(out, "  credited graph calls: %d of %d (search/neighbors/impact only)\n",
+	fmt.Fprintf(out, "  credited graph calls: %d of %d (query/neighbors/impact only)\n",
 		report.CreditedGraphCalls, report.GraphCalls)
 	fmt.Fprintf(out, "  sessions with a saving above 0: %d of %d\n",
 		report.SessionsWithPositiveSavings, report.Sessions)

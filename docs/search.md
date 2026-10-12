@@ -1,9 +1,15 @@
 # Search results and ranking
 
-`entire graph search` turns a plain-language task description into ranked
+`entire graph query` turns a plain-language task description into ranked
 source regions. This page describes what comes back and how to read it,
-verified against current output. `entire graph search --help` documents the
-flags.
+verified against current output. `entire graph query --help` documents the
+flags. Supply the query with `--query`, or as one quoted argument after all flags:
+
+```sh
+entire graph query --repo . --format text "where is token refresh handled?"
+```
+
+Use one form at a time. Queries beginning with `-` require `--query`.
 
 ## Ranking
 
@@ -54,7 +60,7 @@ The default format is JSON, one object per query:
 
 ## Profiles
 
-`search` defaults to `--profile fast` (shallow, high-precision call
+`query` defaults to `--profile fast` (shallow, high-precision call
 resolution). The installed agent guide asks for `--profile full`, which
 enables the complete relation set and deeper graph expansion. Profile is part
 of the cache key, so mixing profiles across runs builds separate cache

@@ -1,6 +1,7 @@
 package sem
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"unicode"
 
 	"github.com/entireio/entire-graph/internal/gitutil"
+	"github.com/entireio/entire-graph/internal/termsafe"
 )
 
 const (
@@ -65,6 +67,23 @@ type SearchOptions struct {
 	MaxIndexedFiles   int
 	IndexAllFiles     bool
 	MaxContextBytes   int
+	// OmitsRepoIgnoreDisclosureFloor says this caller's renderer never prints the
+	// repo-ignore disclosure floor, so the ranking must not be charged for it.
+	//
+	// The floor is funded from INSIDE MaxContextBytes (see the reservation in
+	// SearchRepository), and exactly one renderer emits it: `--format text`, which
+	// has no warning channel of its own. The structured formats carry the same
+	// disclosure as data — the W_REPO_IGNORED_SOURCE warning and the whole
+	// repo_ignored report — whether or not the ranking pays for a floor, so an
+	// unconditional reservation only deleted ranked source from them. Measured on a
+	// fixture with one excluded file: at --max-context-bytes 600 the reservation cost
+	// a JSON payload its ONLY result (result_bytes 589 -> 0) and bought that payload
+	// nothing, because JSON never renders the floor those bytes were held for.
+	//
+	// The zero value is the conservative one: a caller that does not say what it
+	// renders is assumed to render the floor, so the disclosure can never end up
+	// unfunded by omission.
+	OmitsRepoIgnoreDisclosureFloor bool
 	// progressivePreselection is internal policy, not a caller override. The
 	// standard cold default may widen adaptively; explicit and TopK-adaptive
 	// MaxIndexedFiles values remain exact compatibility limits.
@@ -294,8 +313,13 @@ type SearchResult struct {
 }
 
 type SearchStats struct {
-	QueryConstraintsTruncated      bool    `json:"query_constraints_truncated,omitempty"`
-	FilesScanned                   int     `json:"files_scanned"`
+	QueryConstraintsTruncated bool `json:"query_constraints_truncated,omitempty"`
+	FilesScanned              int  `json:"files_scanned"`
+	// RepoIgnoredFiles counts the files Git listed that the REPOSITORY's own
+	// ignore rules removed from this corpus before FilesScanned was taken. It sits
+	// beside FilesScanned deliberately: read alone, "scanned N files" invites the
+	// reading that N is what the repository contains.
+	RepoIgnoredFiles               int     `json:"files_excluded_by_repo_ignore_rules,omitempty"`
 	PreselectionBackend            string  `json:"preselection_backend,omitempty"`
 	PreselectionPasses             int     `json:"preselection_passes,omitempty"`
 	PreselectionFilesExamined      int     `json:"preselection_files_examined,omitempty"`
@@ -483,11 +507,27 @@ type SearchResponse struct {
 	// names the ones that entry does not show. It exists because "the fix passed the test I was
 	// shown and broke its neighbour" is a measured wrong-fix shape that no single test body can
 	// prevent. Nil whenever exactly one test covers the anchor. See search_covertest.go.
-	CoverageNote    *SearchCoverageNote `json:"coverage_note,omitempty"`
-	Stats           SearchStats         `json:"stats"`
-	Warnings        []ProviderWarning   `json:"warnings"`
-	PartialFailures []PartialFailure    `json:"partial_failures"`
-	Completeness    CompletenessReport  `json:"completeness"`
+	CoverageNote *SearchCoverageNote `json:"coverage_note,omitempty"`
+	// RepoIgnored discloses what the REPOSITORY's own ignore rules removed from the
+	// corpus this answer was assembled from, and is nil when they removed nothing.
+	//
+	// Every other field here describes the corpus that survived. That is what made
+	// a committed ignore line an attack: one line deleted a tracked source file
+	// from the payload, the remaining files were reported as the coverage, and an
+	// agent working under this tool's own "search first" doctrine had nothing to
+	// tell it that a file it should have read was missing. The graph does not need
+	// to index an ignored file. It needs to stop implying that what it indexed is
+	// everything the repository holds.
+	//
+	// Only REPOSITORY-controlled rules are reported (.graphignore, .gitignore,
+	// .git/info/exclude, nested .gitignore). Exclusions the caller asked for with
+	// --ignore-file are not: telling callers what they themselves excluded is noise
+	// that would bury the case that matters.
+	RepoIgnored     *RepoIgnoreReport  `json:"repo_ignored,omitempty"`
+	Stats           SearchStats        `json:"stats"`
+	Warnings        []ProviderWarning  `json:"warnings"`
+	PartialFailures []PartialFailure   `json:"partial_failures"`
+	Completeness    CompletenessReport `json:"completeness"`
 	// replayProvenancePaths is the old mutable provider corpus whose membership
 	// and contents could influence preselection, scores, ordering, and rendered
 	// confidence. It stays out of schema 1.x and is used only by session replay.
@@ -514,6 +554,339 @@ func boundedWorktreeSearchReplayProvenance(paths []string) []string {
 	return result
 }
 
+// repoIgnoreDisclosureCode is the diagnostic code that carries the disclosure on
+// the channel every existing consumer already reads. A caller that only parses
+// `warnings` still learns that this answer was assembled from a narrowed corpus.
+const repoIgnoreDisclosureCode = "W_REPO_IGNORED_SOURCE"
+
+// withRepoIgnoreDisclosure puts the disclosure warning FIRST when the
+// repository's own ignore rules narrowed the corpus, and returns warnings
+// unchanged otherwise.
+func withRepoIgnoreDisclosure(warnings []ProviderWarning, report *RepoIgnoreReport) []ProviderWarning {
+	// A count of zero is not "nothing was excluded" whenever the report also says
+	// the count is short. An ignored directory that was unreadable before its
+	// first descendant was reached removes an unknown number of files and lands
+	// here with Files == 0 and CountIncomplete set, and guarding on Files alone
+	// silenced this warning in exactly that case — the total shortfall, not the
+	// partial one. That is this disclosure's own failure mode reached through its
+	// own guard: the field doc promises "a caller that only parses warnings still
+	// learns that this answer was assembled from a narrowed corpus", and the text
+	// renderer already draws the line here (see RenderRepoIgnoreDisclosure), so
+	// the two channels disagreed about the same report.
+	if report == nil || (report.Files == 0 && !report.CountIncomplete && !report.GitListingUnavailable) {
+		return warnings
+	}
+	names := make([]string, 0, len(report.Sources))
+	for _, source := range report.Sources {
+		names = append(names, termsafe.Line(source.File))
+	}
+	// With no file counted there is also no Sources entry to attribute it to —
+	// attribution is recorded per counted path — so the sentence has to name the
+	// rules generically rather than render "0 files excluded by " with an empty
+	// list where the reader expects a filename.
+	detail := fmt.Sprintf("%d file%s excluded by %s", report.Files, pluralS(report.Files), strings.Join(names, ", "))
+	if report.Files == 0 {
+		detail = "an unknown number of files excluded by the repository's own ignore rules"
+		if len(names) > 0 {
+			detail = "an unknown number of files excluded by " + strings.Join(names, ", ")
+		}
+	}
+	switch {
+	case len(report.Sample) > 0:
+		detail += "; including " + termsafe.Line(report.Sample[0].Path)
+	case len(report.Unreadable) > 0:
+		detail += "; unreadable: " + termsafe.Line(report.Unreadable[0])
+	}
+	// FilePath carries the first excluded path so the disclosure survives every
+	// renderer that prints only a warning's code and file — which is the compact
+	// agent payload, i.e. the exact reader this finding is about. "Something is
+	// hidden" is a shrug; "internal/auth/auth.go is hidden" is a next action.
+	first := ""
+	switch {
+	case len(report.Sample) > 0:
+		first = report.Sample[0].Path
+	case len(report.Unreadable) > 0:
+		// Nothing was counted, so there is no sample path to name. The path that
+		// stopped the count is the only actionable one left, and a renderer that
+		// prints just a warning's code and file is the reader this field exists
+		// for — leaving it empty there is "something is hidden" with no next step.
+		first = report.Unreadable[0]
+	}
+	effect := "files git lists were excluded from the corpus by the repository's own ignore rules; " +
+		"the coverage figures describe what remained, not what the repository contains"
+	if report.Files == 0 {
+		// Stats.RepoIgnoredFiles is 0 here, so the coverage line and the compact
+		// form's X<n> show no exclusion at all. Saying "the coverage figures
+		// describe what remained" would invite the reader to subtract a number
+		// that was never disclosed; what is true is that the size is unknown.
+		effect = "the repository's own ignore rules removed content from the corpus and how much could not be " +
+			"determined; the coverage figures describe what remained, not what the repository contains"
+	}
+	// FIRST, not appended. Every renderer that caps the diagnostics it prints
+	// takes them from the head of the list — the agent payload prints three and
+	// replaces the rest with a count — so appending left this warning's path behind
+	// whatever unrelated diagnostics the snapshot happened to carry, and a reader
+	// holding only the count knows something is hidden without knowing what to
+	// open. The existing warnings keep their order behind it.
+	return append([]ProviderWarning{{
+		Code:                 repoIgnoreDisclosureCode,
+		Severity:             "warning",
+		FilePath:             first,
+		EffectOnCompleteness: effect,
+		Detail:               detail,
+	}}, warnings...)
+}
+
+// repoIgnoreIncompleteCode is the partial-failure code for a disclosure whose
+// count is short. Partial failures are the channel this provider already uses for
+// "the answer is real but something was not read", and the coverage line already
+// counts them, so the shortfall reaches every renderer without a new field to
+// learn.
+const repoIgnoreIncompleteCode = "E_REPO_IGNORE_UNREADABLE"
+
+// repoIgnoreTruncatedCode is the same shortfall for the other reason: the
+// excluded tree was larger than the accounting enumerates. It is a separate code
+// because the codes are what a consumer routes on, and routing a tree that is
+// merely big to the one that says UNREADABLE sends a reader after a permission
+// problem that does not exist.
+const repoIgnoreTruncatedCode = "E_REPO_IGNORE_COUNT_INCOMPLETE"
+
+// repoIgnoreGitUnavailableCode marks the other way the disclosure falls short of
+// exact: the listing was produced without Git's own enumeration of a real
+// checkout, so a path a `.gitignore` removed cannot be separated from the
+// tracked source Git would still have listed.
+const repoIgnoreGitUnavailableCode = "E_REPO_IGNORE_GIT_UNAVAILABLE"
+
+// withRepoIgnorePartialFailures appends the shortfall when the exclusion count
+// could not be completed, and returns failures unchanged otherwise.
+//
+// It is applied at the response sink rather than where the walk runs, so every
+// path that builds a SearchResponse from a listing inherits it and none can
+// forget it — the same reason the disclosure warning is added here.
+func withRepoIgnorePartialFailures(failures []PartialFailure, report *RepoIgnoreReport) []PartialFailure {
+	if report == nil {
+		return failures
+	}
+	if report.GitListingUnavailable {
+		failures = append(failures, PartialFailure{
+			Code:     repoIgnoreGitUnavailableCode,
+			Severity: "warning",
+			EffectOnCompleteness: "Git could not list this checkout, so the repository's own ignore rules were applied by a " +
+				"filesystem walk; what they removed that Git would still have listed — tracked files — is not counted here",
+			Detail: "exclusion accounting ran without Git's own listing of a git working tree",
+		})
+	}
+	if !report.CountIncomplete {
+		return failures
+	}
+	first := ""
+	if len(report.Unreadable) > 0 {
+		first = report.Unreadable[0]
+	}
+	detail := fmt.Sprintf("%d excluded path%s counted", report.Files, pluralS(report.Files))
+	if len(report.Unreadable) > 0 {
+		detail += "; unreadable: " + termsafe.Line(strings.Join(report.Unreadable, ", "))
+	}
+	// Two different shortfalls reach this line and a reader can only act on the
+	// one that happened: an unreadable subtree is a broken checkout, a spent walk
+	// budget is a tree too large to enumerate. Naming the wrong one sends the
+	// reader looking for a permission problem that is not there.
+	effect := "the tree the repository's own ignore rules removed is larger than the exclusion accounting " +
+		"enumerates, so the disclosed count is a lower bound rather than the exact number, and the paths it " +
+		"did enumerate are a filesystem-order sample of that tree rather than its first paths in sorted " +
+		"order — two readers on two filesystems can be shown different ones"
+	code := repoIgnoreTruncatedCode
+	if len(report.Unreadable) > 0 {
+		effect = "part of a tree the repository's own ignore rules removed could not be read, so the " +
+			"disclosed exclusion count is a lower bound rather than the exact number"
+		code = repoIgnoreIncompleteCode
+	}
+	return append(failures, PartialFailure{
+		Code:                 code,
+		Severity:             "warning",
+		FilePath:             first,
+		EffectOnCompleteness: effect,
+		Detail:               detail,
+	})
+}
+
+// maxRenderedRepoExclusions is how many excluded paths the TEXT payload names.
+// The header line carries the exact count, so the list only has to be enough to
+// act on; a longer one would cost bytes at the head of every payload in a
+// repository that vendors legitimately.
+const maxRenderedRepoExclusions = 3
+
+// RenderRepoIgnoreDisclosure renders the disclosure for a text payload, or nil
+// when there is nothing to disclose.
+func RenderRepoIgnoreDisclosure(report *RepoIgnoreReport) []byte {
+	if report == nil || (report.Files == 0 && !report.CountIncomplete && !report.GitListingUnavailable) {
+		return nil
+	}
+	var out bytes.Buffer
+	// Capped exactly like the sample list below, and for the same reason: Sources
+	// carries one entry per DISTINCT .gitignore/.git-info-exclude/.graphignore
+	// file that contributed an exclusion, with no upper bound of its own (a
+	// project can nest hundreds of vendored .gitignore files, each an arbitrary
+	// repository-controlled path). Joining every one of them here used to make
+	// this single header line grow without limit, ahead of the ranked results
+	// this payload's --max-context-bytes budget already accounts for elsewhere —
+	// exactly the kind of unbudgeted, repository-controlled bytes that ceiling
+	// exists to rule out.
+	sourceNames := report.Sources
+	if len(sourceNames) > maxRenderedRepoExclusions {
+		sourceNames = sourceNames[:maxRenderedRepoExclusions]
+	}
+	names := make([]string, 0, len(sourceNames))
+	for _, source := range sourceNames {
+		names = append(names, termsafe.Line(source.File))
+	}
+	sourcesLabel := strings.Join(names, ", ")
+	if remaining := len(report.Sources) - len(sourceNames); remaining > 0 {
+		sourcesLabel += fmt.Sprintf(", +%d more", remaining)
+	}
+	// A count of zero is not "nothing was excluded" whenever the report also
+	// says the count could not be completed: an ignored tree that was unreadable
+	// before its first descendant was reached excludes an unknown number of
+	// files, and the JSON channel says so. Rendering nothing for it told the one
+	// reader who only ever sees the text payload that the corpus was whole —
+	// which is this disclosure's own failure mode, reached through its renderer.
+	if report.Files == 0 {
+		out.WriteString("EXCLUDED: the repository's own ignore rules removed content from this corpus; " +
+			"how much could not be determined\n")
+	} else {
+		fmt.Fprintf(&out, "EXCLUDED: %d file%s removed from this corpus by the repository's own ignore rules (%s)\n",
+			report.Files, pluralS(report.Files), sourcesLabel)
+	}
+	shown := report.Sample
+	if len(shown) > maxRenderedRepoExclusions {
+		shown = shown[:maxRenderedRepoExclusions]
+	}
+	for _, exclusion := range shown {
+		fmt.Fprintf(&out, "- %s\n", termsafe.Line(exclusion.Path))
+	}
+	if remaining := report.Files - len(shown); remaining > 0 {
+		// The pointer has to name what the JSON actually holds. Its sample is
+		// capped too, so promising "the full list" there is an instruction that
+		// cannot be followed once a repository excludes more than the cap — and a
+		// disclosure that misdirects is worse than a shorter honest one.
+		if report.SampleTruncated {
+			// "the count is exact" is a claim, and it is false whenever the walk
+			// behind it stopped short. Printing it beside the LOWER BOUND line two
+			// rows down told the reader both things at once.
+			exactness := "the count is exact"
+			if report.CountIncomplete {
+				exactness = "the count is a lower bound"
+			}
+			fmt.Fprintf(&out, "- ... %d more (--format json: repo_ignored names %d of the %d; %s)\n",
+				remaining, len(report.Sample), report.Files, exactness)
+		} else {
+			fmt.Fprintf(&out, "- ... %d more (full list in --format json: repo_ignored)\n", remaining)
+		}
+	}
+	// Both shortfalls print AFTER the paths that could be named, and both print
+	// whatever the count is: a partially counted tree renders an exact-looking
+	// number today, and a reader cannot act on a lower bound they were not told
+	// was one.
+	if report.CountIncomplete {
+		if len(report.Unreadable) > 0 {
+			// Capped like Sources and Sample above, and for the same reason:
+			// Unreadable carries one entry per unreadable repository-controlled
+			// directory with no upper bound of its own (the ledger samples up to
+			// maxRepoExclusionSample of them). Joining every one of them here
+			// made this single line grow with the size of the broken subtree
+			// instead of the size of the answer.
+			unreadable := report.Unreadable
+			if len(unreadable) > maxRenderedRepoExclusions {
+				unreadable = unreadable[:maxRenderedRepoExclusions]
+			}
+			line := termsafe.Line(strings.Join(unreadable, ", "))
+			if remaining := len(report.Unreadable) - len(unreadable); remaining > 0 {
+				line += fmt.Sprintf(", +%d more", remaining)
+			}
+			fmt.Fprintf(&out, "- count is a LOWER BOUND: %s could not be read\n", line)
+		} else {
+			// An empty list rendered "- count is a LOWER BOUND:  could not be read",
+			// which reads as a broken checkout to someone whose tree is merely big.
+			out.WriteString("- count is a LOWER BOUND: the excluded tree is larger than this accounting " +
+				"enumerates, and the paths named are a filesystem-order sample of it, not its first in sorted order\n")
+		}
+	}
+	if report.GitListingUnavailable {
+		out.WriteString("- count is PARTIAL: Git could not list this checkout, so tracked files its own " +
+			"ignore rules cover are not counted here\n")
+	}
+	return out.Bytes()
+}
+
+// maxRepoIgnoreFloorBytes bounds RenderRepoIgnoreDisclosureFloor.
+//
+// The bound is the whole point of the floor. The full disclosure's size is set by
+// the repository being searched — excluded path names, ignore-file names,
+// unreadable directory names — which is why it may only be printed when it fits
+// the remaining context headroom. The floor carries none of those: one sentence,
+// one integer, and a pointer at the JSON channel that holds the rest. Its size is
+// therefore a property of this file, so a caller can state in advance the most a
+// payload can exceed --max-context-bytes by in order to stay honest about its own
+// corpus. TestRepoIgnoreDisclosureFloorIsBoundedAndRepositoryFree pins it.
+const maxRepoIgnoreFloorBytes = 160
+
+// repoIgnoreDisclosureReserveBytes is what a listing with something to disclose
+// takes out of the ranking's budget so the floor can be printed from INSIDE the
+// caller's ceiling instead of on top of it.
+//
+// It is the floor THIS report renders, not the most any report could render. The
+// count the floor states is settled before this is called — a listing's
+// RepoIgnoreReport is produced by preselection and travels to SearchResponse
+// unmodified — so the exact length is knowable here, and reserving
+// maxRepoIgnoreFloorBytes instead took bytes off every ranking to fund a sentence
+// that is shorter than the bound for every report that is not adversarially long.
+// The bound still bounds; it is no longer the price.
+//
+// A listing with nothing to disclose reserves nothing and its payload is
+// byte-identical.
+func repoIgnoreDisclosureReserveBytes(report *RepoIgnoreReport) int {
+	return len(RenderRepoIgnoreDisclosureFloor(report))
+}
+
+// searchRepoIgnoreFloorReserveBytes is the reservation as this CALLER sees it:
+// the floor's own length when the caller's renderer prints one, and nothing when
+// it does not.
+func searchRepoIgnoreFloorReserveBytes(options SearchOptions, report *RepoIgnoreReport) int {
+	if options.OmitsRepoIgnoreDisclosureFloor {
+		return 0
+	}
+	return repoIgnoreDisclosureReserveBytes(report)
+}
+
+// RenderRepoIgnoreDisclosureFloor renders the IRREDUCIBLE form of the disclosure:
+// the fact that the repository's own rules removed content, and where the details
+// are. It is what a text payload prints when the full block (above) cannot be
+// afforded — because the alternative, printing nothing, tells the one reader who
+// only ever sees `--format text` that the corpus was whole.
+//
+// It names no repository-controlled bytes on purpose. That is what lets it be
+// admitted against a budget the ranked results have already spent: the overshoot
+// it can cause is bounded by maxRepoIgnoreFloorBytes and chosen here, not by the
+// repository being searched.
+func RenderRepoIgnoreDisclosureFloor(report *RepoIgnoreReport) []byte {
+	if report == nil || (report.Files == 0 && !report.CountIncomplete && !report.GitListingUnavailable) {
+		return nil
+	}
+	// A count of zero beside a shortfall is not "nothing was excluded" — same rule
+	// as the full block, and for the same reason: an ignored tree that could not be
+	// enumerated excludes an unknown amount.
+	if report.Files == 0 {
+		return []byte("EXCLUDED: repo ignore rules removed content from this corpus, amount unknown" +
+			" (--format json: repo_ignored)\n")
+	}
+	atLeast := ""
+	if report.CountIncomplete {
+		atLeast = "at least "
+	}
+	return fmt.Appendf(nil, "EXCLUDED: %s%d file%s removed from this corpus by repo ignore rules"+
+		" (--format json: repo_ignored)\n", atLeast, report.Files, pluralS(report.Files))
+}
+
 type searchQuery struct {
 	raw         string
 	rawLower    string
@@ -521,6 +894,9 @@ type searchQuery struct {
 	terms       []string
 	termSet     map[string]bool
 	weights     map[string]float64
+	// inferredAbbreviations require identifier boundaries even in substring scoring paths.
+	inferredAbbreviations map[string]bool
+	aliasTokens           map[string][]string
 	// dottedCallMentions holds lowercased "container.member" pairs the query
 	// wrote as explicit calls ("Type.method(...)") — a direct naming of the
 	// symbol the query is about.
@@ -598,6 +974,9 @@ func cachedContentReader(read contentReader) contentReader {
 }
 
 var searchWordPattern = regexp.MustCompile(`[[:alnum:]_./:+#-]+`)
+
+// Preserve complete Unicode source identifiers before splitting camel case.
+var searchSourceWordPattern = regexp.MustCompile(`[\p{L}\p{N}_./:+#-]+`)
 var sparseSearchWordPattern = regexp.MustCompile(`[[:alpha:]][[:alnum:]_]*|[[:digit:]]+`)
 
 // searchQueryURLPattern matches an absolute URL written inside a query. The run stops at
@@ -729,7 +1108,7 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 		// half of hybrid search (graph_candidates is always 0).
 		options.Profile = ProfileFast
 	}
-	sparseQuery := buildSparseSearchQuery(query)
+	sparseQuery := buildSparseSearchQueryExpanded(query, q)
 	searchStarted := time.Now()
 	baseSnapshotOptions := ProviderSnapshotOptions{
 		NoNetwork:     true,
@@ -799,6 +1178,47 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 		preindexCacheHit = false
 	}
 	preselectLatency := time.Since(preselectStarted)
+	// THE DISCLOSURE IS FUNDED FROM INSIDE THE CEILING, and it has to be funded
+	// here, before a single byte of ranking is fitted.
+	//
+	// A `--format text` payload leads with what the repository's own ignore rules
+	// removed, and degrades that block to an irreducible floor rather than
+	// dropping it — text renders no warnings of its own, so the floor is the only
+	// thing that stops a narrowed corpus reading as a whole one. But the fitter
+	// spends the ceiling to the last few bytes (measured: 1996 funded of 2000),
+	// so by render time there was nothing left to print the floor from and it was
+	// admitted ON TOP: a payload that had something to disclose overran
+	// --max-context-bytes by the floor's full length, and that number is what a
+	// caller sized a context window against.
+	//
+	// Taking the reservation out of the RANKING rather than out of the answer
+	// keeps both halves: the ranking loses at most maxRepoIgnoreFloorBytes, a
+	// fixed cost this file picks, and the disclosure lands inside the caller's
+	// number. Only a listing that actually has something to disclose pays it.
+	//
+	// A ceiling too small to fund the allowance at all keeps the behaviour it had:
+	// the caller asked for less room than the shortest honest disclosure needs, and
+	// the renderer's own last-resort floor is what answers that.
+	//
+	// options is a value, so narrowing it here narrows every fitter downstream.
+	// callerContextBytes is what the response REPORTS, because the ceiling the
+	// caller named is the one the renderer measures its headroom against — and
+	// because a stat that quietly shrank would make the reservation unauditable.
+	//
+	// ONLY a renderer that prints the floor pays for it. The reservation buys the
+	// text payload its one channel for saying the corpus is narrowed; the structured
+	// formats already carry that fact as data (warnings + repo_ignored) and emit it
+	// whatever the ranking spends, so charging them too deleted ranked source and
+	// funded nothing — at --max-context-bytes 600 it cost a JSON payload its only
+	// result. A caller declares that with OmitsRepoIgnoreDisclosureFloor; saying
+	// nothing keeps the funded behaviour.
+	callerContextBytes := options.MaxContextBytes
+	if reserve := searchRepoIgnoreFloorReserveBytes(options, selection.repoIgnored); reserve > 0 &&
+		options.MaxContextBytes >= reserve {
+		// Zero means unlimited to the fitter. A one-byte budget seats no
+		// result, preserving the floor-only case when the reserve uses it all.
+		options.MaxContextBytes = max(1, options.MaxContextBytes-reserve)
+	}
 	selectedFiles := selection.files
 	var replayProvenancePaths []string
 	if options.Worktree || selection.commit == "" {
@@ -844,6 +1264,7 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 			Stats: SearchStats{
 				QueryConstraintsTruncated: q.constraints.Truncated,
 				FilesScanned:              selection.filesScanned,
+				RepoIgnoredFiles:          repoIgnoredFileCount(selection.repoIgnored),
 				PreselectionBackend:       selection.preselectionBackend,
 				PreselectionPasses:        selection.preselectionPasses,
 				PreselectionFilesExamined: selection.preselectionFilesExamined,
@@ -856,15 +1277,16 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 				FilesIndexed:              0,
 				SymbolsConsidered:         symbolsConsidered,
 				ResultBytes:               serializedSearchResultBytes([]SearchResult{}),
-				ContextBudgetBytes:        options.MaxContextBytes,
+				ContextBudgetBytes:        callerContextBytes,
 				IndexCacheHit:             cacheHit,
 				IndexLatencyMS:            preindexLoadLatency.Milliseconds(),
 				PreselectLatencyMS:        preselectLatency.Milliseconds(),
 				TotalLatencyMS:            totalLatency,
 				SearchLatencyMS:           totalLatency,
 			},
-			Warnings:        warnings,
-			PartialFailures: partialFailures,
+			RepoIgnored:     selection.repoIgnored,
+			Warnings:        withRepoIgnoreDisclosure(warnings, selection.repoIgnored),
+			PartialFailures: withRepoIgnorePartialFailures(partialFailures, selection.repoIgnored),
 			Completeness:    completeness,
 		}, nil
 	}
@@ -924,7 +1346,7 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 	// The repository-wide literal lookup two blocks share. It reuses the per-term posting lists
 	// preselection already built, so it adds no corpus pass; see search_needle.go for the three
 	// sources and why it answers nothing when none of them is exact.
-	needleIndex := &searchNeedleIndex{read: read, corpus: selection.allFiles}
+	needleIndex := &searchNeedleIndex{read: read, corpus: selection.allFiles, inferredAbbreviations: q.inferredAbbreviations}
 	needleIndex.termFiles, needleIndex.termFileTotals = selection.termPostings.snapshot()
 	if selection.gitGrepUsable {
 		needleIndex.grep = newSearchNeedleGrep(ctx, selection.repoRoot, selection.gitGrepTreeish, selection.ignores)
@@ -967,6 +1389,7 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 	// of the query. The content reader is memoized, so the second pass normally re-reads
 	// nothing; a selection larger than the content cache can fall back to disk for the
 	// overflow, which rereadFiles/rereadBytes below keep out of the read telemetry.
+	corpusMatcher := newSearchQueryTermMatcher(q)
 	indexableFiles := make([]string, 0, len(selectedFiles))
 	for _, filePath := range selectedFiles {
 		if err := ctx.Err(); err != nil {
@@ -977,10 +1400,10 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 			continue
 		}
 		indexableFiles = append(indexableFiles, filePath)
-		lowerContent := strings.ToLower(content)
-		lowerPath := strings.ToLower(filepath.ToSlash(filePath))
-		for _, term := range q.terms {
-			if strings.Contains(lowerContent, term) || strings.Contains(lowerPath, term) {
+		contentMatches := corpusMatcher.match(content)
+		pathMatches := corpusMatcher.match(filepath.ToSlash(filePath))
+		for index, term := range q.terms {
+			if contentMatches[index] || pathMatches[index] {
 				fileDF[term]++
 			}
 		}
@@ -1511,7 +1934,7 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 	// One number for everything outside `results`, so the payload's true size never has to be
 	// re-derived from three separate counters. See search_blocks.go.
 	stats.ContextBlockBytes = searchContextBlockBytes(stats)
-	stats.ContextBudgetBytes = options.MaxContextBytes
+	stats.ContextBudgetBytes = callerContextBytes
 	stats.ResultsDropped = dropped
 	stats.SnippetsTruncated = truncated
 	// Query and usage counters are disjoint physical reads. Identifier lookups
@@ -1523,6 +1946,7 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 	stats.QueryLatencyMS = time.Since(queryStarted).Milliseconds()
 	stats.TotalLatencyMS = time.Since(searchStarted).Milliseconds()
 	stats.SearchLatencyMS = stats.TotalLatencyMS
+	stats.RepoIgnoredFiles = repoIgnoredFileCount(selection.repoIgnored)
 	if results == nil {
 		results = []SearchResult{}
 	}
@@ -1545,9 +1969,10 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 		VerifyCommand:         verifyCommand,
 		ClosedSet:             closedSet,
 		CoverageNote:          coverageNote,
+		RepoIgnored:           selection.repoIgnored,
 		Stats:                 stats,
-		Warnings:              snapshot.Header.Warnings,
-		PartialFailures:       partialFailures,
+		Warnings:              withRepoIgnoreDisclosure(snapshot.Header.Warnings, selection.repoIgnored),
+		PartialFailures:       withRepoIgnorePartialFailures(partialFailures, selection.repoIgnored),
 		Completeness:          snapshot.Header.Completeness,
 		replayProvenancePaths: replayProvenancePaths,
 	}, nil
@@ -1566,7 +1991,9 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 func newSearchNeedleGrep(ctx context.Context, repoRoot, treeish string, ignores ignoreMatcher) func(string) ([]string, bool) {
 	return func(pattern string) ([]string, bool) {
 		paths, grepErr := gitutil.GrepFixedStringPaths(ctx, repoRoot, treeish, pattern)
-		return filterIgnoredPaths(paths, ignores), grepErr == nil
+		// nil ledger: these paths come from Git's whole-tree grep, not from the
+		// corpus listing, so what is dropped here was never disclosed as corpus.
+		return filterIgnoredPaths(paths, ignores, nil), grepErr == nil
 	}
 }
 
@@ -1758,6 +2185,21 @@ func truncateSearchText(value string, maxBytes int, q searchQuery) string {
 	center := len(value) / 2
 	lower := strings.ToLower(value)
 	for _, term := range q.terms {
+		if q.inferredAbbreviations[term] {
+			found := false
+			for _, span := range searchSourceWordPattern.FindAllStringIndex(value, -1) {
+				raw := value[span[0]:span[1]]
+				if searchQueryTermMatches(q, raw, strings.ToLower(raw), term) {
+					center = (span[0] + span[1]) / 2
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+			continue
+		}
 		if index := strings.Index(lower, term); index >= 0 {
 			center = index + len(term)/2
 			break
@@ -1878,6 +2320,9 @@ type searchFileSelection struct {
 	// run against — empty means the working tree, which is what a worktree search indexes.
 	gitGrepUsable  bool
 	gitGrepTreeish string
+	// repoIgnored is the listing's disclosure of what the repository's own ignore
+	// rules removed, carried through so every response shape can report it.
+	repoIgnored *RepoIgnoreReport
 	// ignores is the exclude stack the corpus listing was filtered with, kept so the routes that
 	// reach OUTSIDE that listing can apply the same verdict. Only one does: the needle index's
 	// `git grep`, which Git answers over the whole tree. Carrying the matcher rather than
@@ -1901,6 +2346,11 @@ func preselectSearchFiles(
 	preindexedSnapshot ProviderSnapshot,
 	preindexCacheHit bool,
 ) (searchFileSelection, error) {
+	// This is the one prepareSource caller that reads sourceContext.repoIgnored
+	// (into selection.repoIgnored below, then SearchResponse.RepoIgnored); every
+	// other caller discards it, so this is where the ledger's accounting cost is
+	// worth paying.
+	snapshotOptions.trackRepoIgnored = true
 	source, err := prepareSource(ctx, repo, snapshotOptions)
 	if err != nil {
 		return searchFileSelection{}, err
@@ -1919,6 +2369,7 @@ func preselectSearchFiles(
 		commit:                    source.commit,
 		tree:                      source.tree,
 		warnings:                  append([]ProviderWarning{}, source.warnings...),
+		repoIgnored:               source.repoIgnored,
 		filesScanned:              len(source.paths),
 		preselectionBackend:       "inventory",
 		preselectionPasses:        1,
@@ -1951,12 +2402,57 @@ func preselectSearchFiles(
 		preindexedSnapshot.Header.RepoKey == source.key
 	grepPatterns, grepSafe := searchGitGrepPatterns(q.terms)
 	if exactFullPreindex && !options.Worktree && !options.Deep && grepSafe {
-		matches, grepErr := gitutil.GrepTreePaths(ctx, source.absRepo, source.commit, grepPatterns)
+		var matches []string
+		var grepErr error
+		if len(q.inferredAbbreviations) > 0 {
+			validationRead := source.read
+			if limit := resolveMaxParseBytes(options.MaxParseBytes); limit > 0 && limit < defaultMaxParseBytes {
+				// Preindexed lexical results may exceed a caller-lowered parser
+				// limit. Validate conservative alias hits with the same bounded
+				// reader used to display those results, not the parser's cap.
+				read, closeRead, err := openSearchContentReader(ctx, source.absRepo, source.commit, true, options.IgnoreFiles, options.IncludeFiles, options.MaxParseBytes)
+				if err != nil {
+					return selection, err
+				}
+				defer closeRead()
+				validationRead = read
+			}
+			allowed := map[string]bool{}
+			for _, path := range source.paths {
+				allowed[path] = true
+			}
+			seen := map[string]bool{}
+			patterns := searchGitAliasPatternsForTerms(q, q.terms)
+			if patterns == nil {
+				grepErr = fmt.Errorf("query requires Unicode content preselection")
+			} else {
+				grepErr = gitutil.GrepTreePatternLines(ctx, source.absRepo, source.commit, patterns, func(match gitutil.GrepMatch) error {
+					if allowed[match.Path] && !seen[match.Path] {
+						text := match.Text
+						if !textMatchesSearchQuery(q, text) {
+							// A conservative locale boundary may need validation.
+							if content, ok := validationRead(match.Path); ok {
+								text = content
+								selection.filesContentRead++
+							}
+						}
+						if textMatchesSearchQuery(q, text) {
+							matches = append(matches, match.Path)
+						}
+						seen[match.Path] = true
+					}
+					return ctx.Err()
+				})
+			}
+		} else {
+			matches, grepErr = gitutil.GrepTreePaths(ctx, source.absRepo, source.commit, grepPatterns)
+		}
 		if grepErr == nil {
 			// This branch deliberately keeps every matched file rather than
 			// honouring MaxIndexedFiles (see above), so the bridge gets its own
 			// budget rather than a remainder of a cap this path does not apply.
-			selection.files = bridgeRegistrationHandlerFiles(ctx, source, committedSearchFiles(source.paths, matches, q), searchRegistrationBridgeMaxHandlers)
+			files := committedSearchFiles(source.paths, matches, q)
+			selection.files = bridgeRegistrationHandlerFiles(ctx, source, files, searchRegistrationBridgeMaxHandlers)
 			selection.sparseFiles = append([]string(nil), selection.files...)
 			selection.preselectionBackend = "git-tree-grep"
 			selection.preselectionPasses = 1
@@ -1976,35 +2472,160 @@ func preselectSearchFiles(
 	// share of every file score is added afterwards, over the matched terms only
 	// (applySearchFileCoverage). Until then a file carries its matched weight unnormalized.
 	matchedAnywhere := make([]bool, len(q.terms))
-	matcher := newSearchTermMatcher(q.terms)
+	matcher := newSearchQueryTermMatcher(q)
 	scanPaths := source.paths
 	usedGitIndexPreselection := false
+	gitIndexPasses := 1
 	if shouldUseGitGrepPreselection(options.Worktree, len(source.paths)) {
-		matches, grepErr := gitutil.GrepIndexMatches(ctx, source.absRepo, searchGitGrepPreselectionPatterns(q), 32)
+		allowed := make(map[string]bool, len(source.paths))
+		for _, filePath := range source.paths {
+			allowed[filePath] = true
+		}
+		termMatches := make(map[string][]bool)
+		coalescedAliases := len(q.inferredAbbreviations) > 0 && !searchGitAliasScansFit(q)
+		saturated := make(map[string]bool)
+		fullyScanned := make(map[string]bool)
+		record := func(match gitutil.GrepMatch) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if !allowed[match.Path] || saturated[match.Path] || fullyScanned[match.Path] {
+				return nil
+			}
+			seen := termMatches[match.Path]
+			if seen == nil {
+				seen = make([]bool, len(q.terms))
+			}
+			for index, matched := range matcher.match(match.Text) {
+				seen[index] = seen[index] || matched
+			}
+			all := true
+			for _, matched := range seen {
+				all = all && matched
+			}
+			saturated[match.Path] = all
+			termMatches[match.Path] = seen
+			return nil
+		}
+		var grepErr error
+		if len(q.inferredAbbreviations) > 0 {
+			gitIndexPasses = 0
+			// Preserve the ordinary-term sample in one scan. Alias evidence
+			// gets independent first-hit scans, so common terms cannot hide it.
+			var primary []string
+			primaryTerms := searchGitGrepPreselectionPatterns(q)
+			if coalescedAliases {
+				primaryTerms = q.terms
+			}
+			for _, term := range primaryTerms {
+				if !q.inferredAbbreviations[term] {
+					primary = append(primary, term)
+				}
+			}
+			if len(primary) > 0 && grepErr == nil {
+				if patterns := searchGitAliasPatternsForTerms(q, primary); patterns == nil {
+					grepErr = fmt.Errorf("query requires content preselection")
+				} else {
+					gitIndexPasses++
+					grepErr = gitutil.GrepIndexPatternSample(ctx, source.absRepo, patterns, record)
+				}
+			}
+			if coalescedAliases && grepErr == nil {
+				var aliases []string
+				for _, term := range q.terms {
+					if q.inferredAbbreviations[term] {
+						aliases = append(aliases, term)
+					}
+				}
+				if patterns := searchGitAliasPatternsForTerms(q, aliases); patterns == nil {
+					grepErr = fmt.Errorf("query requires content preselection")
+				} else {
+					gitIndexPasses++
+					grepErr = gitutil.GrepIndexPatternSample(ctx, source.absRepo, patterns, func(match gitutil.GrepMatch) error {
+						if !allowed[match.Path] || saturated[match.Path] || fullyScanned[match.Path] {
+							return ctx.Err()
+						}
+						confirmed := false
+						for _, alias := range aliases {
+							if searchQueryTermMatches(q, match.Text, strings.ToLower(match.Text), alias) {
+								confirmed = true
+								break
+							}
+						}
+						if !confirmed {
+							// A conservative byte boundary can fill the sample before
+							// real Unicode-aware evidence; validate that file once.
+							if content, ok := source.read(match.Path); ok {
+								selection.filesContentRead++
+								match.Text = content
+								if err := record(match); err != nil {
+									return err
+								}
+								fullyScanned[match.Path] = true
+								return nil
+							}
+						}
+						return record(match)
+					})
+				}
+			}
+			for _, term := range q.terms {
+				if coalescedAliases {
+					break
+				}
+				if grepErr != nil {
+					break
+				}
+				if !q.inferredAbbreviations[term] {
+					continue
+				}
+				patterns := searchGitAliasPatternsForTerms(q, []string{term})
+				if patterns == nil {
+					grepErr = fmt.Errorf("query requires content preselection")
+					break
+				}
+				gitIndexPasses++
+				grepErr = gitutil.GrepIndexPatternLines(ctx, source.absRepo, patterns, func(match gitutil.GrepMatch) error {
+					if !allowed[match.Path] || saturated[match.Path] || fullyScanned[match.Path] {
+						return ctx.Err()
+					}
+					if !searchQueryTermMatches(q, match.Text, strings.ToLower(match.Text), term) {
+						// Validate conservative regex boundaries once per file.
+						if content, ok := source.read(match.Path); ok {
+							selection.filesContentRead++
+							match.Text = content
+							if err := record(match); err != nil {
+								return err
+							}
+							// record matched the entire file against every query term,
+							// including aliases whose Git scan has not run yet.
+							fullyScanned[match.Path] = true
+							return nil
+						}
+					}
+					return record(match)
+				})
+				if grepErr != nil {
+					break
+				}
+			}
+		} else {
+			var matches []gitutil.GrepMatch
+			matches, grepErr = gitutil.GrepIndexMatches(ctx, source.absRepo, searchGitGrepPreselectionPatterns(q), 32)
+			if grepErr == nil {
+				for _, match := range matches {
+					if grepErr = record(match); grepErr != nil {
+						break
+					}
+				}
+			}
+		}
 		tracked, trackedErr := gitutil.ListIndexFiles(ctx, source.absRepo)
 		if grepErr == nil && trackedErr == nil {
 			usedGitIndexPreselection = true
-			allowed := make(map[string]bool, len(source.paths))
-			for _, filePath := range source.paths {
-				allowed[filePath] = true
-			}
 			trackedSet := make(map[string]bool, len(tracked))
 			for _, filePath := range tracked {
 				trackedSet[filePath] = true
-			}
-			termMatches := make(map[string][]bool)
-			for _, match := range matches {
-				if !allowed[match.Path] {
-					continue
-				}
-				seen := termMatches[match.Path]
-				if seen == nil {
-					seen = make([]bool, len(q.terms))
-				}
-				for index, matched := range matcher.match(match.Text) {
-					seen[index] = seen[index] || matched
-				}
-				termMatches[match.Path] = seen
 			}
 			provisional := make([]searchFileCandidate, 0, len(termMatches)+16)
 			grepMatchedAnywhere := make([]bool, len(q.terms))
@@ -2017,6 +2638,9 @@ func preselectSearchFiles(
 					}
 				}
 				pathScore := pathSearchScore(q, filePath)
+				if pathScore == 0 && matchedWeight == 0 {
+					continue
+				}
 				contentScore := matchedWeight
 				provisional = append(provisional, searchFileCandidate{
 					path:          filePath,
@@ -2051,6 +2675,8 @@ func preselectSearchFiles(
 				return canonicalSearchPathLess(provisional[i].path, provisional[j].path)
 			})
 			poolLimit := len(provisional)
+			// Bounded samples rank a validation shortlist; the final
+			// ranking uses full content only from this shortlist.
 			if threshold := (len(provisional)-1)/4 + 1; options.MaxIndexedFiles < threshold {
 				poolLimit = options.MaxIndexedFiles * 4
 			}
@@ -2064,7 +2690,7 @@ func preselectSearchFiles(
 				scanPaths = append(scanPaths, candidate.path)
 			}
 			scanPaths = append(scanPaths, untracked...)
-			if len(scanPaths) == 0 {
+			if len(scanPaths) == 0 && !coalescedAliases {
 				scanPaths = source.paths
 			}
 		}
@@ -2202,15 +2828,15 @@ func preselectSearchFiles(
 	// An explicit MaxIndexedFiles is an exact compatibility limit, so the bridge
 	// spends only what preselection left unused.
 	selection.files = bridgeRegistrationHandlerFiles(ctx, source, selection.files, options.MaxIndexedFiles-len(selection.files))
-	selection.filesContentRead = contentReads
+	selection.filesContentRead += contentReads
 	selection.preselectionBackend = "go-content"
 	selection.preselectionFilesExamined = len(scanPaths)
 	if usedGitIndexPreselection {
 		selection.preselectionBackend = "git-index-grep+go-content"
 		if !progressive {
-			selection.preselectionPasses++
+			selection.preselectionPasses += gitIndexPasses
 		}
-		selection.preselectionFilesExamined += len(source.paths)
+		selection.preselectionFilesExamined += len(source.paths) * gitIndexPasses
 		// The content pass ran over a Git-narrowed pool, so the posting lists cover only part of
 		// the corpus. Discard them rather than let a block compute a repository-wide total from a
 		// subset — Git is here, so the exact answer is one grep away.
@@ -2546,6 +3172,17 @@ var (
 	searchASCIILowerAlternatives     [128][]rune
 )
 
+func initSearchASCIILowerAlternatives() {
+	searchASCIILowerAlternativesOnce.Do(func() {
+		for value := rune(128); value <= unicode.MaxRune; value++ {
+			lower := unicode.ToLower(value)
+			if lower >= 0 && lower < 128 {
+				searchASCIILowerAlternatives[lower] = append(searchASCIILowerAlternatives[lower], value)
+			}
+		}
+	})
+}
+
 // searchGitGrepPatterns makes Git's byte-oriented fixed-string preselection a
 // conservative superset of Go's strings.ToLower matching. Some non-ASCII
 // uppercase runes lower to ASCII (for example Turkish dotted İ -> i), while
@@ -2557,14 +3194,7 @@ func searchGitGrepPatterns(terms []string) ([]string, bool) {
 	if !searchTermsSafeForGitGrep(terms) {
 		return nil, false
 	}
-	searchASCIILowerAlternativesOnce.Do(func() {
-		for value := rune(128); value <= unicode.MaxRune; value++ {
-			lower := unicode.ToLower(value)
-			if lower >= 0 && lower < 128 {
-				searchASCIILowerAlternatives[lower] = append(searchASCIILowerAlternatives[lower], value)
-			}
-		}
-	})
+	initSearchASCIILowerAlternatives()
 	patterns := make([]string, 0, len(terms))
 	seen := make(map[string]bool, len(terms))
 	for _, term := range terms {
@@ -2893,14 +3523,14 @@ func sparseCandidatesForFile(
 	}
 	chunkLines := maxInt(1, options.MaxRegionLines)
 	stride := minInt(sparseSearchChunkStrideLines, chunkLines)
-	pathCounts, _ := sparseSearchTermCounts(filepath.ToSlash(filePath), sparseQuery.termSet)
+	pathCounts, _ := sparseSearchTermCounts(filepath.ToSlash(filePath), sparseQuery)
 	documentCount := 0
 	documentLength := 0
 	var out []searchCandidate
 	for start := 1; start <= len(lines); start += stride {
 		end := minInt(len(lines), start+chunkLines-1)
 		text := filepath.ToSlash(filePath) + "\n" + strings.Join(lines[start-1:end], "\n")
-		counts, length := sparseSearchTermCounts(text, sparseQuery.termSet)
+		counts, length := sparseSearchTermCounts(text, sparseQuery)
 		documentCount++
 		documentLength += maxInt(1, length)
 		if len(counts) > 0 {
@@ -2937,7 +3567,7 @@ func sparseSearchFocusLine(q searchQuery, lines []string, start, end int) int {
 	bestLine := start
 	bestMatches := -1
 	for line := start; line <= end; line++ {
-		counts, _ := sparseSearchTermCounts(lines[line-1], q.termSet)
+		counts, _ := sparseSearchTermCounts(lines[line-1], q)
 		matches := 0
 		for _, count := range counts {
 			matches += count
@@ -3186,7 +3816,7 @@ func makeSearchCandidate(q searchQuery, filePath, language string, lines []strin
 		return searchCandidate{}, false
 	}
 	regionText := strings.Join(lines[start-1:end], "\n")
-	counts, length := searchTermCounts(regionText, q.termSet)
+	counts, length := searchTermCounts(regionText, q)
 	focus := searchFocusLine(q, lines, start, end)
 	if symbol.ID != "" {
 		focus = maxInt(focus, symbol.StartLine)
@@ -3349,10 +3979,11 @@ func scoreSearchCandidates(candidates []searchCandidate, q searchQuery, fileDF m
 // Plural-tolerant on purpose: the issue says "sections" and the symbol says "Section", and an exact
 // substring test scores that as a miss — which is precisely how the gold site lost.
 func searchNameTermCoverage(result SearchResult, q searchQuery, _ map[string]float64) float64 {
-	name := strings.ToLower(result.QualifiedName)
-	if name == "" {
-		name = strings.ToLower(result.SymbolName)
+	rawName := result.QualifiedName
+	if rawName == "" {
+		rawName = result.SymbolName
 	}
+	name := strings.ToLower(rawName)
 	if name == "" || len(q.terms) == 0 {
 		return 0
 	}
@@ -3364,9 +3995,16 @@ func searchNameTermCoverage(result SearchResult, q searchQuery, _ map[string]flo
 	// (pages + section) barely above `Pages.Reverse` (pages). Counting DISTINCT matched terms is the
 	// signal: two domain terms in one name is strong evidence, three is decisive, and beyond that the
 	// extra matches say little, so it saturates.
+	// Tokenized once per candidate, not once per term: the abbreviation test is token-scoped and
+	// the split is the only expensive part of it.
+	tokens := searchTokenVariants(rawName)
 	matched := 0
 	for _, term := range q.terms {
-		if searchNameContainsTerm(name, term) {
+		if q.inferredAbbreviations[term] {
+			continue
+		}
+		if (result.Kind == "section" || result.Kind == "document") && searchProseNameContainsTerm(name, term) ||
+			result.Kind != "section" && result.Kind != "document" && (searchNameTokenMatchesTerm(tokens, term) || searchNameMatchesAbbreviation(tokens, term)) {
 			matched++
 		}
 	}
@@ -3376,23 +4014,339 @@ func searchNameTermCoverage(result SearchResult, q searchQuery, _ map[string]flo
 	return minFloat64(float64(matched), 3) / 3
 }
 
-// searchNameContainsTerm matches a query term against an identifier, tolerating the one
-// morphological difference that dominates issue text: a plural in the prose against a singular in
-// the identifier ("sections" vs getPagesInSection).
-func searchNameContainsTerm(lowerName, term string) bool {
+func searchProseNameContainsTerm(name, term string) bool {
 	if len(term) < 3 {
 		return false
 	}
-	if strings.Contains(lowerName, term) {
+	if strings.Contains(name, term) {
 		return true
 	}
-	if strings.HasSuffix(term, "es") && len(term) > 4 && strings.Contains(lowerName, term[:len(term)-2]) {
+	if strings.HasSuffix(term, "es") && len(term) > 4 && strings.Contains(name, term[:len(term)-2]) {
 		return true
 	}
-	if strings.HasSuffix(term, "s") && len(term) > 3 && strings.Contains(lowerName, term[:len(term)-1]) {
+	return strings.HasSuffix(term, "s") && len(term) > 3 && strings.Contains(name, term[:len(term)-1])
+}
+
+// searchNameTokenMatchesTerm matches a query term against the TOKENS of an identifier, tolerating
+// the one morphological difference that dominates issue text: a plural in the prose against a
+// singular in the identifier ("sections" vs getPagesInSection).
+//
+// This replaced a raw substring test over the lowercased name, which could not tell login from
+// logging. `strings.Contains("runlogin", "log")` is true, so the plural-stripped term "logs" from
+// "the function that logs a user in" matched runLogin and RestoreLogsOnly identically — the one
+// signal that could have separated the two clusters scored them the same. Tokenizing first makes
+// "log" a match for the token "logs" and a non-match for the token "login", which is the
+// distinction the substring form structurally could not express.
+//
+// Known code abbreviations retain prefix/suffix reach; arbitrary prose terms do not.
+func searchNameTokenMatchesTerm(tokens []string, term string) bool {
+	if len(term) < 2 || searchStopWords[term] {
+		return false
+	}
+	if searchKnownAbbreviations[term] && searchNameMatchesAlias(tokens, term) {
 		return true
+	}
+	termVariants := searchNameWordVariants(term)
+	for _, token := range tokens {
+		for _, tokenVariant := range searchNameWordVariants(token) {
+			for _, termVariant := range termVariants {
+				if tokenVariant == termVariant {
+					return true
+				}
+			}
+		}
 	}
 	return false
+}
+
+// searchNameWordVariants returns the singular forms a word might be matched through. Both sides of
+// the comparison are expanded rather than one, because the query is as likely to carry the plural
+// as the identifier is: "sections" against Section, and "file" against files.
+//
+// Every candidate form is emitted rather than one chosen by rule, since the rules disagree — "-es"
+// stripping is right for "processes" and wrong for "files".
+func searchNameWordVariants(word string) []string {
+	out := []string{word}
+	if strings.HasSuffix(word, "ies") && len(word) > 4 {
+		out = append(out, word[:len(word)-3]+"y")
+	}
+	if strings.HasSuffix(word, "es") && len(word) > 4 {
+		out = append(out, word[:len(word)-2])
+	}
+	if strings.HasSuffix(word, "s") && !strings.HasSuffix(word, "ss") && len(word) > 3 {
+		out = append(out, word[:len(word)-1])
+	}
+	return out
+}
+
+// searchAbbreviationTermWeight is the query weight of an alias the caller did not type. It matches
+// the morphological-variant weight: same class of inference, same confidence.
+const searchAbbreviationTermWeight = 0.55
+
+// searchTermAbbreviations maps the long, prose spelling of a concept to the short spellings an
+// identifier actually uses. Prose and code disagree systematically here, and literal substring matching
+// cannot bridge unrelated spellings, so "authentication" scores a MISS against
+// runLogin, persistLogin and the whole `auth` package.
+//
+// Measured on entireio/cli. The query "authentication" topped out at 16.6 (rank 1
+// addInsecureHTTPAuthFlag, then slugifyTitle and HTTPErrorMessage — noise); the same concept spelled
+// the way the code spells it, "auth", scored 34.6 with a clean auth-only head. So the prose sentence
+// "the main authentication function that logs a user in" returned the LOGGING package —
+// RestoreLogsOnly and handleLogsOnlyRewindNonInteractive at 22.3 — because "logs" is spelled the way
+// code spells it and "authentication" is not. The name-coverage signal that exists to separate the
+// head scored zero on every correct answer.
+//
+// One direction only, long -> short. Query terms come from prose and identifiers carry the
+// abbreviation; known full forms also let a direct "auth" query match runAuthenticated.
+//
+// EVERY ENTRY IS FREQUENCY-DERIVED, NOT CURATED. An earlier, hand-written version of this table
+// carried 74 pairs and lost a real query to one of them: "return 4xx on invalid input for delete
+// method" (SWE-bench caddyserver__caddy-5870) dropped its gold file out of the top ten because
+// delete -> del pulled in every Del() header helper. The failure class is an entry whose long form
+// is ALREADY common in identifiers -- the query needs no help, so the alias only adds noise -- or
+// whose alias code does not actually prefer (code writes "delete" 10x more often than "del").
+//
+// The keep rule, measured over 1.4M identifier tokens from 40 repos (21 SWE-bench Multilingual
+// repos across nine languages, 18 pinned popular Go repos, entireio/cli): the LONG form occurs at
+// most 50 times per 100k identifier tokens (a query whose word code already writes needs no help,
+// and the alias only adds noise -- this is the clause that catches delete at 80/100k, context at
+// 139, error at 345), AND the alias occurs at least 25 times (it must actually reach something:
+// txn occurs ONCE in 1.4M tokens, authz seven times, sess zero). 23 of the original 74 pairs
+// failed. Deliberately NOT a code-prefers-the-short-form ratio test: database/db fails that ratio
+// (557 vs 183) yet openDB-style names are real and reachable only through the alias.
+// Do not add entries by taste; rerun the measurement.
+var searchTermAbbreviations = map[string][]string{
+	"address":        {"addr"},
+	"administration": {"admin"},
+	"administrator":  {"admin"},
+	"allocate":       {"alloc"},
+	"allocation":     {"alloc"},
+	"asynchronous":   {"async"},
+	"authenticate":   {"auth"},
+	"authenticated":  {"auth"},
+	"authentication": {"auth"},
+	"authorization":  {"auth"},
+	"authorize":      {"auth"},
+	"boolean":        {"bool"},
+	"calculate":      {"calc"},
+	"calculation":    {"calc"},
+	"configuration":  {"config", "cfg"},
+	"configure":      {"config"},
+	"connection":     {"conn"},
+	"database":       {"db"},
+	"definition":     {"def"},
+	"destination":    {"dest", "dst"},
+	"document":       {"doc"},
+	"documentation":  {"docs", "doc"},
+	"environment":    {"env"},
+	"executable":     {"exec"},
+	"execute":        {"exec"},
+	"identifier":     {"id"},
+	"implementation": {"impl"},
+	"information":    {"info"},
+	"initialization": {"init"},
+	"initialize":     {"init"},
+	"integer":        {"int"},
+	"library":        {"lib"},
+	"maximum":        {"max"},
+	"minimum":        {"min"},
+	"package":        {"pkg"},
+	"parameter":      {"param"},
+	"pointer":        {"ptr"},
+	"previous":       {"prev"},
+	"reference":      {"ref"},
+	"repository":     {"repo"},
+	"specification":  {"spec"},
+	"statement":      {"stmt"},
+	"statistics":     {"stats"},
+	"synchronize":    {"sync"},
+	"synchronous":    {"sync"},
+	"temporary":      {"temp", "tmp"},
+	"utility":        {"util"},
+}
+
+var searchKnownAbbreviations = func() map[string]bool {
+	aliases := map[string]bool{}
+	for _, values := range searchTermAbbreviations {
+		for _, alias := range values {
+			aliases[alias] = true
+		}
+	}
+	return aliases
+}()
+
+// Longer aliases may expand to known concept spellings, not arbitrary prefixes.
+var searchAbbreviationForms = func() map[string]map[string]bool {
+	forms := map[string]map[string]bool{
+		"auth":   {"authn": true, "authz": true, "oauth": true, "oauth2": true, "auth2": true},
+		"config": {"configurable": true},
+		"repo":   {"gitrepo": true, "monorepo": true},
+	}
+	for word, aliases := range searchTermAbbreviations {
+		for _, alias := range aliases {
+			if len(alias) < 4 {
+				continue
+			}
+			if forms[alias] == nil {
+				forms[alias] = map[string]bool{}
+			}
+			forms[alias][word] = true
+		}
+	}
+	return forms
+}()
+
+func searchAliasFormAccepted(token, alias string) bool {
+	if token == alias || token == alias+"s" {
+		return true
+	}
+	forms := searchAbbreviationForms[alias]
+	if len(forms) == 0 {
+		return false
+	}
+	for _, variant := range searchNameWordVariants(token) {
+		if forms[variant] {
+			return true
+		}
+	}
+	for _, variant := range morphologicalSearchTerms(token) {
+		if forms[variant] {
+			return true
+		}
+	}
+	return false
+}
+
+var searchAliasForms = func() map[string]map[string]bool {
+	out := map[string]map[string]bool{}
+	for alias := range searchKnownAbbreviations {
+		forms := map[string]bool{alias: true, alias + "s": true}
+		for root := range searchAbbreviationForms[alias] {
+			candidates := []string{root, root + "s", root + "es", root + "ing", root + "ed"}
+			if strings.HasSuffix(root, "y") {
+				candidates = append(candidates, strings.TrimSuffix(root, "y")+"ies")
+			}
+			if strings.HasSuffix(root, "e") {
+				base := strings.TrimSuffix(root, "e")
+				candidates = append(candidates, base+"ing", base+"ed")
+			}
+			if strings.HasSuffix(root, "ize") {
+				candidates = append(candidates, strings.TrimSuffix(root, "ize")+"ization")
+			}
+			if strings.HasSuffix(root, "ify") {
+				candidates = append(candidates, strings.TrimSuffix(root, "ify")+"ification")
+			}
+			for _, form := range candidates {
+				if searchAliasFormAccepted(form, alias) {
+					forms[form] = true
+				}
+			}
+		}
+		out[alias] = forms
+	}
+	return out
+}()
+
+func searchNameMatchesAlias(tokens []string, alias string) bool {
+	for _, token := range tokens {
+		if searchAliasForms[alias][token] {
+			return true
+		}
+	}
+	return false
+}
+
+// The reverse index lets one tokenization serve every inferred query alias.
+func searchAliasTokenIndex(terms []string, aliases map[string]bool) map[string][]string {
+	out := map[string][]string{}
+	explicit := map[string]bool{}
+	for _, term := range terms {
+		if !aliases[term] {
+			explicit[term] = true
+		}
+	}
+	for _, alias := range terms {
+		if !aliases[alias] {
+			continue
+		}
+		for token := range searchAliasForms[alias] {
+			if explicit[token] {
+				continue
+			}
+			if len(out[token]) == 0 || token == alias {
+				out[token] = []string{alias}
+			}
+		}
+	}
+	return out
+}
+
+// Match whole alias tokens and their plurals. Longer aliases also recognize
+// their known full spellings and explicit code forms such as oauth and gitrepo.
+// This preserves Authenticated without allowing author, or repo without report.
+func searchNameMatchesAbbreviation(tokens []string, term string) bool {
+	for _, alias := range searchAbbreviations(term) {
+		if searchNameMatchesAlias(tokens, alias) {
+			return true
+		}
+	}
+	return false
+}
+
+// Preserve the original case until identifier splitting has found camel-case boundaries.
+func searchTextMatchesAlias(text, alias string) bool {
+	for _, word := range searchSourceWordPattern.FindAllString(text, -1) {
+		if searchNameMatchesAlias(searchTokenVariants(word), alias) {
+			return true
+		}
+	}
+	return false
+}
+
+// Prose headings retain text matching; code names use identifier boundaries.
+func searchSymbolNameScoreMatches(q searchQuery, symbol SymbolRecord, term string) bool {
+	if symbol.Kind == "section" || symbol.Kind == "document" {
+		return searchQueryTermMatches(q, symbol.Name, strings.ToLower(symbol.Name), term) || searchQueryTermMatches(q, symbol.QualifiedName, strings.ToLower(symbol.QualifiedName), term)
+	}
+	return searchQueryNameTermMatches(q, symbol.Name, term) || searchQueryNameTermMatches(q, symbol.QualifiedName, term)
+}
+
+func searchQueryNameTermMatches(q searchQuery, name, term string) bool {
+	if q.inferredAbbreviations[term] {
+		return searchQueryTermMatches(q, name, strings.ToLower(name), term)
+	}
+	for _, raw := range searchSourceWordPattern.FindAllString(name, -1) {
+		if searchNameTokenMatchesTerm(searchTokenVariants(raw), term) {
+			return true
+		}
+	}
+	return false
+}
+
+func searchQueryTermMatches(q searchQuery, text, lower, term string) bool {
+	if q.inferredAbbreviations[term] {
+		for _, raw := range searchSourceWordPattern.FindAllString(text, -1) {
+			for _, token := range searchTokenVariants(raw) {
+				for _, alias := range q.aliasTokens[token] {
+					if alias == term {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+	return strings.Contains(lower, term)
+}
+
+// Use the same inflection routes for retrieval and name coverage, including
+// authenticating -> authenticate -> auth and repositories -> repository -> repo.
+func searchAbbreviations(term string) []string {
+	var aliases []string
+	for _, variant := range appendUnique(searchNameWordVariants(term), morphologicalSearchTerms(term)...) {
+		aliases = appendUnique(aliases, searchTermAbbreviations[variant]...)
+	}
+	return aliases
 }
 
 // searchNameCoverageWeight is how much a fully name-covering candidate gains. Sized against the
@@ -3401,20 +4355,27 @@ func searchNameContainsTerm(lowerName, term string) bool {
 const searchNameCoverageWeight = 10.0
 
 func searchNameCoversQuery(result SearchResult, q searchQuery) bool {
-	name := strings.ToLower(result.QualifiedName)
+	name := result.QualifiedName
 	if name == "" {
-		name = strings.ToLower(result.SymbolName)
+		name = result.SymbolName
 	}
 	if name == "" || len(q.terms) == 0 {
 		return false
 	}
-	matched := 0
+	matched, concepts := 0, 0
+	tokens := searchTokenVariants(name)
+	lowerName := strings.ToLower(name)
 	for _, term := range q.terms {
-		if strings.Contains(name, term) {
+		if q.inferredAbbreviations[term] {
+			continue
+		}
+		concepts++
+		if (result.Kind == "section" || result.Kind == "document") && strings.Contains(lowerName, term) ||
+			result.Kind != "section" && result.Kind != "document" && (searchNameTokenMatchesTerm(tokens, term) || searchNameMatchesAbbreviation(tokens, term)) {
 			matched++
 		}
 	}
-	return float64(matched) >= 0.5*float64(len(q.terms))
+	return concepts > 0 && float64(matched) >= 0.5*float64(concepts)
 }
 
 func searchResultHasSignal(result SearchResult, signal string) bool {
@@ -3732,7 +4693,7 @@ func expandGraphCandidates(seeds []searchCandidate, q searchQuery, relations []R
 			inherit := 0.28 * seedScore
 			callerBoost := 0.0
 			regionText := strings.Join(lines[start-1:end], "\n")
-			counts, _ := searchTermCounts(regionText, q.termSet)
+			counts, _ := searchTermCounts(regionText, q)
 			symbolMatch := searchSymbolNameMatchesQueryTerm(q, symbol)
 			if len(counts) > 0 || symbolMatch {
 				inherit = 0.55 * seedScore
@@ -3777,13 +4738,11 @@ func expandGraphCandidates(seeds []searchCandidate, q searchQuery, relations []R
 // searchSymbolNameMatchesQueryTerm reports whether a symbol's name/qualified-name shares a
 // (non-trivial) query term — used to gate the graph-expansion boost to textually-plausible callees.
 func searchSymbolNameMatchesQueryTerm(q searchQuery, symbol SymbolRecord) bool {
-	name := strings.ToLower(symbol.Name)
-	qualified := strings.ToLower(symbol.QualifiedName)
 	for _, term := range q.terms {
-		if len(term) < 3 {
+		if len(term) < 3 && !q.inferredAbbreviations[term] {
 			continue
 		}
-		if strings.Contains(name, term) || strings.Contains(qualified, term) {
+		if searchQueryNameTermMatches(q, symbol.Name, term) || searchQueryNameTermMatches(q, symbol.QualifiedName, term) {
 			return true
 		}
 	}
@@ -4285,6 +5244,13 @@ func expandSameFileBridgeCandidates(
 				if !ok {
 					continue
 				}
+				// An inferred path alias locates the file, but does not justify a
+				// symbol-free bridge displacing the actual downstream graph symbol.
+				directPathQuery := q
+				directPathQuery.inferredAbbreviations = nil
+				if len(candidate.termCounts) == 0 && candidate.result.SymbolID == "" && pathSearchScore(directPathQuery, filePath) == 0 {
+					continue
+				}
 				candidate.result.Signals = appendUnique(candidate.result.Signals, "same-file-bridge")
 				candidate.score = derivedSearchScore(maxFloat64(left.score, right.score), 0.45*(left.score+right.score))
 				candidate.baseScore = candidate.score
@@ -4700,6 +5666,413 @@ func regionsAroundHits(hits []int, lower, upper, context, maxLines int) [][2]int
 	return regions
 }
 
+// searchCompoundPhrases maps a two-word prose spelling to the single identifier code uses for it.
+// Keyed on the BASE form of the first word; searchCompoundJoin handles the inflections.
+//
+// Two kinds of entry. Phrasal verbs ("log in", "roll back") are the ones prose almost always
+// splits and code almost never does. Noun compounds ("end point", "meta data") are the ones prose
+// splits inconsistently. Both lose the joined token today.
+var searchCompoundPhrases = map[string]string{
+	"back up":      "backup",
+	"black list":   "blacklist",
+	"break down":   "breakdown",
+	"call back":    "callback",
+	"check in":     "checkin",
+	"check out":    "checkout",
+	"clean up":     "cleanup",
+	"data base":    "database",
+	"drop down":    "dropdown",
+	"end point":    "endpoint",
+	"fall back":    "fallback",
+	"fall through": "fallthrough",
+	"hand off":     "handoff",
+	"life cycle":   "lifecycle",
+	"log in":       "login",
+	"log out":      "logout",
+	"look up":      "lookup",
+	"meta data":    "metadata",
+	"name space":   "namespace",
+	"place holder": "placeholder",
+	"roll back":    "rollback",
+	"roll out":     "rollout",
+	"run time":     "runtime",
+	"set up":       "setup",
+	"shut down":    "shutdown",
+	"sign in":      "signin",
+	"sign out":     "signout",
+	"sign up":      "signup",
+	"start up":     "startup",
+	"tear down":    "teardown",
+	"time out":     "timeout",
+	"time stamp":   "timestamp",
+	"warm up":      "warmup",
+	"web hook":     "webhook",
+	"white list":   "whitelist",
+	"work around":  "workaround",
+	"work flow":    "workflow",
+}
+
+// searchPhrasalVerbParticles are the second halves of the SEPARABLE entries in the table above.
+// English splits a phrasal verb around its object — "logs A USER in", "roll THE CHANGE back" — so
+// an adjacent-pair scan never sees the pair at all. This was the first version of this fix and it
+// changed nothing on the very query that motivated it, because the motivating sentence is "the
+// authentication function that logs a user in": `logs` and `in` are four tokens apart.
+//
+// Noun compounds ("end point", "meta data") are NOT separable and stay adjacent-only.
+var searchPhrasalVerbParticles = map[string]bool{
+	"back":    true,
+	"down":    true,
+	"in":      true,
+	"off":     true,
+	"out":     true,
+	"through": true,
+	"up":      true,
+}
+
+// searchCompoundObjectHeads are the words that can open the object a phrasal verb splits around.
+// Requiring one is what separates "logs a user in" from "write the log in JSON": the first has a
+// determiner immediately after the verb, the second does not.
+var searchCompoundObjectHeads = map[string]bool{
+	"a": true, "an": true, "the": true, "this": true, "that": true, "these": true, "those": true,
+	"its": true, "their": true, "his": true, "her": true, "our": true, "my": true, "your": true,
+	"it": true, "them": true, "him": true, "us": true, "me": true, "you": true,
+}
+
+// searchMaxCompoundGap is how many tokens may sit between a phrasal verb and its particle. Three
+// covers the object phrases that actually occur ("logs a user in", "roll the failed change back")
+// without letting the scan reach across a clause boundary.
+const searchMaxCompoundGap = 3
+
+// searchCompoundDeterminers mark the following word as a NOUN. This is the cue that separates the
+// phrasal verb "cannot log in" from the noun-plus-preposition "write THE log in json format" —
+// two token sequences English spells identically and distinguishes only by part of speech.
+//
+// Without this check the false positive is not a rounding error: "write the log in json format"
+// returned persistLogin, RecordLoginContext and runLogin at ranks 1-3, hijacking a legitimate
+// logging query outright. Measured, after an earlier version of this comment claimed the cost was
+// bounded because the joined term is only ADDED. It is not bounded; an added term that matches a
+// dense cluster of real identifiers wins.
+//
+// Applied to phrasal verbs only. Noun compounds ("the end point", "the meta data") are nouns
+// already and a determiner in front of them is expected, not disqualifying.
+var searchCompoundDeterminers = map[string]bool{
+	"a": true, "an": true, "the": true, "this": true, "that": true, "these": true, "those": true,
+	"my": true, "your": true, "his": true, "her": true, "its": true, "our": true, "their": true,
+	"each": true, "every": true, "any": true, "some": true, "no": true, "one": true,
+	"all": true, "both": true, "either": true, "neither": true, "several": true, "many": true, "few": true,
+}
+
+// searchCompoundJoins returns the single-identifier spellings implied by the token at index: the
+// adjacent pair, plus — for a separable phrasal verb — the particle found a few tokens later.
+var searchCompoundWordPattern = regexp.MustCompile(searchWordPattern.String() + `|[;!?,]`)
+
+func searchCompoundToken(raw string) string {
+	return strings.ToLower(strings.Trim(raw, ".:;-!?,"))
+}
+
+var searchCompoundBareObjects = map[string]bool{
+	"user": true, "users": true, "account": true, "accounts": true, "client": true, "clients": true,
+	"customer": true, "customers": true, "people": true, "request": true, "requests": true,
+	"session": true, "sessions": true, "file": true, "files": true, "change": true, "changes": true,
+	"connection": true, "connections": true, "process": true, "processes": true,
+}
+
+// A determiner+noun or a plural/software subject makes "that" relative.
+func searchCompoundRelativeSubject(tokens []string, index int) bool {
+	if index < 0 {
+		return false
+	}
+	word := searchCompoundToken(tokens[index])
+	// "that logs/logged" is a relative verb clause: singular "that" cannot
+	// determine the plural noun "logs". This also covers unseen subject nouns.
+	if index+2 < len(tokens) && !searchCompoundGoverningVerb(word) {
+		verb := searchCompoundToken(tokens[index+2])
+		if strings.HasSuffix(verb, "s") || strings.HasSuffix(verb, "ed") {
+			return true
+		}
+	}
+	if searchCompoundBareObjects[word] || (strings.HasSuffix(word, "s") && len(word) > 3) {
+		return true
+	}
+	if index > 0 && searchCompoundDeterminers[searchCompoundToken(tokens[index-1])] {
+		return true
+	}
+	switch word {
+	case "function", "service", "handler", "method", "worker", "agent", "module", "component", "command", "program", "routine", "thread", "job":
+		return true
+	}
+	return false
+}
+
+func searchCompoundProperObject(tokens []string) bool {
+	if len(tokens) != 1 {
+		return false
+	}
+	lower := false
+	for index, r := range tokens[0] {
+		if !unicode.IsLetter(r) || index == 0 && !unicode.IsUpper(r) {
+			return false
+		}
+		lower = lower || unicode.IsLower(r)
+	}
+	return lower // Avoid treating uppercase format names such as JSON as actors.
+}
+
+func searchCompoundModifiedObject(tokens []string) bool {
+	if len(tokens) == 0 || !searchCompoundBareObjects[searchCompoundToken(tokens[len(tokens)-1])] {
+		return false
+	}
+	if len(tokens) == 2 && strings.HasSuffix(searchCompoundToken(tokens[0]), "ly") {
+		return false
+	}
+	for _, raw := range tokens[:len(tokens)-1] {
+		word := searchCompoundToken(raw)
+		if searchStopWords[word] || searchPhrasalVerbParticles[word] {
+			return false
+		}
+	}
+	return true
+}
+
+// Skip bounded adjective modifiers, but stop at a subject noun or verb so
+// "the worker logs in" remains a verb phrase.
+func searchCompoundNounPhraseBefore(tokens []string, index int) bool {
+	// A governing verb plus determiner admits ordinary noun modifiers without
+	// an adjective dictionary: "write the event log", "read the custom log".
+	for at := index - 1; at >= 0 && index-at <= 3; at-- {
+		word := searchCompoundToken(tokens[at])
+		if strings.ContainsAny(tokens[at], ".;!?,:") || word == "and" || word == "or" || word == "but" || word == "then" {
+			break
+		}
+		if word == "that" && searchCompoundRelativeSubject(tokens, at-1) {
+			return false
+		}
+		if searchCompoundDeterminers[word] && at > 0 && searchCompoundGoverningVerb(searchCompoundToken(tokens[at-1])) {
+			return true
+		}
+	}
+	modifiers := 0
+	for at := index - 1; at >= 0 && index-at <= 4; at-- {
+		word := searchCompoundToken(tokens[at])
+		if searchCompoundToken(tokens[index]) == "log" && searchCompoundPayloadObject(tokens[at:at+1]) {
+			return true
+		}
+		switch word {
+		case "system", "application":
+			// Singular subjects take "logs"; the base spelling in "the system log"
+			// instead makes log the noun modified by system.
+			return searchCompoundToken(tokens[index]) == "log"
+		case "process":
+			return at == 0 || !searchCompoundDeterminers[searchCompoundToken(tokens[at-1])]
+		case "write", "read", "archive", "store", "output", "print", "emit", "send", "delete", "inspect", "list", "view":
+			return true
+		}
+		if searchCompoundDeterminers[word] {
+			return !(word == "that" && searchCompoundRelativeSubject(tokens, at-1))
+		}
+		adjective := false
+		switch word {
+		case "new", "old", "current", "full", "raw", "plain", "verbose", "debug", "audit", "access", "error", "long", "short", "red":
+			adjective = true
+		}
+		for _, suffix := range []string{"ed", "ive", "al", "ous", "ic", "ful", "less", "ary"} {
+			if strings.HasSuffix(word, suffix) {
+				adjective = true
+			}
+		}
+		if !adjective && !(modifiers > 0 && strings.HasSuffix(word, "ly")) {
+			return false
+		}
+		modifiers++
+	}
+	return false
+}
+
+// Payloads are objects of logging or cryptographic signing, rather than
+// actors that can log in or sign in.
+func searchCompoundPayloadObject(tokens []string) bool {
+	for _, raw := range tokens {
+		for _, word := range searchNameWordVariants(searchCompoundToken(raw)) {
+			switch word {
+			case "message", "msg", "event", "record", "line", "entry", "output", "error", "warning", "exception", "payload", "data", "detail", "text", "file", "request", "document", "digest", "hash", "certificate", "transaction":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// A preceding governing verb distinguishes "write the sign in red" from
+// the noun compound in "the sign in page". The noun-phrase check separately
+// ensures this bounded lookback does not cross a subject or clause.
+func searchCompoundGoverningVerb(word string) bool {
+	switch word {
+	case "write", "read", "archive", "store", "output", "print", "emit", "send", "delete", "inspect", "list", "view", "process":
+		return true
+	}
+	return false
+}
+
+func searchCompoundGovernedObject(tokens []string, index int) bool {
+	for at := index - 1; at >= 0 && index-at <= 4; at-- {
+		if searchCompoundGoverningVerb(searchCompoundToken(tokens[at])) {
+			return true
+		}
+	}
+	return false
+}
+
+func searchCompoundJoins(tokens []string, index int) []string {
+	var out []string
+	if strings.ContainsAny(tokens[index], ";!?,:") || strings.HasSuffix(tokens[index], ".") {
+		return out
+	}
+	if index+1 < len(tokens) {
+		joined, ok := searchCompoundJoin(tokens[index], tokens[index+1])
+		nounPhrase := searchCompoundNounPhraseBefore(tokens, index)
+		if ok && !((joined == "login" || joined == "logout" || searchPhrasalVerbParticles[searchCompoundToken(tokens[index+1])] && searchCompoundGovernedObject(tokens, index)) && nounPhrase) && !((joined == "login" || nounPhrase) && searchCompoundFormatPreposition(tokens, index+1)) {
+			out = append(out, joined)
+		}
+	}
+	for gap := 2; gap <= searchMaxCompoundGap+1 && index+gap < len(tokens); gap++ {
+		if previous := tokens[index+gap-1]; strings.ContainsAny(previous, ";!?,:") || strings.HasSuffix(previous, ".") {
+			break
+		}
+		switch searchCompoundToken(tokens[index+gap-1]) {
+		case "and", "or", "but", "then", "while", "when":
+			return out
+		}
+		particle := searchCompoundToken(tokens[index+gap])
+		if !searchPhrasalVerbParticles[particle] {
+			continue
+		}
+		// The object has to look like an object. Without this, any "log" and any later "in"
+		// in the same sentence would manufacture a login term.
+		if head := searchCompoundToken(tokens[index+1]); !searchCompoundObjectHeads[head] && !searchCompoundDeterminers[head] &&
+			!searchCompoundModifiedObject(tokens[index+1:index+gap]) && !searchCompoundProperObject(tokens[index+1:index+gap]) {
+			continue
+		}
+		// Here the verb already has its object before "in", so a following
+		// format describes that object for any verb ("sign the request in JSON").
+		// Adjacent "check in a JSON file" instead places the object after "in".
+		if joined, ok := searchCompoundJoin(tokens[index], particle); ok &&
+			!((joined == "login" || joined == "logout") && searchCompoundNounPhraseBefore(tokens, index)) &&
+			!((joined == "login" || joined == "logout" || joined == "signin" && searchCompoundTrailingNounPhrase(tokens, index+gap)) && searchCompoundPayloadObject(tokens[index+1:index+gap])) &&
+			!searchCompoundFormatPreposition(tokens, index+gap) {
+			out = append(out, joined)
+		}
+	}
+	return out
+}
+
+// A payload followed by "in <noun phrase>" is ordinarily being signed in a
+// format/place/order. A bare "sign requests in" remains a phrasal-verb cue.
+func searchCompoundTrailingNounPhrase(tokens []string, index int) bool {
+	if index+1 >= len(tokens) || strings.ContainsAny(tokens[index], ".;!?,:") {
+		return false
+	}
+	word := searchCompoundToken(tokens[index+1])
+	if word == "" || strings.HasSuffix(word, "ly") {
+		return false
+	}
+	switch word {
+	case "and", "or", "then", "to", "with", "when", "while", "before", "after", "for", "from", "using", "without", "by", "via", "so", "but", "now", "today", "tomorrow", "yesterday", "again", "here", "there", "online", "offline":
+		return false
+	}
+	return true
+}
+
+// In "log a message in JSON", "in" introduces the output format rather than
+// completing "log in". Inspect only the immediately following noun phrase so
+// "log the user in and return JSON" still recovers login.
+func searchCompoundFormatPreposition(tokens []string, index int) bool {
+	if searchCompoundToken(tokens[index]) != "in" || strings.ContainsAny(tokens[index], ".;!?,:") {
+		return false
+	}
+	next := index + 1
+	if next < len(tokens) && searchCompoundDeterminers[searchCompoundToken(tokens[next])] {
+		next++
+	}
+	if next >= len(tokens) {
+		return false
+	}
+	// Allow a bounded number of modifiers ("compact JSON format"), but do
+	// not cross a clause boundary ("log the user in and return JSON").
+	for end := minInt(next+3, len(tokens)); next < end; next++ {
+		if searchCompoundToken(tokens[next]) == "" && strings.ContainsAny(tokens[next], ".;!?,:") {
+			return false
+		}
+		word := searchCompoundToken(tokens[next])
+		switch word {
+		case "and", "or", "then", "to", "with", "when", "while", "before", "after", "for", "from", "using", "without", "by", "via", "so", "but":
+			return false
+		}
+		if word == "utf" && next+1 < len(tokens) && searchCompoundComplementWord("utf"+searchCompoundToken(tokens[next+1])) {
+			return true
+		}
+		if searchCompoundComplementWord(word) {
+			return true
+		}
+		if strings.ContainsAny(tokens[next], ".;!?,:") {
+			return false
+		}
+	}
+	return false
+}
+
+func searchCompoundComplementWord(word string) bool {
+	encoding := strings.ReplaceAll(strings.ReplaceAll(searchCompoundToken(word), "-", ""), "_", "")
+	switch encoding {
+	case "json", "yaml", "yml", "xml", "csv", "tsv", "text", "plaintext",
+		"html", "toml", "ini", "binary", "hex", "hexadecimal", "base64",
+		"protobuf", "msgpack", "messagepack", "utf8", "utf16", "utf16le", "utf16be",
+		"utf32", "utf32le", "utf32be", "ascii", "usascii", "latin1", "iso88591", "windows1252",
+		"format", "encoding", "file", "files", "directory", "folder", "console",
+		"stdout", "stderr", "syslog", "journal", "buffer", "disk",
+		"function", "method", "handler", "routine", "module", "class":
+		return true
+	}
+	return false
+}
+
+// searchCompoundJoin reports the single-identifier spelling of a word pair, if there is one. The
+// first word is matched on its base form as well as its literal one, because the sentence a
+// reporter writes conjugates the verb the table cannot: "logs in", "logged in" and "logging in"
+// all mean login, and only "log in" is in the table.
+func searchCompoundJoin(first, second string) (string, bool) {
+	head := searchCompoundToken(first)
+	tail := searchCompoundToken(second)
+	// Noun compounds pluralize their second word. Do not singularize a
+	// phrasal particle (e.g. "ins") into a verb join.
+	for _, singular := range searchNameWordVariants(tail)[1:] {
+		if !searchPhrasalVerbParticles[singular] {
+			if joined, ok := searchCompoundPhrases[head+" "+singular]; ok {
+				return joined, true
+			}
+		}
+	}
+	if joined, ok := searchCompoundPhrases[head+" "+tail]; ok {
+		return joined, true
+	}
+	for _, suffix := range []string{"ing", "ed", "es", "s"} {
+		if !strings.HasSuffix(head, suffix) || len(head) <= len(suffix)+1 {
+			continue
+		}
+		stem := head[:len(head)-len(suffix)]
+		if joined, ok := searchCompoundPhrases[stem+" "+tail]; ok {
+			return joined, true
+		}
+		// English doubles the final consonant before -ing/-ed, so "logging" stems to "logg" and
+		// "logg in" is in no table. Collapse the double and try once more.
+		if n := len(stem); n >= 2 && stem[n-1] == stem[n-2] {
+			if joined, ok := searchCompoundPhrases[stem[:n-1]+" "+tail]; ok {
+				return joined, true
+			}
+		}
+	}
+	return "", false
+}
+
 func buildSearchQuery(query string) searchQuery {
 	// Strip before anything reads the text, so terms, words and rawLower are all derived from
 	// the same URL-state-free query. SearchResponse.Query still echoes the caller's original.
@@ -4755,6 +6128,23 @@ func buildSearchQuery(query string) searchQuery {
 			add(term, weight)
 		}
 	}
+	// Prose splits compounds that code writes as one identifier, and the split throws away the
+	// most informative token in the query. `search` is documented to take "the task or bug in one
+	// plain sentence", and English writes this verb as two words: "the authentication function
+	// that logs a user IN". Measured on entireio/cli, that sentence returned the LOGGING package
+	// (RestoreLogsOnly, handleLogsOnlyRewindNonInteractive) with no auth in the top five, while the
+	// same sentence carrying `login` as one token returned fetchCurrentUserLogin, persistLogin,
+	// RecordLoginContext and NewRefreshingLoginProvider — every hit auth, logging gone.
+	//
+	// ADDED, never substituted. "logs" and "log" stay in the query: a repo is free to spell the
+	// concept as two words in prose, a doc comment or a test name, and dropping the split form to
+	// chase the joined one would trade this blind spot for its mirror image.
+	compoundTokens := searchCompoundWordPattern.FindAllString(query, -1)
+	for index := range compoundTokens {
+		for _, joined := range searchCompoundJoins(compoundTokens, index) {
+			add(joined, 1.0)
+		}
+	}
 	for _, entity := range constraints.Entities {
 		add(entity.Normalized, 1.0)
 	}
@@ -4770,6 +6160,38 @@ func buildSearchQuery(query string) searchQuery {
 	for _, term := range originalTerms {
 		for _, related := range morphologicalSearchTerms(term) {
 			add(related, 0.55)
+		}
+	}
+	// Abbreviations have to enter the query as TERMS, not only as a name-coverage rule.
+	//
+	// searchNameMatchesAbbreviation re-ranks: it can lift a candidate the retrieval stage already
+	// produced, and it can do nothing at all for one that stage never produced. The offline eval
+	// caught the difference. On a fixture where the identifier is the only bridge from
+	// "authentication" to the auth cluster, the query returns runLogin alone — newAuthCmd never
+	// enters the candidate pool, so there is nothing for the name rule to boost. That is also why
+	// entireio/cli improved only 16.6 -> 19.9 on "authentication" rather than reaching the 34.6
+	// that "auth" scores: those candidates were already in the pool via path and body matches, and
+	// the name rule merely reordered them.
+	//
+	// Adding the alias here puts it in front of preselection and BM25, so the auth files are
+	// RETRIEVED for a query that never says "auth".
+	//
+	// Weighted like a morphological variant rather than like a typed term: an abbreviation is
+	// strong evidence of the same concept but it is still the caller's word inferred, not written,
+	// and a full-weight alias would let an inferred term outrank one the caller actually chose.
+	// Snapshot after morphology, before adding aliases: inferred singular and
+	// verb forms must participate too, without recursively expanding aliases.
+	abbreviationTerms := make([]string, 0, len(weights))
+	for term := range weights {
+		abbreviationTerms = append(abbreviationTerms, term)
+	}
+	inferredAbbreviations := map[string]bool{}
+	for _, term := range abbreviationTerms {
+		for _, alias := range searchAbbreviations(term) {
+			if weights[alias] == 0 {
+				inferredAbbreviations[alias] = true
+			}
+			add(alias, searchAbbreviationTermWeight)
 		}
 	}
 	termSet := make(map[string]bool, len(weights))
@@ -4797,20 +6219,27 @@ func buildSearchQuery(query string) searchQuery {
 		}
 		weights = trimmedWeights
 	}
+	for alias := range inferredAbbreviations {
+		if !termSet[alias] {
+			delete(inferredAbbreviations, alias)
+		}
+	}
 	rawLower := strings.ToLower(strings.TrimSpace(query))
 	wordSequence := searchQueryWordSequence(rawLower)
 	return searchQuery{
-		raw:                query,
-		rawLower:           rawLower,
-		constraints:        constraints,
-		terms:              terms,
-		termSet:            termSet,
-		weights:            weights,
-		words:              searchQueryWords(rawLower),
-		wordSequence:       wordSequence,
-		matchableWords:     matchableQueryWords(wordSequence, termSet, nil),
-		identifierTokens:   identifierTokens,
-		dottedCallMentions: dottedCallMentionsIn(query),
+		raw:                   query,
+		rawLower:              rawLower,
+		constraints:           constraints,
+		terms:                 terms,
+		termSet:               termSet,
+		weights:               weights,
+		inferredAbbreviations: inferredAbbreviations,
+		aliasTokens:           searchAliasTokenIndex(terms, inferredAbbreviations),
+		words:                 searchQueryWords(rawLower),
+		wordSequence:          wordSequence,
+		matchableWords:        matchableQueryWords(wordSequence, termSet, nil),
+		identifierTokens:      identifierTokens,
+		dottedCallMentions:    dottedCallMentionsIn(query),
 	}
 }
 
@@ -4911,6 +6340,10 @@ func (q searchQuery) withCorpusPresence(documentFrequency map[string]int) search
 }
 
 func buildSparseSearchQuery(query string) searchQuery {
+	return buildSparseSearchQueryExpanded(query, buildSearchQuery(query))
+}
+
+func buildSparseSearchQueryExpanded(query string, expanded searchQuery) searchQuery {
 	// Same strip as buildSearchQuery: the sparse half of hybrid search must not be scored
 	// against a term set the dense half never sees, and its own cap
 	// (maxSparseSearchQueryTerms) is filled first-come, so URL debris starves it too.
@@ -4929,16 +6362,40 @@ func buildSparseSearchQuery(query string) searchQuery {
 			break
 		}
 	}
+	compounds := map[string]bool{}
+	compoundTokens := searchCompoundWordPattern.FindAllString(query, -1)
+	for index := range compoundTokens {
+		for _, joined := range searchCompoundJoins(compoundTokens, index) {
+			compounds[joined] = true
+		}
+	}
+	aliases := map[string]bool{}
+	for _, term := range expanded.terms {
+		if !expanded.inferredAbbreviations[term] && !compounds[term] {
+			continue
+		}
+		if termSet[term] || len(terms) >= maxSparseSearchQueryTerms {
+			continue
+		}
+		terms = append(terms, term)
+		termSet[term] = true
+		weights[term] = expanded.weights[term]
+		if expanded.inferredAbbreviations[term] {
+			aliases[term] = true
+		}
+	}
 	rawLower := strings.ToLower(strings.TrimSpace(query))
 	wordSequence := searchQueryWordSequence(rawLower)
 	return searchQuery{
-		rawLower:       rawLower,
-		terms:          terms,
-		termSet:        termSet,
-		weights:        weights,
-		words:          searchQueryWords(rawLower),
-		wordSequence:   wordSequence,
-		matchableWords: matchableQueryWords(wordSequence, termSet, nil),
+		rawLower:              rawLower,
+		terms:                 terms,
+		termSet:               termSet,
+		weights:               weights,
+		inferredAbbreviations: aliases,
+		aliasTokens:           searchAliasTokenIndex(terms, aliases),
+		words:                 searchQueryWords(rawLower),
+		wordSequence:          wordSequence,
+		matchableWords:        matchableQueryWords(wordSequence, termSet, nil),
 	}
 }
 
@@ -5028,6 +6485,9 @@ func searchTokenVariants(raw string) []string {
 		if len(current) > 0 && unicode.IsUpper(r) {
 			previous := runes[i-1]
 			nextLower := i+1 < len(runes) && unicode.IsLower(runes[i+1])
+			if i+1 < len(runes) && runes[i+1] == 's' && (i+2 == len(runes) || !unicode.IsLower(runes[i+2])) {
+				nextLower = false
+			}
 			if unicode.IsLower(previous) || unicode.IsDigit(previous) || (unicode.IsUpper(previous) && nextLower) {
 				flush()
 			}
@@ -5074,39 +6534,84 @@ func sparseSearchTokens(text string) []string {
 	return out
 }
 
-func sparseSearchTermCounts(text string, queryTerms map[string]bool) (map[string]int, int) {
+func sparseSearchTermCounts(text string, q searchQuery) (map[string]int, int) {
 	counts := map[string]int{}
 	tokens := sparseSearchTokens(text)
 	for _, token := range tokens {
-		if queryTerms[token] {
+		if q.termSet[token] && !q.inferredAbbreviations[token] {
 			counts[token]++
+		}
+	}
+	if len(q.inferredAbbreviations) > 0 {
+		for _, raw := range searchSourceWordPattern.FindAllString(text, -1) {
+			countSearchAliases(counts, q, searchTokenVariants(raw))
 		}
 	}
 	return counts, len(tokens)
 }
 
-func searchTermCounts(text string, queryTerms map[string]bool) (map[string]int, int) {
+func searchTermCounts(text string, q searchQuery) (map[string]int, int) {
 	counts := map[string]int{}
 	length := 0
-	for _, raw := range searchWordPattern.FindAllString(text, -1) {
-		for _, token := range searchTokenVariants(raw) {
+	for _, raw := range searchSourceWordPattern.FindAllString(text, -1) {
+		wholeTokens := searchTokenVariants(raw)
+		ordinaryTokens := wholeTokens
+		if strings.IndexFunc(raw, func(r rune) bool { return r > unicode.MaxASCII }) >= 0 {
+			// Retain the ordinary ASCII-fragment evidence used before alias
+			// boundaries became Unicode-aware, plus full Unicode/folded terms.
+			ordinaryTokens = nil
+			for _, fragment := range searchWordPattern.FindAllString(raw, -1) {
+				ordinaryTokens = append(ordinaryTokens, searchTokenVariants(fragment)...)
+			}
+			ordinaryTokens = appendUnique(ordinaryTokens, wholeTokens...)
+		}
+		for _, token := range ordinaryTokens {
 			if len(token) < 2 {
 				continue
 			}
 			length++
-			if queryTerms[token] {
+			if q.termSet[token] && !q.inferredAbbreviations[token] {
 				counts[token]++
 			}
 		}
+		countSearchAliases(counts, q, wholeTokens)
 	}
 	return counts, length
+}
+
+// Overlapping full-identifier and camel-case variants describe one occurrence.
+func countSearchAliases(counts map[string]int, q searchQuery, tokens []string) {
+	if len(q.aliasTokens) == 0 {
+		return
+	}
+	var seen map[string]bool
+	for _, token := range tokens {
+		for _, alias := range q.aliasTokens[token] {
+			if seen == nil {
+				seen = make(map[string]bool)
+			}
+			if !seen[alias] {
+				counts[alias]++
+				seen[alias] = true
+			}
+		}
+	}
 }
 
 func textMatchesSearchQuery(q searchQuery, text string) bool {
 	lower := strings.ToLower(text)
 	for _, term := range q.terms {
-		if strings.Contains(lower, term) {
+		if !q.inferredAbbreviations[term] && strings.Contains(lower, term) {
 			return true
+		}
+	}
+	if len(q.aliasTokens) > 0 {
+		for _, raw := range searchSourceWordPattern.FindAllString(text, -1) {
+			for _, token := range searchTokenVariants(raw) {
+				if len(q.aliasTokens[token]) > 0 {
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -5119,7 +6624,7 @@ func searchFocusLine(q searchQuery, lines []string, start, end int) int {
 		lower := strings.ToLower(lines[line-1])
 		matches := 0.0
 		for _, term := range q.terms {
-			if strings.Contains(lower, term) {
+			if searchQueryTermMatches(q, lines[line-1], lower, term) {
 				matches += q.weights[term]
 			}
 		}
@@ -5150,12 +6655,12 @@ func pathSearchScore(q searchQuery, filePath string) float64 {
 	score := 0.0
 	for _, term := range q.terms {
 		weight := q.weights[term]
-		if weight != 1 && weight < 1.25 {
+		if !q.inferredAbbreviations[term] && weight != 1 && weight < 1.25 {
 			continue
 		}
-		if strings.Contains(base, term) {
+		if searchQueryTermMatches(q, filepath.Base(filePath), base, term) {
 			score += 2.5 * weight
-		} else if strings.Contains(lower, term) {
+		} else if searchQueryTermMatches(q, filepath.ToSlash(filePath), lower, term) {
 			score += 1.25 * weight
 		}
 	}
@@ -5357,7 +6862,6 @@ func searchQueryWordSequence(rawLower string) []string {
 
 func symbolSearchScore(q searchQuery, symbol SymbolRecord) (float64, []string) {
 	name := strings.ToLower(symbol.Name)
-	qualified := strings.ToLower(symbol.QualifiedName)
 	signature := strings.ToLower(symbol.Signature)
 	compactName := compactSearchIdentifier(name)
 	score := 0.0
@@ -5382,10 +6886,10 @@ func symbolSearchScore(q searchQuery, symbol SymbolRecord) (float64, []string) {
 		case name == term:
 			score += 6 * weight
 			signals = append(signals, "symbol-name")
-		case strings.Contains(name, term) || strings.Contains(qualified, term):
+		case searchSymbolNameScoreMatches(q, symbol, term):
 			score += 3 * weight
 			signals = append(signals, "symbol-name")
-		case strings.Contains(signature, term):
+		case searchQueryTermMatches(q, symbol.Signature, signature, term):
 			score += 1.5 * weight
 			signals = append(signals, "signature")
 		}
@@ -5591,3 +7095,11 @@ func (response SearchResponse) Validate() error {
 }
 
 var dottedCallMentionPattern = regexp.MustCompile(`([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)\s*\(`)
+
+// repoIgnoredFileCount is the nil-safe count for the stats block.
+func repoIgnoredFileCount(report *RepoIgnoreReport) int {
+	if report == nil {
+		return 0
+	}
+	return report.Files
+}

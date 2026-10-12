@@ -60,7 +60,7 @@ directory. If there are no sessions for the repo it says so and exits 0.
 It is an **estimate with a stated assumption, not a measurement** — but both of its prices are
 measured from the session's own transcript, so only the substitution ratio is assumed:
 
-1. Only **locate** calls are credited — `search`, `neighbors`, `impact`. Bulk verbs
+1. Only **locate** calls are credited — `query`, `neighbors`, `impact`. Bulk verbs
    (`symbols`, `edges`, `snapshot`, `diff`, …) appear in the table but are never credited.
 2. Within each session, both per-call prices are **measured**:
    `graph bytes/call = locate result bytes ÷ locate calls`, and

@@ -190,9 +190,12 @@ func processProviderFile(
 			return result
 		}
 		result.failures = append(result.failures, PartialFailure{
-			Code:                 "E_FILE_READ",
-			Severity:             "error",
-			FilePath:             path,
+			Code:     "E_FILE_READ",
+			Severity: "error",
+			FilePath: path,
+			// Preserve shebang routing when the full read fails and there is
+			// no file record or filename extension to recover the language.
+			Language:             routedLanguage.language,
 			EffectOnCompleteness: "file omitted from semantic snapshot",
 			Detail:               "file listed but content was unavailable",
 		})

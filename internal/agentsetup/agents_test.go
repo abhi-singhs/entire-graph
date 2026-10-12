@@ -1,4 +1,4 @@
-package cli
+package agentsetup
 
 import (
 	"bytes"
@@ -12,25 +12,20 @@ import (
 	"testing"
 )
 
-const testAgentPointerBlock = agentPointerBegin + "\n" +
-	"This repo has the entire-graph code graph installed. Before exploring code with\n" +
-	"grep/find/whole-file reads, read .entire/graph-agent.md — resolution-first guidance\n" +
-	"for using graph retrieval, focused source inspection, and verification.\n" +
-	"@.entire/graph-agent.md\n" +
-	agentPointerEnd + "\n"
+const testAgentPointerBlock = Pointer
 
 const testInheritedAgentPointerBlock = agentPointerBegin + "\n" +
-	"<!-- Entire Graph instructions are inherited through AGENTS.md. -->\n" +
+	"<!-- Entire agent instructions are inherited through AGENTS.md. -->\n" +
 	agentPointerEnd + "\n"
 
 func TestAgentGuidePrintsDoctrine(t *testing.T) {
 	var out bytes.Buffer
-	if err := Run(context.Background(), Options{Stdout: &out, Stderr: &out}, []string{"agent-guide"}); err != nil {
+	if err := Run(context.Background(), OptionsForTest{Stdout: &out, Stderr: &out}, []string{"agent-guide"}); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"SEARCH FIRST",
-		"entire graph search",
+		"MUST be ONE Graph query",
+		"entire graph query",
 		"--profile full",
 		"VERIFY before stopping",
 		"never trade resolution for fewer turns",
@@ -56,17 +51,19 @@ func TestInitAgentsInstallsAndIsIdempotent(t *testing.T) {
 	var out bytes.Buffer
 	run := func() {
 		t.Helper()
-		if err := Run(context.Background(), Options{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo}); err != nil {
+		if err := Run(context.Background(), OptionsForTest{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	run()
 
-	guide, err := os.ReadFile(filepath.Join(repo, ".entire", "graph-agent.md"))
+	guide, err := os.ReadFile(filepath.Join(repo, ".entire", "agent-guide.md"))
 	if err != nil {
 		t.Fatalf("guide not written: %v", err)
 	}
-	if !strings.Contains(string(guide), "SEARCH FIRST") {
+	// The marker is the first-action obligation: it is what makes the guide worth installing,
+	// and it is the sentence that went missing when adoption collapsed. See guide.go.
+	if !strings.Contains(string(guide), "MUST be ONE Graph query") {
 		t.Fatalf("guide content wrong:\n%s", guide)
 	}
 
@@ -77,10 +74,10 @@ func TestInitAgentsInstallsAndIsIdempotent(t *testing.T) {
 	if !strings.Contains(string(agents), "# my project rules") {
 		t.Fatalf("existing AGENTS.md content clobbered:\n%s", agents)
 	}
-	if !strings.Contains(string(agents), agentPointerBegin) || !strings.Contains(string(agents), ".entire/graph-agent.md") {
+	if !strings.Contains(string(agents), agentPointerBegin) || !strings.Contains(string(agents), ".entire/agent-guide.md") {
 		t.Fatalf("pointer block missing from AGENTS.md:\n%s", agents)
 	}
-	if !strings.Contains(string(agents), "resolution-first guidance") ||
+	if !strings.Contains(string(agents), "verification guidance") ||
 		strings.Contains(string(agents), "roughly in half") {
 		t.Fatalf("pointer block retained withdrawn doctrine:\n%s", agents)
 	}
@@ -89,7 +86,7 @@ func TestInitAgentsInstallsAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CLAUDE.md not created: %v", err)
 	}
-	if !strings.Contains(string(claude), "@.entire/graph-agent.md") {
+	if !strings.Contains(string(claude), "@.entire/agent-guide.md") {
 		t.Fatalf("CLAUDE.md missing import line:\n%s", claude)
 	}
 
@@ -130,7 +127,7 @@ func TestInitAgentsMigratesClaudeToAgentsInheritance(t *testing.T) {
 	if !strings.Contains(claude, testInheritedAgentPointerBlock) {
 		t.Fatalf("legacy direct block was not migrated to inheritance notice:\n%s", claude)
 	}
-	if strings.Contains(claude, "@.entire/graph-agent.md") {
+	if strings.Contains(claude, "@.entire/agent-guide.md") {
 		t.Fatalf("CLAUDE.md retained a duplicate direct guide import:\n%s", claude)
 	}
 	agents := readFileForTest(t, filepath.Join(repo, "AGENTS.md"))
@@ -174,7 +171,7 @@ func TestInitAgentsRestoresClaudeDirectPointerWhenAgentsImportIsRemoved(t *testi
 	}
 	runInitAgentsForTest(t, repo)
 	got = readFileForTest(t, claudePath)
-	if !strings.Contains(got, testInheritedAgentPointerBlock) || strings.Contains(got, "@.entire/graph-agent.md") {
+	if !strings.Contains(got, testInheritedAgentPointerBlock) || strings.Contains(got, "@.entire/agent-guide.md") {
 		t.Fatalf("CLAUDE.md did not migrate back to inheritance:\n%s", got)
 	}
 }
@@ -237,7 +234,7 @@ func TestInitAgentsIgnoresNonLiveAndExcludedAgentsMentions(t *testing.T) {
 			if strings.Contains(got, testInheritedAgentPointerBlock) {
 				t.Fatalf("excluded or ambiguous mention selected inheritance block:\n%s", got)
 			}
-			if !strings.Contains(got, "@.entire/graph-agent.md") {
+			if !strings.Contains(got, "@.entire/agent-guide.md") {
 				t.Fatalf("safe direct guide pointer is missing:\n%s", got)
 			}
 		})
@@ -306,6 +303,17 @@ func TestInitAgentsWritesSameFileOnlyOnce(t *testing.T) {
 
 			agents := readFileForTest(t, filepath.Join(repo, "AGENTS.md"))
 			claude := readFileForTest(t, filepath.Join(repo, "CLAUDE.md"))
+			agentsInfo, err := os.Stat(filepath.Join(repo, "AGENTS.md"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			claudeInfo, err := os.Stat(filepath.Join(repo, "CLAUDE.md"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !os.SameFile(agentsInfo, claudeInfo) {
+				t.Fatal("instruction aliases no longer share an inode")
+			}
 			if agents != claude {
 				t.Fatalf("same-file aliases diverged:\nAGENTS.md:\n%s\nCLAUDE.md:\n%s", agents, claude)
 			}
@@ -338,7 +346,7 @@ func TestInitAgentsRegeneratesOwnerWriteOnlyGuide(t *testing.T) {
 	if err := os.Mkdir(guideDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	guidePath := filepath.Join(guideDir, "graph-agent.md")
+	guidePath := filepath.Join(guideDir, "agent-guide.md")
 	if err := os.WriteFile(guidePath, []byte("stale guide\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -411,7 +419,7 @@ func TestInitAgentsRejectsMalformedMarkersWithoutWrites(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			repo := t.TempDir()
-			guidePath := filepath.Join(repo, ".entire", "graph-agent.md")
+			guidePath := filepath.Join(repo, ".entire", "agent-guide.md")
 			if err := os.MkdirAll(filepath.Dir(guidePath), 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -428,7 +436,7 @@ func TestInitAgentsRejectsMalformedMarkersWithoutWrites(t *testing.T) {
 			}
 
 			var stdout, stderr bytes.Buffer
-			err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+			err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 			if err == nil {
 				t.Fatal("init-agents accepted malformed markers")
 			}
@@ -464,7 +472,7 @@ func TestInitAgentsMalformedMarkersDoNotCreateMissingOutputs(t *testing.T) {
 			}
 
 			var stdout bytes.Buffer
-			err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &bytes.Buffer{}}, []string{"init-agents", "--repo", repo})
+			err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &bytes.Buffer{}}, []string{"init-agents", "--repo", repo})
 			if err == nil {
 				t.Fatal("init-agents accepted malformed markers")
 			}
@@ -475,7 +483,7 @@ func TestInitAgentsMalformedMarkersDoNotCreateMissingOutputs(t *testing.T) {
 				t.Fatalf("malformed source changed: %q", got)
 			}
 			for _, path := range []string{
-				filepath.Join(repo, ".entire", "graph-agent.md"),
+				filepath.Join(repo, ".entire", "agent-guide.md"),
 				filepath.Join(repo, counterpartName),
 			} {
 				if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
@@ -490,7 +498,7 @@ func TestInitAgentsRejectsNonRegularInstructionFileWithoutWrites(t *testing.T) {
 	for _, invalidName := range []string{"AGENTS.md", "CLAUDE.md"} {
 		t.Run(invalidName, func(t *testing.T) {
 			repo := t.TempDir()
-			guidePath := filepath.Join(repo, ".entire", "graph-agent.md")
+			guidePath := filepath.Join(repo, ".entire", "agent-guide.md")
 			if err := os.MkdirAll(filepath.Dir(guidePath), 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -512,7 +520,7 @@ func TestInitAgentsRejectsNonRegularInstructionFileWithoutWrites(t *testing.T) {
 			}
 
 			var stdout bytes.Buffer
-			err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &bytes.Buffer{}}, []string{"init-agents", "--repo", repo})
+			err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &bytes.Buffer{}}, []string{"init-agents", "--repo", repo})
 			// "directory", not the permission-bit form: the message has to say what
 			// is in the way for it to be actionable.
 			if err == nil || !strings.Contains(err.Error(), invalidName) ||
@@ -596,7 +604,7 @@ func TestInitAgentsRefusesInstructionAliasEscapingRepository(t *testing.T) {
 			symlinkForTest(t, filepath.Join("..", "victim.md"), filepath.Join(repo, aliasName))
 
 			var stdout, stderr bytes.Buffer
-			err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+			err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 			if err == nil {
 				t.Fatalf("init-agents followed %s out of the repository", aliasName)
 			}
@@ -609,7 +617,7 @@ func TestInitAgentsRefusesInstructionAliasEscapingRepository(t *testing.T) {
 			if got := readFileForTest(t, victimPath); got != string(victim) {
 				t.Fatalf("a file outside the repository was written:\nwant: %q\n got: %q", victim, got)
 			}
-			if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "graph-agent.md")); !os.IsNotExist(statErr) {
+			if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "agent-guide.md")); !os.IsNotExist(statErr) {
 				t.Fatalf("the guide was written despite the containment failure (stat error %v)", statErr)
 			}
 			if stdout.Len() != 0 {
@@ -668,7 +676,7 @@ func TestInitAgentsRefusesGuideAliasEscapingRepository(t *testing.T) {
 				if err := os.Mkdir(outside, 0o755); err != nil {
 					t.Fatal(err)
 				}
-				victimPath := filepath.Join(outside, "graph-agent.md")
+				victimPath := filepath.Join(outside, "agent-guide.md")
 				if err := os.WriteFile(victimPath, []byte("# outside the repository\n"), 0o644); err != nil {
 					t.Fatal(err)
 				}
@@ -687,7 +695,7 @@ func TestInitAgentsRefusesGuideAliasEscapingRepository(t *testing.T) {
 				if err := os.Mkdir(filepath.Join(repo, ".entire"), 0o755); err != nil {
 					t.Fatal(err)
 				}
-				link := filepath.Join(repo, ".entire", "graph-agent.md")
+				link := filepath.Join(repo, ".entire", "agent-guide.md")
 				symlinkForTest(t, filepath.Join("..", "..", "victim.md"), link)
 				return victimPath
 			},
@@ -704,7 +712,7 @@ func TestInitAgentsRefusesGuideAliasEscapingRepository(t *testing.T) {
 			victim := readFileForTest(t, victimPath)
 
 			var stdout, stderr bytes.Buffer
-			err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+			err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 			if err == nil {
 				t.Fatal("init-agents followed the guide alias out of the repository")
 			}
@@ -761,7 +769,7 @@ func TestInitAgentsReportsUnreadableTargetAsOperationalFailure(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(guideDir, 0o755) })
 
 	var stdout, stderr bytes.Buffer
-	err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+	err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 	if err == nil {
 		t.Fatal("init-agents reported success for a write target it could not inspect")
 	}
@@ -771,7 +779,7 @@ func TestInitAgentsReportsUnreadableTargetAsOperationalFailure(t *testing.T) {
 	if !strings.Contains(err.Error(), "permission denied") {
 		t.Fatalf("error dropped the operating system cause: %v", err)
 	}
-	if !strings.Contains(err.Error(), filepath.Join(repo, ".entire", "graph-agent.md")) {
+	if !strings.Contains(err.Error(), filepath.Join(repo, ".entire", "agent-guide.md")) {
 		t.Fatalf("error does not name the target that could not be inspected: %v", err)
 	}
 	if stdout.Len() != 0 {
@@ -822,7 +830,7 @@ func TestWriteContainedFileRefusesEscapeWithoutPreflight(t *testing.T) {
 func runInitAgentsForTest(t *testing.T, repo string) {
 	t.Helper()
 	var out bytes.Buffer
-	if err := Run(context.Background(), Options{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo}); err != nil {
+	if err := Run(context.Background(), OptionsForTest{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -880,7 +888,7 @@ func TestInitAgentsFollowsAbsoluteAliasInsideRepository(t *testing.T) {
 				real := filepath.Join(repo, "tooling")
 				mkdirAllForTest(t, real)
 				symlinkForTest(t, real, filepath.Join(repo, ".entire"))
-				return filepath.Join(real, "graph-agent.md")
+				return filepath.Join(real, "agent-guide.md")
 			},
 		},
 		{
@@ -891,7 +899,7 @@ func TestInitAgentsFollowsAbsoluteAliasInsideRepository(t *testing.T) {
 				mkdirAllForTest(t, filepath.Dir(guide))
 				writeFileForTest(t, guide, "")
 				mkdirAllForTest(t, filepath.Join(repo, ".entire"))
-				symlinkForTest(t, guide, filepath.Join(repo, ".entire", "graph-agent.md"))
+				symlinkForTest(t, guide, filepath.Join(repo, ".entire", "agent-guide.md"))
 				return guide
 			},
 		},
@@ -903,7 +911,7 @@ func TestInitAgentsFollowsAbsoluteAliasInsideRepository(t *testing.T) {
 
 			runInitAgentsForTest(t, repo)
 
-			if got := readFileForTest(t, landing); !strings.Contains(got, "entire-graph") {
+			if got := readFileForTest(t, landing); !strings.Contains(got, "source") {
 				t.Fatalf("absolute in-repository alias target %s never received the install:\n%s", landing, got)
 			}
 		})
@@ -996,7 +1004,7 @@ func TestInitAgentsFollowsGuideDirectoryAliasToRepositoryRoot(t *testing.T) {
 
 	runInitAgentsForTest(t, repo)
 
-	if got := readFileForTest(t, filepath.Join(repo, "graph-agent.md")); !strings.Contains(got, "entire-graph") {
+	if got := readFileForTest(t, filepath.Join(repo, "agent-guide.md")); !strings.Contains(got, "source") {
 		t.Fatalf("guide did not land at the repository root through the alias:\n%s", got)
 	}
 	if got := readFileForTest(t, filepath.Join(repo, "AGENTS.md")); !strings.Contains(got, testAgentPointerBlock) {
@@ -1029,8 +1037,8 @@ func TestInitAgentsCreatesDanglingGuideDirectoryAliasParents(t *testing.T) {
 
 			runInitAgentsForTest(t, repo)
 
-			guide := filepath.Join(repo, baseTarget, "graph-agent.md")
-			if got := readFileForTest(t, guide); !strings.Contains(got, "entire-graph") {
+			guide := filepath.Join(repo, baseTarget, "agent-guide.md")
+			if got := readFileForTest(t, guide); !strings.Contains(got, "source") {
 				t.Fatalf("guide was not created through the dangling directory alias:\n%s", got)
 			}
 		})
@@ -1148,14 +1156,14 @@ func TestInitAgentsRefusesUntraversableSuffixAfterDirectoryAlias(t *testing.T) {
 	before := readFileForTest(t, victim)
 
 	var stdout, stderr bytes.Buffer
-	err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+	err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 	if err == nil {
 		t.Fatal("init-agents collapsed an untraversable suffix after a directory alias")
 	}
 	if got := readFileForTest(t, victim); got != before {
 		t.Fatalf("an unrelated repository file was rewritten:\nwant: %q\n got: %q", before, got)
 	}
-	if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "graph-agent.md")); !os.IsNotExist(statErr) {
+	if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "agent-guide.md")); !os.IsNotExist(statErr) {
 		t.Fatalf("the guide was written despite the preflight failure (stat error %v)", statErr)
 	}
 	if stdout.Len() != 0 {
@@ -1184,14 +1192,14 @@ func TestInitAgentsPreservesTerminalSeparatorAfterAbsoluteAliasMapping(t *testin
 	}
 
 	var stdout, stderr bytes.Buffer
-	err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+	err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 	if err == nil {
 		t.Fatal("init-agents dropped a trailing separator while mapping an absolute alias")
 	}
 	if got := readFileForTest(t, victim); got != before {
 		t.Fatalf("the mapped regular file was rewritten:\nwant: %q\n got: %q", before, got)
 	}
-	if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "graph-agent.md")); !os.IsNotExist(statErr) {
+	if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "agent-guide.md")); !os.IsNotExist(statErr) {
 		t.Fatalf("the guide was written despite the preflight failure (stat error %v)", statErr)
 	}
 	if stdout.Len() != 0 {
@@ -1289,7 +1297,7 @@ func TestInitAgentsRefusesAbsoluteAliasLeavingRepository(t *testing.T) {
 			before := readFileForTest(t, victim)
 
 			var stdout, stderr bytes.Buffer
-			err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+			err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 			if err == nil {
 				t.Fatal("init-agents followed an absolute alias out of the repository")
 			}
@@ -1299,7 +1307,7 @@ func TestInitAgentsRefusesAbsoluteAliasLeavingRepository(t *testing.T) {
 			if got := readFileForTest(t, victim); got != before {
 				t.Fatalf("a file outside the repository was written:\nwant: %q\n got: %q", before, got)
 			}
-			if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "graph-agent.md")); !os.IsNotExist(statErr) {
+			if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "agent-guide.md")); !os.IsNotExist(statErr) {
 				t.Fatalf("the guide was written despite the containment failure (stat error %v)", statErr)
 			}
 			if stdout.Len() != 0 {
@@ -1323,7 +1331,7 @@ func TestInitAgentsRefusesWindowsRootRelativeAlias(t *testing.T) {
 	before := readFileForTest(t, victim)
 
 	var stdout, stderr bytes.Buffer
-	err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+	err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 	if err == nil {
 		t.Fatal("init-agents treated a drive-rooted alias as repository-relative")
 	}
@@ -1383,7 +1391,7 @@ func TestInitAgentsPreservesWindowsSymlinkType(t *testing.T) {
 			}
 
 			var stdout, stderr bytes.Buffer
-			err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+			err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 			if err == nil {
 				t.Fatal("init-agents ignored the Windows symlink target type")
 			}
@@ -1394,7 +1402,7 @@ func TestInitAgentsPreservesWindowsSymlinkType(t *testing.T) {
 			} else if _, statErr := os.Lstat(shared); !os.IsNotExist(statErr) {
 				t.Fatalf("the dangling directory link target was created as a file (stat error %v)", statErr)
 			}
-			if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "graph-agent.md")); !os.IsNotExist(statErr) {
+			if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "agent-guide.md")); !os.IsNotExist(statErr) {
 				t.Fatalf("the guide was written despite the type mismatch (stat error %v)", statErr)
 			}
 			if stdout.Len() != 0 {
@@ -1420,7 +1428,7 @@ func TestInitAgentsDoesNotCleanWindowsExtendedPathTraversal(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+	err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 	if err == nil {
 		t.Fatal("init-agents cleaned a dot component in an extended path")
 	}
@@ -1430,7 +1438,7 @@ func TestInitAgentsDoesNotCleanWindowsExtendedPathTraversal(t *testing.T) {
 	if got := readFileForTest(t, victim); got != before {
 		t.Fatalf("the extended path rewrote an unrelated file:\nwant: %q\n got: %q", before, got)
 	}
-	if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "graph-agent.md")); !os.IsNotExist(statErr) {
+	if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "agent-guide.md")); !os.IsNotExist(statErr) {
 		t.Fatalf("the guide was written despite the preflight failure (stat error %v)", statErr)
 	}
 	if stdout.Len() != 0 {
@@ -1496,7 +1504,7 @@ func TestInitAgentsReportsAbsoluteAliasLoopAsItself(t *testing.T) {
 	symlinkForTest(t, filepath.Join(repo, "AGENTS.md"), filepath.Join(repo, "loop.md"))
 
 	var stdout, stderr bytes.Buffer
-	err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+	err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 	if err == nil {
 		t.Fatal("init-agents accepted a symlink loop")
 	}
@@ -1506,7 +1514,7 @@ func TestInitAgentsReportsAbsoluteAliasLoopAsItself(t *testing.T) {
 	if strings.Contains(err.Error(), "leaves the repository") {
 		t.Fatalf("a symlink loop was misreported as a repository escape: %v", err)
 	}
-	if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "graph-agent.md")); !os.IsNotExist(statErr) {
+	if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "agent-guide.md")); !os.IsNotExist(statErr) {
 		t.Fatalf("the guide was written despite the failure (stat error %v)", statErr)
 	}
 }
@@ -1533,7 +1541,7 @@ func TestInitAgentsHonorsTheHostSymlinkLimit(t *testing.T) {
 	before := readFileForTest(t, victim)
 
 	var stdout, stderr bytes.Buffer
-	err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+	err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 	if err == nil {
 		t.Fatal("init-agents resolved more symlink hops than the host filesystem")
 	}
@@ -1580,14 +1588,14 @@ func TestInitAgentsHonorsTheHostLimitAcrossAnAbsolutePrefix(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+	err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 	if err == nil {
 		t.Fatal("init-agents reset the host link budget after mapping an absolute prefix")
 	}
 	if got := readFileForTest(t, victim); got != before {
 		t.Fatalf("a path rejected by the host rewrote the git config:\nwant: %q\n got: %q", before, got)
 	}
-	if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "graph-agent.md")); !os.IsNotExist(statErr) {
+	if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "agent-guide.md")); !os.IsNotExist(statErr) {
 		t.Fatalf("the guide was written despite the preflight failure (stat error %v)", statErr)
 	}
 	if stdout.Len() != 0 {
@@ -1631,14 +1639,14 @@ func TestInitAgentsCountsLinksInEveryAbsoluteTargetPrefix(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	err = Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+	err = Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 	if err == nil {
 		t.Fatal("init-agents ignored links consumed by each absolute target prefix")
 	}
 	if got := readFileForTest(t, victim); got != before {
 		t.Fatalf("a path rejected by Darwin rewrote the git config:\nwant: %q\n got: %q", before, got)
 	}
-	if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "graph-agent.md")); !os.IsNotExist(statErr) {
+	if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "agent-guide.md")); !os.IsNotExist(statErr) {
 		t.Fatalf("the guide was written despite the preflight failure (stat error %v)", statErr)
 	}
 	if stdout.Len() != 0 {
@@ -1682,7 +1690,7 @@ func TestInitAgentsHonorsWindowsReparseLimits(t *testing.T) {
 			before := readFileForTest(t, victim)
 
 			var stdout, stderr bytes.Buffer
-			err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+			err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 			if err == nil {
 				t.Fatal("init-agents resolved more reparse points than Windows permits")
 			}
@@ -1841,7 +1849,7 @@ func TestInitAgentsRefusesAliasWithTerminalDirectoryRequirementBeforeWriting(t *
 			symlinkForTest(t, tt.target, filepath.Join(repo, "AGENTS.md"))
 
 			var stdout, stderr bytes.Buffer
-			err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+			err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 			if err == nil {
 				t.Fatal("init-agents accepted a file alias whose spelling requires a directory")
 			}
@@ -1855,7 +1863,7 @@ func TestInitAgentsRefusesAliasWithTerminalDirectoryRequirementBeforeWriting(t *
 			} else if _, statErr := os.Lstat(filepath.Join(repo, "missing")); !os.IsNotExist(statErr) {
 				t.Fatalf("the missing target was created (stat error %v)", statErr)
 			}
-			if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "graph-agent.md")); !os.IsNotExist(statErr) {
+			if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "agent-guide.md")); !os.IsNotExist(statErr) {
 				t.Fatalf("the guide was written despite the preflight failure (stat error %v)", statErr)
 			}
 			if stdout.Len() != 0 {
@@ -1872,7 +1880,7 @@ func TestInitAgentsRefusesMissingAliasParentBeforeWriting(t *testing.T) {
 	symlinkForTest(t, target, filepath.Join(repo, "CLAUDE.md"))
 
 	var stdout, stderr bytes.Buffer
-	err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+	err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 	if err == nil {
 		t.Fatal("init-agents accepted a dangling alias whose parent cannot be created by OpenFile")
 	}
@@ -1880,7 +1888,7 @@ func TestInitAgentsRefusesMissingAliasParentBeforeWriting(t *testing.T) {
 		t.Fatalf("the refusal did not identify the missing parent directory: %v", err)
 	}
 	for _, name := range []string{
-		filepath.Join(".entire", "graph-agent.md"),
+		filepath.Join(".entire", "agent-guide.md"),
 		"AGENTS.md",
 		filepath.Join("missing", "subdir", "shared.md"),
 	} {
@@ -1899,10 +1907,10 @@ func TestInitAgentsRefusesManagedTargetCollisionsBeforeWriting(t *testing.T) {
 		repo := t.TempDir()
 		guideDir := filepath.Join(repo, ".entire")
 		mkdirAllForTest(t, guideDir)
-		symlinkForTest(t, filepath.Join("..", "AGENTS.md"), filepath.Join(guideDir, "graph-agent.md"))
+		symlinkForTest(t, filepath.Join("..", "AGENTS.md"), filepath.Join(guideDir, "agent-guide.md"))
 
 		var stdout, stderr bytes.Buffer
-		err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+		err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 		if err == nil || !strings.Contains(err.Error(), "same managed file") {
 			t.Fatalf("init-agents did not reject the guide/instruction collision: %v", err)
 		}
@@ -1921,12 +1929,12 @@ func TestInitAgentsRefusesManagedTargetCollisionsBeforeWriting(t *testing.T) {
 		agents := filepath.Join(repo, "AGENTS.md")
 		before := "# Shared rules\n"
 		writeFileForTest(t, agents, before)
-		if err := os.Link(agents, filepath.Join(guideDir, "graph-agent.md")); err != nil {
+		if err := os.Link(agents, filepath.Join(guideDir, "agent-guide.md")); err != nil {
 			t.Skipf("hard links unavailable: %v", err)
 		}
 
 		var stdout, stderr bytes.Buffer
-		err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+		err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 		if err == nil || !strings.Contains(err.Error(), "same managed file") {
 			t.Fatalf("init-agents did not reject the hard-linked collision: %v", err)
 		}
@@ -1948,7 +1956,7 @@ func TestInitAgentsRefusesManagedTargetCollisionsBeforeWriting(t *testing.T) {
 		symlinkForTest(t, "nested", filepath.Join(repo, "AGENTS.md"))
 
 		var stdout, stderr bytes.Buffer
-		err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+		err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 		if err == nil || !strings.Contains(err.Error(), "created as a directory") {
 			t.Fatalf("init-agents did not reject the directory/file collision: %v", err)
 		}
@@ -1969,11 +1977,11 @@ func TestInitAgentsRefusesManagedTargetCollisionsBeforeWriting(t *testing.T) {
 		mkdirAllForTest(t, guideDir)
 		guideTarget := "é.md"
 		instructionTarget := "e\u0301.md"
-		symlinkForTest(t, filepath.Join("..", guideTarget), filepath.Join(guideDir, "graph-agent.md"))
+		symlinkForTest(t, filepath.Join("..", guideTarget), filepath.Join(guideDir, "agent-guide.md"))
 		symlinkForTest(t, instructionTarget, filepath.Join(repo, "AGENTS.md"))
 
 		var stdout, stderr bytes.Buffer
-		err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+		err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 		if err == nil || !strings.Contains(err.Error(), "same managed file") {
 			t.Fatalf("init-agents did not reject filesystem-equivalent Unicode names: %v", err)
 		}
@@ -1992,11 +2000,11 @@ func TestInitAgentsRefusesManagedTargetCollisionsBeforeWriting(t *testing.T) {
 		repo := t.TempDir()
 		guideDir := filepath.Join(repo, ".entire")
 		mkdirAllForTest(t, guideDir)
-		symlinkForTest(t, filepath.Join("..", "shared.md."), filepath.Join(guideDir, "graph-agent.md"))
+		symlinkForTest(t, filepath.Join("..", "shared.md."), filepath.Join(guideDir, "agent-guide.md"))
 		symlinkForTest(t, "shared.md", filepath.Join(repo, "AGENTS.md"))
 
 		var stdout, stderr bytes.Buffer
-		err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+		err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 		if err == nil || !strings.Contains(err.Error(), "same managed file") {
 			t.Fatalf("init-agents did not reject Win32-equivalent trailing-dot names: %v", err)
 		}
@@ -2018,12 +2026,12 @@ func TestInitAgentsAllowsCaseDistinctMissingManagedTargets(t *testing.T) {
 		}
 		guideDir := filepath.Join(repo, ".entire")
 		mkdirAllForTest(t, guideDir)
-		symlinkForTest(t, filepath.Join("..", "Shared.md"), filepath.Join(guideDir, "graph-agent.md"))
+		symlinkForTest(t, filepath.Join("..", "Shared.md"), filepath.Join(guideDir, "agent-guide.md"))
 		symlinkForTest(t, "shared.md", filepath.Join(repo, "AGENTS.md"))
 
 		runInitAgentsForTest(t, repo)
 
-		if got := readFileForTest(t, filepath.Join(repo, "Shared.md")); !strings.Contains(got, "# entire-graph") {
+		if got := readFileForTest(t, filepath.Join(repo, "Shared.md")); !strings.Contains(got, "# Entire repository agent guide") {
 			t.Fatalf("case-distinct guide target did not receive the guide:\n%s", got)
 		}
 		if got := readFileForTest(t, filepath.Join(repo, "shared.md")); !strings.Contains(got, testAgentPointerBlock) {
@@ -2045,7 +2053,7 @@ func TestInitAgentsAllowsCaseDistinctMissingManagedTargets(t *testing.T) {
 
 		runInitAgentsForTest(t, repo)
 
-		if got := readFileForTest(t, filepath.Join(repo, "nested", "activation", "graph-agent.md")); !strings.Contains(got, "# entire-graph") {
+		if got := readFileForTest(t, filepath.Join(repo, "nested", "activation", "agent-guide.md")); !strings.Contains(got, "# Entire repository agent guide") {
 			t.Fatalf("guide was not written through the planned directory alias:\n%s", got)
 		}
 		if got := readFileForTest(t, filepath.Join(repo, "NESTED")); !strings.Contains(got, testAgentPointerBlock) {
@@ -2156,10 +2164,10 @@ var untraversableAliasPlants = []aliasPlant{
 	},
 	{
 		name:   "guide directory alias",
-		target: filepath.Join(".entire", "graph-agent.md"),
+		target: filepath.Join(".entire", "agent-guide.md"),
 		plant: func(t *testing.T, repo string) string {
 			t.Helper()
-			victim := filepath.Join(repo, "tooling", "graph-agent.md")
+			victim := filepath.Join(repo, "tooling", "agent-guide.md")
 			mkdirAllForTest(t, filepath.Dir(victim))
 			writeFileForTest(t, victim, "# an unrelated repository file\n")
 			symlinkForTest(t, rawJoin("missing", "..", "tooling"), filepath.Join(repo, ".entire"))
@@ -2183,7 +2191,7 @@ func TestInitAgentsRefusesAliasCollapsingUntraversableComponent(t *testing.T) {
 			before := readFileForTest(t, victim)
 
 			var stdout, stderr bytes.Buffer
-			err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+			err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 
 			if err == nil {
 				t.Fatal("init-agents wrote through a \"..\" the kernel could not have taken")
@@ -2199,7 +2207,7 @@ func TestInitAgentsRefusesAliasCollapsingUntraversableComponent(t *testing.T) {
 				// link that leaves when the cause is a path that does not resolve.
 				t.Fatalf("a broken path was reported as a repository escape: %v", err)
 			}
-			if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "graph-agent.md")); !os.IsNotExist(statErr) {
+			if _, statErr := os.Lstat(filepath.Join(repo, ".entire", "agent-guide.md")); !os.IsNotExist(statErr) {
 				t.Fatalf("the guide was written despite the failure (stat error %v)", statErr)
 			}
 			if stdout.Len() != 0 {
@@ -2271,7 +2279,7 @@ func TestInitAgentsAliasResolutionMatchesTheKernel(t *testing.T) {
 			repo := t.TempDir()
 			tt.plant(t, repo)
 			var stdout, stderr bytes.Buffer
-			err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+			err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 
 			if tt.refusedEvenIfTheKernelCanReachIt {
 				// The one deliberate divergence. Reachability is the kernel's to answer and
@@ -2297,7 +2305,7 @@ func TestInitAgentsAliasResolutionMatchesTheKernel(t *testing.T) {
 			if readErr != nil {
 				t.Fatal(readErr)
 			}
-			if !strings.Contains(string(got), "entire-graph") {
+			if !strings.Contains(string(got), "source") {
 				t.Fatalf("the install did not land where the kernel resolves %s:\n%s", tt.target, got)
 			}
 		})
@@ -2361,7 +2369,7 @@ func TestInitAgentsRefusesOversizeInstructionFileWithoutWrites(t *testing.T) {
 			}
 
 			var stdout, stderr bytes.Buffer
-			err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+			err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 			if err == nil {
 				t.Fatalf("init-agents accepted a %d-byte %s", len(oversize), oversizeName)
 			}
@@ -2377,7 +2385,7 @@ func TestInitAgentsRefusesOversizeInstructionFileWithoutWrites(t *testing.T) {
 				t.Fatalf("%s was rewritten despite the refusal (%d bytes read back)", oversizeName, len(got))
 			}
 			for _, path := range []string{
-				filepath.Join(repo, ".entire", "graph-agent.md"),
+				filepath.Join(repo, ".entire", "agent-guide.md"),
 				filepath.Join(repo, counterpartName),
 			} {
 				if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
@@ -2400,7 +2408,7 @@ func managedBlockOverheadForTest(t *testing.T) int {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
-	if err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo}); err != nil {
+	if err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo}); err != nil {
 		t.Fatalf("probe run: %v", err)
 	}
 	return len(readFileForTest(t, agentsPath)) - 1
@@ -2421,7 +2429,7 @@ func TestInitAgentsAcceptsTheLargestFileThatStillFitsOnceTheBlockIsAdded(t *test
 	}
 
 	var stdout, stderr bytes.Buffer
-	if err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo}); err != nil {
+	if err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo}); err != nil {
 		t.Fatalf("init-agents refused a file that renders to exactly the %d-byte limit: %v", maxInstructionFileBytes, err)
 	}
 	got := readFileForTest(t, agentsPath)
@@ -2437,7 +2445,7 @@ func TestInitAgentsAcceptsTheLargestFileThatStillFitsOnceTheBlockIsAdded(t *test
 
 	stdout.Reset()
 	stderr.Reset()
-	if err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo}); err != nil {
+	if err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo}); err != nil {
 		t.Fatalf("init-agents could not read back the %d-byte file it wrote: %v", len(got), err)
 	}
 	if again := readFileForTest(t, agentsPath); again != got {
@@ -2460,7 +2468,7 @@ func TestInitAgentsRefusesWhenTheManagedBlockWouldCrossTheReadLimit(t *testing.T
 	}
 
 	var stdout, stderr bytes.Buffer
-	err := Run(context.Background(), Options{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
+	err := Run(context.Background(), OptionsForTest{Stdout: &stdout, Stderr: &stderr}, []string{"init-agents", "--repo", repo})
 	if err == nil {
 		t.Fatalf("init-agents wrote a file past the %d-byte limit it will read back", maxInstructionFileBytes)
 	}
@@ -2473,7 +2481,7 @@ func TestInitAgentsRefusesWhenTheManagedBlockWouldCrossTheReadLimit(t *testing.T
 		t.Fatalf("AGENTS.md was rewritten despite the refusal (%d bytes read back)", len(got))
 	}
 	for _, path := range []string{
-		filepath.Join(repo, ".entire", "graph-agent.md"),
+		filepath.Join(repo, ".entire", "agent-guide.md"),
 		filepath.Join(repo, "CLAUDE.md"),
 	} {
 		if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
@@ -2502,7 +2510,7 @@ func TestInitAgentsRefusesManagedTargetInsideGitDirectory(t *testing.T) {
 	}{
 		{name: "claude to git config", managed: "CLAUDE.md", victim: filepath.Join(".git", "config")},
 		{name: "agents to git hook", managed: "AGENTS.md", victim: filepath.Join(".git", "hooks", "pre-commit")},
-		{name: "guide to git config", managed: filepath.Join(".entire", "graph-agent.md"), victim: filepath.Join(".git", "config")},
+		{name: "guide to git config", managed: filepath.Join(".entire", "agent-guide.md"), victim: filepath.Join(".git", "config")},
 		{name: "nested checkout git config", managed: "AGENTS.md", victim: filepath.Join("vendor", "dep", ".git", "config")},
 		// A symlink target is text the repository chose, and macOS and Windows resolve it
 		// case-insensitively: an exact ".git" comparison is a bypass on both.
@@ -2541,7 +2549,7 @@ func TestInitAgentsRefusesManagedTargetInsideGitDirectory(t *testing.T) {
 			}
 
 			var out bytes.Buffer
-			runErr := Run(context.Background(), Options{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
+			runErr := Run(context.Background(), OptionsForTest{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
 			requireGitDirRefusal(t, runErr, out.String())
 
 			after, err := os.ReadFile(victimPath)
@@ -2553,7 +2561,7 @@ func TestInitAgentsRefusesManagedTargetInsideGitDirectory(t *testing.T) {
 			}
 
 			// The refusal is a preflight for ALL managed targets, so nothing is installed.
-			for _, unwritten := range []string{"AGENTS.md", "CLAUDE.md", filepath.Join(".entire", "graph-agent.md")} {
+			for _, unwritten := range []string{"AGENTS.md", "CLAUDE.md", filepath.Join(".entire", "agent-guide.md")} {
 				if unwritten == testCase.managed {
 					continue
 				}
@@ -2617,7 +2625,7 @@ func TestInitAgentsRefusesIndirectRoutesIntoGitDirectory(t *testing.T) {
 			testCase.build(t, repo)
 
 			var out bytes.Buffer
-			err := Run(context.Background(), Options{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
+			err := Run(context.Background(), OptionsForTest{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
 			requireGitDirRefusal(t, err, out.String())
 			after, readErr := os.ReadFile(configPath)
 			if readErr != nil {
@@ -2633,7 +2641,7 @@ func TestInitAgentsRefusesIndirectRoutesIntoGitDirectory(t *testing.T) {
 // TestInitAgentsRefusesGuideDirectoryAliasedToGitDirectory covers the directory target, which
 // resolves through resolveContainedDirectoryName rather than the file resolver: `.entire -> .git`
 // would otherwise have MkdirAll accept the git directory as the guide's home and drop
-// graph-agent.md inside it.
+// agent-guide.md inside it.
 func TestInitAgentsRefusesGuideDirectoryAliasedToGitDirectory(t *testing.T) {
 	t.Parallel()
 	repo := t.TempDir()
@@ -2646,9 +2654,9 @@ func TestInitAgentsRefusesGuideDirectoryAliasedToGitDirectory(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	err := Run(context.Background(), Options{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
+	err := Run(context.Background(), OptionsForTest{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
 	requireGitDirRefusal(t, err, out.String())
-	if _, statErr := os.Lstat(filepath.Join(gitDir, "graph-agent.md")); !os.IsNotExist(statErr) {
+	if _, statErr := os.Lstat(filepath.Join(gitDir, "agent-guide.md")); !os.IsNotExist(statErr) {
 		t.Fatalf("guide written inside the git directory (%v)", statErr)
 	}
 }
@@ -2666,7 +2674,7 @@ func TestInitAgentsStillFollowsInRepositoryAliases(t *testing.T) {
 			t.Skipf("symlinks unavailable: %v", err)
 		}
 		var out bytes.Buffer
-		if err := Run(context.Background(), Options{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo}); err != nil {
+		if err := Run(context.Background(), OptionsForTest{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo}); err != nil {
 			t.Fatalf("documented alias refused: %v\n%s", err, out.String())
 		}
 		agents, err := os.ReadFile(filepath.Join(repo, "AGENTS.md"))
@@ -2692,7 +2700,7 @@ func TestInitAgentsStillFollowsInRepositoryAliases(t *testing.T) {
 			t.Skipf("symlinks unavailable: %v", err)
 		}
 		var out bytes.Buffer
-		if err := Run(context.Background(), Options{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo}); err != nil {
+		if err := Run(context.Background(), OptionsForTest{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo}); err != nil {
 			t.Fatalf("documented alias refused: %v\n%s", err, out.String())
 		}
 		got, err := os.ReadFile(target)
@@ -2767,7 +2775,7 @@ func TestInitAgentsRefusesManagedTargetHardLinkedIntoGitDirectory(t *testing.T) 
 			}
 
 			var out bytes.Buffer
-			runErr := Run(context.Background(), Options{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
+			runErr := Run(context.Background(), OptionsForTest{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
 			if runErr == nil {
 				t.Fatalf("init-agents succeeded while writing through a hard link into the git directory:\n%s", out.String())
 			}
@@ -2792,7 +2800,7 @@ func TestInitAgentsRefusesManagedTargetHardLinkedIntoGitDirectory(t *testing.T) 
 // The guard is enforced on the write, because an open handle is the only thing that can be asked
 // about an inode — but the first write that reaches it is the one that creates or overwrites the
 // guide. Measured on this branch before the preflight: `AGENTS.md` hard-linked to `.git/config`
-// printed "wrote .entire/graph-agent.md", left that file behind, and — where the user already had
+// printed "wrote .entire/agent-guide.md", left that file behind, and — where the user already had
 // a guide of their own — replaced its contents with the managed guide, all while exiting non-zero.
 // The error path does not call rollback, and rollback could not have restored an overwritten guide
 // in any case, so the only place this can be refused without damage is before the first write.
@@ -2841,7 +2849,7 @@ func TestInitAgentsRefusesAHardLinkedTargetBeforeWritingAnything(t *testing.T) {
 						t.Skipf("hard links unavailable on this filesystem: %v", err)
 					}
 
-					guidePath := filepath.Join(repo, ".entire", "graph-agent.md")
+					guidePath := filepath.Join(repo, ".entire", "agent-guide.md")
 					const ownGuide = "# my own graph notes\n"
 					if guide != "missing" {
 						mkdirAllForTest(t, filepath.Dir(guidePath))
@@ -2849,7 +2857,7 @@ func TestInitAgentsRefusesAHardLinkedTargetBeforeWritingAnything(t *testing.T) {
 					}
 
 					var out bytes.Buffer
-					runErr := Run(context.Background(), Options{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
+					runErr := Run(context.Background(), OptionsForTest{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
 					if runErr == nil {
 						t.Fatalf("init-agents wrote through an unaccounted hard link:\n%s", out.String())
 					}
@@ -2904,7 +2912,7 @@ func TestInitAgentsWritesThroughADirectorySpelledLikeTheGitDirectory(t *testing.
 	symlinkForTest(t, filepath.Join(".GIT", "rules.md"), filepath.Join(repo, "AGENTS.md"))
 
 	var out bytes.Buffer
-	if err := Run(context.Background(), Options{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo}); err != nil {
+	if err := Run(context.Background(), OptionsForTest{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo}); err != nil {
 		t.Fatalf("init-agents refused an ordinary directory named .GIT: %v\n%s", err, out.String())
 	}
 	got := readFileForTest(t, filepath.Join(repo, ".GIT", "rules.md"))
@@ -2929,7 +2937,7 @@ func TestInitAgentsWritesAnOrdinaryInstructionFile(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	if err := Run(context.Background(), Options{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo}); err != nil {
+	if err := Run(context.Background(), OptionsForTest{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo}); err != nil {
 		t.Fatalf("init-agents on an ordinary file: %v\n%s", err, out.String())
 	}
 	body, err := os.ReadFile(filepath.Join(repo, "AGENTS.md"))
@@ -2968,7 +2976,7 @@ const gitAdministrativeConfig = "[core]\n\trepositoryformatversion = 0\n\tbare =
 // managed block appended to git's real config, after which every git command failed with "fatal:
 // bad config line 9".
 //
-// The `.entire` case is the one no filename rule can catch. Its landing is `graph-agent.md`, an
+// The `.entire` case is the one no filename rule can catch. Its landing is `agent-guide.md`, an
 // ordinary markdown name that the instruction-file allowlist admits — it is refused only because of
 // WHERE it lands, which is inside the real ref store.
 func TestInitAgentsRefusesGitDirectoryNotNamedDotGit(t *testing.T) {
@@ -3008,7 +3016,7 @@ func TestInitAgentsRefusesGitDirectoryNotNamedDotGit(t *testing.T) {
 				plantGitAdministrativeDirectory(t, filepath.Join(repo, "admin"))
 				writeFileForTest(t, filepath.Join(repo, ".git"), "gitdir: admin\n")
 				symlinkForTest(t, filepath.Join("admin", "refs", "heads"), filepath.Join(repo, ".entire"))
-				return filepath.Join(repo, "admin", "refs", "heads", "graph-agent.md")
+				return filepath.Join(repo, "admin", "refs", "heads", "agent-guide.md")
 			},
 		},
 		{
@@ -3040,7 +3048,7 @@ func TestInitAgentsRefusesGitDirectoryNotNamedDotGit(t *testing.T) {
 			}
 
 			var out bytes.Buffer
-			runErr := Run(context.Background(), Options{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
+			runErr := Run(context.Background(), OptionsForTest{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
 			requireGitDirRefusal(t, runErr, out.String())
 
 			if existed {
@@ -3050,7 +3058,7 @@ func TestInitAgentsRefusesGitDirectoryNotNamedDotGit(t *testing.T) {
 			} else if _, statErr := os.Lstat(victim); !os.IsNotExist(statErr) {
 				t.Fatalf("%s was created inside the git directory (stat error %v)", victim, statErr)
 			}
-			for _, unwritten := range []string{"AGENTS.md", "CLAUDE.md", filepath.Join(".entire", "graph-agent.md")} {
+			for _, unwritten := range []string{"AGENTS.md", "CLAUDE.md", filepath.Join(".entire", "agent-guide.md")} {
 				path := filepath.Join(repo, unwritten)
 				info, statErr := os.Lstat(path)
 				if os.IsNotExist(statErr) {
@@ -3090,7 +3098,7 @@ func TestInitAgentsRefusesLandingThatIsNotAnInstructionFile(t *testing.T) {
 		{name: "direnv", managed: "CLAUDE.md", victim: ".envrc", content: "export FOO=bar\n"},
 		{name: "package manifest", managed: "AGENTS.md", victim: "package.json", content: "{\"scripts\":{\"build\":\"tsc\"}}\n"},
 		{name: "shell profile", managed: "AGENTS.md", victim: ".bashrc", content: "export PATH=$PATH:/bin\n"},
-		{name: "guide alias", managed: filepath.Join(".entire", "graph-agent.md"), victim: "Makefile", content: "all:\n\techo hi\n"},
+		{name: "guide alias", managed: filepath.Join(".entire", "agent-guide.md"), victim: "Makefile", content: "all:\n\techo hi\n"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
@@ -3108,7 +3116,7 @@ func TestInitAgentsRefusesLandingThatIsNotAnInstructionFile(t *testing.T) {
 			symlinkForTest(t, relativeVictim, managedPath)
 
 			var out bytes.Buffer
-			runErr := Run(context.Background(), Options{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
+			runErr := Run(context.Background(), OptionsForTest{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
 			if runErr == nil {
 				t.Fatalf("init-agents wrote its managed block into %s; output:\n%s", testCase.victim, out.String())
 			}
@@ -3124,7 +3132,7 @@ func TestInitAgentsRefusesLandingThatIsNotAnInstructionFile(t *testing.T) {
 			if got := readFileForTest(t, victimPath); got != testCase.content {
 				t.Fatalf("%s was written through:\nwant: %q\n got: %q", testCase.victim, testCase.content, got)
 			}
-			for _, unwritten := range []string{"AGENTS.md", "CLAUDE.md", filepath.Join(".entire", "graph-agent.md")} {
+			for _, unwritten := range []string{"AGENTS.md", "CLAUDE.md", filepath.Join(".entire", "agent-guide.md")} {
 				if unwritten == testCase.managed {
 					continue
 				}
@@ -3197,7 +3205,7 @@ func TestInitAgentsAllowsInstructionFileLandings(t *testing.T) {
 		t.Parallel()
 		repo := t.TempDir()
 		mkdirAllForTest(t, filepath.Join(repo, ".entire"))
-		symlinkForTest(t, filepath.Join("..", "GUIDE"), filepath.Join(repo, ".entire", "graph-agent.md"))
+		symlinkForTest(t, filepath.Join("..", "GUIDE"), filepath.Join(repo, ".entire", "agent-guide.md"))
 
 		runInitAgentsForTest(t, repo)
 		runInitAgentsForTest(t, repo)
@@ -3213,7 +3221,7 @@ func TestInitAgentsAllowsInstructionFileLandings(t *testing.T) {
 // landingCarriesManagedContent either admit every file or admit none.
 func TestAgentGuideHeadingIdentifiesTheGuide(t *testing.T) {
 	t.Parallel()
-	if len(agentGuideHeading) < len("# entire-graph") {
+	if len(agentGuideHeading) < len("# Entire repository agent guide") {
 		t.Fatalf("the guide heading is too short to identify anything: %q", agentGuideHeading)
 	}
 	if !strings.Contains(agentGuide, agentGuideHeading) {
@@ -3258,7 +3266,7 @@ func TestInitAgentsRefusesHardLinkWhoseCountASymlinkAliasInflates(t *testing.T) 
 	}
 
 	var out bytes.Buffer
-	runErr := Run(context.Background(), Options{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
+	runErr := Run(context.Background(), OptionsForTest{Stdout: &out, Stderr: &out}, []string{"init-agents", "--repo", repo})
 	if runErr == nil {
 		t.Fatalf("init-agents succeeded while writing through a hard link into the git directory:\n%s", out.String())
 	}
