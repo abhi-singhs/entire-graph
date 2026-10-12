@@ -1634,6 +1634,15 @@ func searchVerifyHasSection(content, heading string) bool {
 	return false
 }
 
+func searchVerifyPytestConfigDeclaresRunner(file, content string) bool {
+	for _, section := range searchVerifyPytestSections[path.Base(file)] {
+		if searchVerifyHasSection(content, section) {
+			return true
+		}
+	}
+	return false
+}
+
 func deriveSearchVerifySuitePytest(dir string, evidence *searchVerifyEvidence) *SearchVerifyCommand {
 	for _, name := range searchVerifyPytestConfigs {
 		candidate := searchVerifyJoin(dir, name)
@@ -2766,7 +2775,7 @@ func deriveSearchVerifyPytest(dir string, subject searchVerifySubject, evidence 
 		if !ok {
 			continue
 		}
-		if !strings.Contains(content, "pytest") {
+		if !searchVerifyPytestConfigDeclaresRunner(candidate, content) {
 			continue
 		}
 		config = candidate
