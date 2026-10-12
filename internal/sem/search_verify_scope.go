@@ -156,6 +156,15 @@ func deriveSearchVerifyAboveScope(subject searchVerifySubject, evidence *searchV
 		},
 		lookPath: evidence.lookPath,
 	}
+	// The inventory is what licenses a native file (`.s`, `.c`) as part of a Go package: its
+	// same-directory Go files. Those live in the scope, so the scope's inventory, lifted to
+	// toplevel coordinates, is the evidence a search at the toplevel would have had for them.
+	if len(evidence.files) > 0 {
+		outer.files = make([]string, len(evidence.files))
+		for index, filePath := range evidence.files {
+			outer.files[index] = searchVerifyJoin(scope.prefix, filePath)
+		}
+	}
 	lifted := subject
 	lifted.sourcePath = searchVerifyJoin(scope.prefix, subject.sourcePath)
 	if subject.testPath != "" {
