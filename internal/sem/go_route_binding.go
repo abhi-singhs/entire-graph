@@ -1985,6 +1985,7 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 		joins []*goRouteRewriteJoin
 	}
 	var captures []rewriteCapture
+	proxies := map[string]*goRouteBinding{}
 	deferred := seed == nil && goRouteLocalClosureEligible(lit) &&
 		(r.localClosureLits[lit] || r.immediateClosureLits[lit])
 	var effect *goRouteClosureEffect
@@ -2026,6 +2027,7 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 		r.closureCaptureTargets[proxy] = captureTarget
 		closureScope.vars[name] = proxy
 		captures = append(captures, rewriteCapture{name: name, outer: binding, proxy: proxy})
+		proxies[name] = proxy
 	}
 	mark := len(r.log)
 	savedRegion := r.region
@@ -2079,9 +2081,7 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 				r.applyClosureEffect(effect)
 			}
 		}
-		for name := range r.addressedNames(lit.Body) {
-			r.escape(scope, name)
-		}
+		r.escapeClosureAddressed(lit, scope, proxies)
 		return
 	}
 	r.markNames(scope, r.writtenNames(lit.Body), false)
@@ -2112,9 +2112,72 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 			r.set(capture.name, capture.outer, value)
 		}
 	}
+	r.escapeClosureAddressed(lit, scope, proxies)
+}
+
+// escapeClosureAddressed escapes the enclosing bindings whose address the
+// closure takes. A name the closure never declares can only mean the enclosing
+// binding. A name it does declare may mean either, depending on where the `&`
+// sits, so the walk's own scoped resolution decides: the enclosing binding
+// escapes only if the closure's capture proxy for it did (a non-captured name
+// resolved straight through to the enclosing binding during the walk).
+func (r *goRouteResolver) escapeClosureAddressed(lit *ast.FuncLit, scope *goRouteScope, proxies map[string]*goRouteBinding) {
+	declared := r.closureDeclaredNames(lit)
 	for name := range r.addressedNames(lit.Body) {
-		r.escape(scope, name)
+		if !declared[name] {
+			r.escape(scope, name)
+			continue
+		}
+		if proxy := proxies[name]; proxy != nil && r.escaped[proxy] {
+			r.escape(scope, name)
+		}
 	}
+}
+
+// closureDeclaredNames lists every name the closure (or a closure nested in
+// it) declares: parameters, results, := targets and var specs.
+func (r *goRouteResolver) closureDeclaredNames(lit *ast.FuncLit) map[string]bool {
+	declared := map[string]bool{}
+	noteFields := func(fields *ast.FieldList) {
+		if fields == nil {
+			return
+		}
+		for _, field := range fields.List {
+			for _, name := range field.Names {
+				declared[name.Name] = true
+			}
+		}
+	}
+	ast.Inspect(lit, func(n ast.Node) bool {
+		r.step(1)
+		switch n := n.(type) {
+		case *ast.FuncType:
+			noteFields(n.Params)
+			noteFields(n.Results)
+		case *ast.AssignStmt:
+			if n.Tok == token.DEFINE {
+				for _, target := range n.Lhs {
+					if ident, ok := target.(*ast.Ident); ok {
+						declared[ident.Name] = true
+					}
+				}
+			}
+		case *ast.RangeStmt:
+			if n.Tok == token.DEFINE {
+				for _, target := range []ast.Expr{n.Key, n.Value} {
+					if ident, ok := target.(*ast.Ident); ok {
+						declared[ident.Name] = true
+					}
+				}
+			}
+		case *ast.ValueSpec:
+			for _, name := range n.Names {
+				declared[name.Name] = true
+			}
+		}
+		return true
+	})
+	return declared
 }
 
 // escape records that name's address was taken: its binding is unknown for
