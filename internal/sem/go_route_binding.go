@@ -2976,6 +2976,9 @@ func (r *goRouteResolver) computeParamFacts() {
 	r.paramValueUse = map[string]bool{}
 	r.readOnlyParams = map[string][]bool{}
 	declNames := map[*ast.Ident]bool{}
+	// rootParamMethods are the methods among rootParamFuncs: only they can be
+	// named by a selector's Sel (a method value `s.register`).
+	rootParamMethods := map[string]bool{}
 	for _, decl := range r.file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Body == nil {
@@ -2986,6 +2989,9 @@ func (r *goRouteResolver) computeParamFacts() {
 		for _, field := range fn.Type.Params.List {
 			if r.typeValue(field.Type).kind == goRouteKnown {
 				r.rootParamFuncs[fn.Name.Name] = true
+				if fn.Recv != nil {
+					rootParamMethods[fn.Name.Name] = true
+				}
 			}
 			if len(field.Names) == 0 {
 				names = append(names, nil)
@@ -3007,19 +3013,45 @@ func (r *goRouteResolver) computeParamFacts() {
 		r.readOnlyParams[fn.Name.Name] = readOnly
 	}
 	calledIdents := map[*ast.Ident]bool{}
+	// selIdents are selector Sels; notValues are names that never denote a
+	// package-level function: field and parameter names, and composite-literal
+	// keys (a struct field name; a function is not comparable, so never a map key).
+	selIdents := map[*ast.Ident]bool{}
+	notValues := map[*ast.Ident]bool{}
 	ast.Inspect(r.file, func(n ast.Node) bool {
 		r.step(1)
-		if call, ok := n.(*ast.CallExpr); ok {
-			switch fun := call.Fun.(type) {
+		switch n := n.(type) {
+		case *ast.CallExpr:
+			switch fun := n.Fun.(type) {
 			case *ast.Ident:
 				calledIdents[fun] = true
 			case *ast.SelectorExpr:
 				calledIdents[fun.Sel] = true
 			}
+		case *ast.SelectorExpr:
+			selIdents[n.Sel] = true
+		case *ast.Field:
+			for _, name := range n.Names {
+				notValues[name] = true
+			}
+		case *ast.CompositeLit:
+			for _, element := range n.Elts {
+				if pair, ok := element.(*ast.KeyValueExpr); ok {
+					if key, ok := pair.Key.(*ast.Ident); ok {
+						notValues[key] = true
+					}
+				}
+			}
 		}
-		if ident, ok := n.(*ast.Ident); ok && r.rootParamFuncs[ident.Name] && !calledIdents[ident] && !declNames[ident] {
-			r.paramValueUse[ident.Name] = true
+		ident, ok := n.(*ast.Ident)
+		if !ok || !r.rootParamFuncs[ident.Name] || calledIdents[ident] || declNames[ident] || notValues[ident] {
+			return true
 		}
+		if selIdents[ident] && !rootParamMethods[ident.Name] {
+			// A field or another package's name that only shares the spelling.
+			return true
+		}
+		r.paramValueUse[ident.Name] = true
 		return true
 	})
 }
