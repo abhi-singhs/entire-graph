@@ -376,7 +376,7 @@ abdbb9f272e4265153b7e3e71837007e  benchmarks/common/metrics.py
 c3331bce8631d07cf69ae94cb82f821c  benchmarks/locomo/run.py
 180750bea9900b826dd5990fc9e16787  benchmarks/longmemeval/prompts.py
 632e01d52537e5b931994d61a246cd9b  benchmarks/longmemeval/run.py
-6adf81735919c7d09468a67b539f3294  requirements-lock-py312.txt
+40be8756fc254e97c536233b746cd4a3  requirements-lock-py312.txt
 ```
 
 The patched `docker/mem0/main.py` runs outside the harness process and is therefore not in this
