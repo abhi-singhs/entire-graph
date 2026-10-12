@@ -137,7 +137,7 @@ func mergeSearchContractContext(
 		outside := cardBytes + searchCoverageNoteCost(context.note)
 		for drop := 0; drop <= len(order); drop++ {
 			merged := searchContractMergedPlan(results, context.test, order[:drop])
-			if len(merged) <= topK && serializedSearchResultBytes(merged)+outside <= ceiling {
+			if (context.test == nil || len(merged) <= topK) && serializedSearchResultBytes(merged)+outside <= ceiling {
 				tests := 0
 				if context.test != nil {
 					tests = 1
