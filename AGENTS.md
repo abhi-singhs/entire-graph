@@ -2,10 +2,11 @@
 
 Hand this to any coding agent working in a repo where the `entire graph` plugin
 is installed. It moves initial code-location work from broad grep/read
-exploration to targeted graph queries; token impact depends on the task and
-model, and no end-to-end savings claim is current.
+exploration to targeted graph queries. Token impact depends on the task and the
+model, so treat any single figure as scenario-dependent; the measured range and
+the conditions behind it are in the [README](README.md).
 
-Two guidance surfaces coexist here on purpose. `.entire/graph-agent.md` is the
+Two guidance surfaces coexist here on purpose. `.entire/agent-guide.md` is the
 generated activation artifact — regenerated in full by `init-agents`, so never
 edit it by hand — and is what agents load through the managed block at the end
 of this file. This document is the maintained long-form reference; its examples
@@ -14,7 +15,7 @@ relying on command defaults.
 
 ## What this gives you
 
-A precomputed code graph is available through the `entire graph` command — functions, classes, methods, types, routes, and the calls/inheritance/field/service relations between them, parsed with tree-sitter. Built-in analysis is local and no-egress (no network, no model, no keys). Use it to **LOCATE** and **UNDERSTAND** code *before* broad grep / find / cat / whole-file exploration. The same repository view and options yield the same graph, but static relations can be heuristic or incomplete; inspect focused source and verify the resulting change. Some commands write derivative caches or explicitly requested setup/report files; inspect command help when filesystem writes matter.
+A precomputed code graph is available through the `entire graph` command — functions, classes, methods, types, routes, and the calls/inheritance/field/service relations between them, parsed with tree-sitter. Built-in analysis is local and no-egress (no network, no model, no keys). Use it to **LOCATE** and **UNDERSTAND** code when additional discovery is needed. The same repository view and options yield the same graph, but static relations can be heuristic or incomplete; inspect focused source and verify the resulting change. Some commands write derivative caches or explicitly requested setup/report files; inspect command help when filesystem writes matter.
 
 Default flags to remember: pass `--repo .` when you're not inside an Entire session. The interactive query family (`query`, `def`, `explain`, `neighbors`, and `impact`) reads your **working tree by default** so uncommitted edits are visible; `--head` switches those commands to committed-tree semantics. Other command families have different defaults.
 
@@ -24,7 +25,7 @@ Default flags to remember: pass `--repo .` when you're not inside an Entire sess
 
 Reach for the smallest tool that answers your question.
 
-### 🔍 query — *find the code for a task* (your first move)
+### 🔍 query — *find the code for a task* (when discovery is needed)
 Ranked source regions for a plain-language description, with the source and `file:line` inline. Hybrid ranking over bodies, identifiers (camelCase/snake_case aware), signatures, paths, and graph neighbors. Output is byte-budgeted to drop straight into context.
 
 ```sh
@@ -36,7 +37,7 @@ entire graph query --repo . --query "<the task or bug in one plain sentence>" --
 - Working tree by default (always rebuilt and never cached); add `--head` for cached committed-tree semantics.
 - `--profile syntax-only|fast|full` (default `fast`); `--index-all-files` or `--max-indexed-files N` to widen/bound cold-search parsing.
 
-**When:** the start of essentially every task. One good query lands you on the fix area.
+**When:** additional code discovery is needed; reuse locations already supplied by the task or Brain brief.
 
 ### 🕸️ neighbors — *who calls this / what does it call* (targeted relations)
 Direct incoming/outgoing relations for **one** symbol, with definition locations, plus bounded two-hop paths at `--depth 2`. For the full blast radius of a change, prefer `impact`; use `neighbors` when you want one specific relation/direction. Never `edges` for this (full stream).
@@ -161,42 +162,34 @@ what `scripts/entire-graph-statusline.sh` renders as a live Claude Code status l
 
 ---
 
-## Resolution-first agent prompt (copy-paste this)
+## Repository-specific workflow
 
-The former “measured-best” early-stop prompt and its 54.9%/57.7% token claims
-are withdrawn. It optimized token use without preserving resolution parity and
-could reward a cheap wrong patch. Use this correctness-first guidance instead;
-substitute your search invocation for `<query-cmd>`:
+Follow `.entire/agent-guide.md`, generated from repository state. Both Graph-only
+and combined instructions make the same first-action obligation: the first action on
+any task that requires finding code is ONE
+`entire graph query --repo . --profile full --query "<task>"`.
+That holds for small edits, follow-ups, tasks that already name the file, and tasks
+where a Brain brief has already reported locations — a brief reports where code is,
+not what depends on it. Combined instructions also begin substantive orientation with
+`entire brain brief "<task>" --json` unless equivalent task context is available.
+Use Graph for discovery, structural analysis, and semantic revision comparisons, and
+Brain for retained knowledge, prior decisions, and checkpoint/session history.
 
-```text
-A precomputed code-search tool is available: <query-cmd> . Use it to LOCATE the fix BEFORE any
-grep/find. Your FIRST action must be ONE search:
-  <query-cmd> "<the bug in one sentence>"   <-- ranked relevant code (file:line + source)
-Then open the top hit's file with your native Read tool (pass a line range around the reported
-line), inspect enough surrounding behavior to justify the change, and make the smallest complete
-edit. Treat graph output as evidence, not an oracle. Check callers/impact when the change can affect
-other sites. If the result prints a `VERIFY:` line, run that exact command after editing before
-claiming the task is done; it may be a per-file command or a whole-suite fallback when no narrow
-command can be derived. Never report that tests pass without executing the command. If verification
-cannot be run, state why and perform a bounded source-level check. Optimize turns only after
-correctness.
-```
-
-For bug-fix/locate tasks, run query at `--profile full` (call-graph expansion active). Query's
-default output is JSON; pass `--format text` for the tiered human view (full snippet for the top
-hits, terse locators after) or `--format agent` for compact output with a cache/latency header.
-Prefer targeted follow-up queries over whole-graph dumps, but use the graph and source
-checks needed to make and verify a complete fix.
+Current source and executed tests establish present behavior; historical answers
+explain prior intent. Investigate disagreements. A failed query is reported and falls
+back to direct source inspection for that query only — it does not retire the tool for
+the session — and does not authorize automatic installation, configuration, or repair.
+See [the contract](docs/agent-coordination.md).
 
 ## Operating doctrine
 
-1. **Search first for location tasks.** Start with one `entire graph query --query "<task>"` before broad grep/find exploration.
+1. **Answer the information gap.** Follow the generated workflow; query Graph when further discovery is needed.
 2. **Treat results as evidence, not truth.** Read focused source around the result and widen the check when behavior, aliases, generated code, or dynamic dispatch could matter.
 3. **Use graph follow-ups when they answer a real question.** `impact`, `callers`, and `neighbors` are appropriate for blast radius and related-site checks; avoid exploratory whole-graph dumps.
 4. **Make the smallest complete change.** Check sibling sites and contracts when the task implies them.
 5. **Verify before stopping.** Run the `VERIFY:` command when query prints one; it may be a whole-suite fallback when no narrow command exists. Never report that tests pass without having run them. If execution is unavailable, perform a bounded source-level verification and disclose the limitation.
 6. **Optimize context after correctness.** Prefer precise queries and line ranges, but never trade resolution for fewer turns.
-7. **Feature-detect before you trust.** If a language might be inventory-only, check `capabilities --json` first — inventory-only files have file records but no semantic relations.
+7. **Account for semantic coverage.** Inventory-only files have file records but no semantic relations; verify incomplete results against current source.
 
 Quick mental model:
 
@@ -221,7 +214,7 @@ mise run test    # go test ./...
 mise run check   # fmt + vet + race tests + build
 ```
 
-Contract rules that must not break: schema `1.x` is frozen and additive-only (`docs/adr/0001-ga-schema-contract.md`); the provider is **no-egress** (never add remote fetches, hosted API calls, telemetry, or runtime grammar downloads); `compound-v1` symbol IDs must stay stable across ordinary edits; unsupported/unparseable files must surface as machine-readable partial failures, never silent drops. All logic lives under `internal/` (`sem` = parsing/graph/search, `cli` = hand-rolled dispatch, `gitutil` = git subprocess); `cmd/entire-graph/main.go` is a thin entry point. The plugin manifest (`entire-plugin.yml`) registers the subcommand `graph`, so users type `entire graph ...`. This project was **previously named `entire-sem`** — do not reintroduce the old name. **Entire Brain** (`entire-brain`) is the separate downstream consumer of this provider's NDJSON — not an old name for this project.
+Contract rules that must not break: schema `1.x` is frozen and additive-only (`docs/adr/0001-ga-schema-contract.md`); the provider is **no-egress** (never add remote fetches, hosted API calls, telemetry, or runtime grammar downloads); `compound-v1` symbol IDs must stay stable across ordinary edits, and any parser change that RE-KEYS existing symbols must bump `IdentityRevision` (`internal/sem/provider.go`) in the same commit — the record and search caches are keyed on the git tree of the source, which a parser edit does not change, so without the bump upgraded users keep being served the old symbols from a stale cache and the fix is invisible; unsupported/unparseable files must surface as machine-readable partial failures, never silent drops. All logic lives under `internal/` (`sem` = parsing/graph/search, `cli` = hand-rolled dispatch, `gitutil` = git subprocess); `cmd/entire-graph/main.go` is a thin entry point. The plugin manifest (`entire-plugin.yml`) registers the subcommand `graph`, so users type `entire graph ...`. This project was **previously named `entire-sem`** — do not reintroduce the old name. **Entire Brain** (`entire-brain`) is the separate downstream consumer of this provider's NDJSON — not an old name for this project.
 
 ### Working in a scratch worktree: adopt the session first
 
@@ -254,9 +247,7 @@ from the transcript and links it to the last commit. Two cautions:
   the checkpoint is still created and the trailer is printed to paste into a later
   commit instead.
 
-<!-- entire-graph:begin -->
-This repo has the entire-graph code graph installed. Before exploring code with
-grep/find/whole-file reads, read .entire/graph-agent.md — resolution-first guidance
-for using graph retrieval, focused source inspection, and verification.
-@.entire/graph-agent.md
-<!-- entire-graph:end -->
+<!-- entire-agent:begin -->
+Read .entire/agent-guide.md for this repository's workflow, source inspection, and verification guidance.
+@.entire/agent-guide.md
+<!-- entire-agent:end -->

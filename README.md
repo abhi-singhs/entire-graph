@@ -31,7 +31,7 @@ up to 71% depending on the coding scenario. As always, your mileage may vary.
 - Commit and Entire checkpoint analysis for reviewing changes in their repository context.
 - Working-tree queries that include uncommitted edits by default, with explicit committed-tree queries and reusable caches for matching repository states and options.
 - Full graph export through versioned NDJSON snapshots, stable symbol identifiers, a compact NDJSON format, and experimental SCIP export.
-- Per-repository agent activation, which installs graph-first guidance in AGENTS.md and CLAUDE.md.
+- Per-repository agent activation, which installs repository-specific guidance in AGENTS.md and CLAUDE.md.
 - Machine-readable coverage, exclusions, warnings, and partial failures, with relation confidence and resolution metadata.
 - Local analysis with no network requests, model calls, API keys, telemetry, or runtime grammar downloads.
 
@@ -73,13 +73,19 @@ Activation is per repository:
 entire graph init-agents --repo .
 ```
 
+Add `--strict` to save mandatory Graph/Brain tool-use rules for this repository.
+The saved mode is shared by enabled products and inherited on later runs.
+Use `init-agents --normal` to reset it. `agent-guide` inherits the saved mode;
+`agent-guide --strict` or `--normal` previews an override without saving it.
+The two flags are mutually exclusive. New repositories default to normal.
+
 The command creates or updates these files:
 
-- `.entire/graph-agent.md`: the agent operating guide. Generated in full and
+- `.entire/agent-guide.md`: the agent operating guide. Generated in full and
   regenerated in full on each successful rerun; manual edits there do not
   survive.
 - `AGENTS.md` and `CLAUDE.md`: created if absent; otherwise one managed block
-  between `<!-- entire-graph:begin -->` and `<!-- entire-graph:end -->` markers
+  between `<!-- entire-agent:begin -->` and `<!-- entire-agent:end -->` markers
   is added or replaced. Text outside the markers is preserved.
 
 Review the three files, then commit them together when the instructions should
@@ -151,14 +157,12 @@ evidence for the agent to check against source, not an oracle. The
 capture conditions, relevant agent and tool events, complete graph-command
 outputs, and the final answer verbatim.
 
-Each layer of the setup has its own success signal. Installation: both
-`entire version` and `entire graph version` succeed. Activation: the three
-files exist with intact markers. Adoption: in a fresh session, the first
-code-locating call is `entire graph query`. If the agent begins with broad
-grep or whole-file exploration, the guide may not have loaded or may not have
-been followed. Check the activation files and the client's instruction view;
-see [agent activation](docs/agents.md). Grounding: the answer cites files and
-lines the agent actually opened.
+Activation succeeds when the managed guide and pointers are present and
+`agent-guide` matches the installed guide for the same target and invocation.
+Follow the [coordinated workflow](docs/agent-coordination.md): Brain supplies task
+context in combined mode; Graph handles further discovery and structural analysis.
+Sufficient task or brief locations permit direct source inspection. Ground claims
+in inspected source and executed verification.
 
 ## What to ask
 
@@ -189,11 +193,11 @@ any of the seven other systems we tested, including graphify, mem0, and cognee.
 
 | System | LoCoMo | Index-time tokens | Version tested |
 | --- | --- | --- | --- |
-| **entire-graph** § | **94.74** | **0** | [#104](https://github.com/entireio/entire-graph/pull/104) branch, 2026-08-14 (pre-merge) |
+| **entire-graph** | **94.74** | **0** | [#104](https://github.com/entireio/entire-graph/pull/104) branch, 2026-08-14 (pre-merge) |
 | [mem0](https://github.com/mem0ai/mem0) | 93.83 | 50.85M | commit [`4debc58`](https://github.com/mem0ai/mem0/commit/4debc58a83377b18be81ae1e5969a300736b2fac) |
 | [cognee](https://github.com/topoteretes/cognee) | 92.86 | 12.35M | commit [`38eece5`](https://github.com/topoteretes/cognee/commit/38eece5bbb0cb9f5706fed908abd16dba0f5505e) |
 | [bm25](https://github.com/dorianbrown/rank_bm25) (lexical baseline) | 91.88 | 0 | [0.2.2](https://github.com/dorianbrown/rank_bm25/releases/tag/0.2.2) |
-| [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) (cmm) † | 91.30 | 0 | [v0.9.0](https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.9.0) |
+| [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) (cmm)  | 91.30 | 0 | [v0.9.0](https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.9.0) |
 | [graphify](https://github.com/Graphify-Labs/graphify)  | 87.34 | 0 | [0.9.37](https://github.com/Graphify-Labs/graphify/releases?page=3#release-v0.9.34)|
 | [letta](https://github.com/letta-ai/letta) | 84.68 | not projectable | [0.16.8](https://github.com/letta-ai/letta/releases/tag/0.16.8) |
 | [supermemory](https://github.com/supermemoryai/supermemory)  | 82.08 | hosted | [server-v0.0.7-rc.2](https://github.com/supermemoryai/supermemory/releases/tag/server-v0.0.7-rc.2) |

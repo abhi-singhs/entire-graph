@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/entireio/entire-graph/internal/agentsetup"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -1022,7 +1023,7 @@ func writeConfinedOutputFile(
 	return file.Close()
 }
 
-// The links this walk follows are bounded by containedLinkHopLimit — the SAME budget
+// The links this walk follows are bounded by agentsetup.LinkHopLimit — the SAME budget
 // the contained walk in agents.go applies, for the same reason and from the same
 // table (linkHopLimitFor). Two notions of the limit would be two answers to one
 // question, and the second one was wrong: a fixed 40 is the Linux figure, and the
@@ -1133,14 +1134,14 @@ func openUnconfinedOutputFile(
 		aliasCandidate := statErr == nil && unconfinedRouteAliasCandidate(runtime.GOOS, info.Mode())
 		var link string
 		if aliasCandidate && runtime.GOOS == "windows" {
-			rawTarget, kind, rawErr := windowsRawReparseTarget(directory.Name(), component, info)
+			rawTarget, kind, rawErr := agentsetup.WindowsRawReparseTarget(directory.Name(), component, info)
 			if rawErr != nil {
 				return nil, fmt.Errorf(
 					"refusing to write %s: cannot inspect the raw Windows reparse target of %s: %w",
 					target.given, full, rawErr)
 			}
 			switch kind {
-			case windowsReparseOpaqueAlias:
+			case agentsetup.ReparseOpaqueAlias:
 				// A NAME SURROGATE whose tag this code cannot decode. Windows follows it
 				// while resolving the path, to somewhere this walk cannot name, so its
 				// own chain would be neither expanded nor counted against the hop budget.
@@ -1148,7 +1149,7 @@ func openUnconfinedOutputFile(
 				return nil, fmt.Errorf(
 					"refusing to write %s: %s is a Windows reparse point of an unsupported kind "+
 						"that the kernel follows", target.given, full)
-			case windowsReparseInert:
+			case agentsetup.ReparseInert:
 				if info.Mode()&os.ModeSymlink != 0 {
 					return nil, fmt.Errorf(
 						"refusing to write %s: cannot inspect the raw Windows reparse target of %s",
@@ -1159,7 +1160,7 @@ func openUnconfinedOutputFile(
 				// the path straight through it, so it is the ordinary component it looks
 				// like and the walk opens it as one.
 				aliasCandidate = false
-			case windowsReparseResolved:
+			case agentsetup.ReparseResolved:
 				// Read from the same reparse-buffer snapshot that was screened, so a
 				// malformed offset never reaches Readlink's unsafe parser and an in-place
 				// update cannot pair an unchecked target with this walk.
@@ -1197,7 +1198,7 @@ func openUnconfinedOutputFile(
 				// ones do, so it takes the same smaller budget.
 				fullyQualifiedTarget = true
 			}
-			hopLimit := containedLinkHopLimit(fullyQualifiedTarget)
+			hopLimit := agentsetup.LinkHopLimit(fullyQualifiedTarget)
 			if hops > hopLimit {
 				return nil, fmt.Errorf(
 					"refusing to write %s: the path follows more than %d symbolic links",

@@ -197,9 +197,12 @@ these rules existed misses instead of re-emitting the paths it named.
   directory. `os.Root` intentionally keeps using that directory object after a
   move; portable Go cannot pin its lexical ancestry, and a process with that
   namespace authority can already move existing cache artifacts.
-- `init-agents` writes through exactly three repository paths, disclosed in
-  [agent activation](agents.md): `.entire/graph-agent.md` and managed blocks
-  in `AGENTS.md` and `CLAUDE.md`. A repository-committed symlink at one of
+- `init-agents` writes through three primary repository paths, disclosed in
+  [agent activation](agents.md): `.entire/agent-guide.md` and managed blocks
+  in `AGENTS.md` and `CLAUDE.md`. Existing legacy Graph/Brain guide paths are
+  also checked and rewritten as redirects under the same protections. See
+  [coordination](agent-coordination.md) for detection and migration.
+  A repository-committed symlink at one of
   those paths may redirect the write to another file, which is what makes the
   alias support in the activation guide work; the redirection is confined to
   the project root, and additionally refused when it lands in a git directory —
@@ -212,7 +215,7 @@ these rules existed misses instead of re-emitting the paths it named.
   `.git` component and stats as an ordinary regular file. An inode's other names
   cannot be read back from it, so a managed target is refused unless every name
   it has is `AGENTS.md` or `CLAUDE.md`. Those two instruction files may share
-  one inode; the generated `.entire/graph-agent.md` guide must remain distinct.
+  one inode; the generated `.entire/agent-guide.md` guide must remain distinct.
   This also refuses a hard link to a harmless file, including one outside the
   project. A symlink remains the preferred instruction-file alias.
 - `index --report <path>` writes a Markdown graph report to the path you give
