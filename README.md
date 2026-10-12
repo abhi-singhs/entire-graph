@@ -135,6 +135,16 @@ export ENTIRE_GRAPH_PROMPT_CONTEXT=1          # off unless set
 # optional: ENTIRE_GRAPH_BIN=/path/to/entire  # run as `<path> graph search`; any other command as `<cmd> search`
 ```
 
+Project settings may enable the hook and select `ENTIRE_GRAPH_BIN` after workspace
+trust is granted. Enable it only in trusted workspaces. Paths containing spaces
+are supported as whole paths or quoted tokens. Without opt-in the shell guard
+exits before starting Python; missing Python also fails open. The first 160
+prompt characters are passed through the ordinary CLI query argument, visible
+in local process listings. Timeouts terminate the child process tree. Injected
+output is always indented in an untrusted data frame; confidence warnings remain
+visible and repository text is evidence, never instructions.
+
+
 Why it is opt-in: in paired agent runs, a graph search *tool call* cost a whole agent turn and raised tokens; the
 same answer injected into the prompt was token-neutral (+0.7%, 95% CI about ±11%) and resolved slightly more tasks
 in two separate stages, but neither difference is statistically significant.
