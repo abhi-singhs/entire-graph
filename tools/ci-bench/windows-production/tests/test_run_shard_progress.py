@@ -420,5 +420,19 @@ class RunShardProgressTests(unittest.TestCase):
                     self.assertFalse(thread.is_alive())
 
 
+    def test_heartbeat_stop_is_bounded_when_console_writer_is_blocked(self):
+        stop = threading.Event()
+        unblock = threading.Event()
+        thread = threading.Thread(target=unblock.wait, daemon=True)
+        thread.start()
+        try:
+            self.assertFalse(run_shard.stop_heartbeat(stop, thread, timeout=0.01))
+            self.assertTrue(stop.is_set())
+        finally:
+            unblock.set()
+            thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+
+
 if __name__ == "__main__":
     unittest.main()
