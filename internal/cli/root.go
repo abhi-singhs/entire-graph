@@ -248,7 +248,7 @@ func (cw *contextChunkWriter) Unwrap() io.Writer { return cw.w }
 // the context is canceled. A cache hit can be megabytes; a plain Write would
 // ignore SIGINT until the whole buffer is flushed.
 func writeBytesWithContext(ctx context.Context, w io.Writer, b []byte) error {
-	_, err := (&contextChunkWriter{ctx: ctx, w: w}).Write(b)
+	_, err := contextChunkWriterFor(ctx, w).Write(b)
 	return err
 }
 
@@ -277,8 +277,8 @@ func Run(ctx context.Context, opts Options, args []string) error {
 	// below wrap again for their own sinks; a second wrapper only re-chunks
 	// bytes that are already 64 KiB or smaller, and its ctx check is the same
 	// check.
-	opts.Stdout = &contextChunkWriter{ctx: ctx, w: opts.Stdout}
-	opts.Stderr = &contextChunkWriter{ctx: ctx, w: opts.Stderr}
+	opts.Stdout = contextChunkWriterFor(ctx, opts.Stdout)
+	opts.Stderr = contextChunkWriterFor(ctx, opts.Stderr)
 
 	if len(args) == 0 {
 		printHelp(opts.Stdout)
@@ -584,7 +584,7 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 		encoder.SetEscapeHTML(false) // match json.Marshal used elsewhere (no < escaping)
 		return encoder.Encode
 	}
-	encodeRecord := newRecordEncoder(&contextChunkWriter{ctx: ctx, w: opts.Stdout})
+	encodeRecord := newRecordEncoder(contextChunkWriterFor(ctx, opts.Stdout))
 	if scipEncoder != nil {
 		// The version is read inside the snapshot build, through the reader that
 		// is already validated, bounded and pinned to this snapshot's revision.
@@ -715,7 +715,7 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 	// stored: the cache is best effort, the stream is not.
 	recordBuf := boundedRecordBuffer{limit: providerRecordsCacheMaxBytes}
 	if recordsCache != nil {
-		encodeRecord = newRecordEncoder(io.MultiWriter(&contextChunkWriter{ctx: ctx, w: opts.Stdout}, &recordBuf))
+		encodeRecord = newRecordEncoder(io.MultiWriter(contextChunkWriterFor(ctx, opts.Stdout), &recordBuf))
 	}
 	if err := sem.StreamSnapshot(ctx, repo, opts.Version, options, func(record any) error {
 		capture(record)
@@ -1533,7 +1533,7 @@ func printResult(ctx context.Context, out io.Writer, result sem.Result, asJSON b
 	// land. Without it a canceled or broken stdout produced truncated output and
 	// a nil error, which the process then reports as exit status 0 -- a partial
 	// answer indistinguishable from a complete one.
-	sink := &errCapturingWriter{w: &contextChunkWriter{ctx: ctx, w: out}}
+	sink := &errCapturingWriter{w: contextChunkWriterFor(ctx, out)}
 	if asJSON {
 		encoded, err := json.MarshalIndent(result, "", "  ")
 		if err != nil {
