@@ -24890,7 +24890,7 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 				// A named handler that is not a symbol here (a local variable,
 				// another package's function): attributed to the enclosing
 				// symbol like an inline handler, never dropped to the bare path.
-				inlineRegs = append(inlineRegs, goRouteInline{Route: registration.Route, Offset: registration.offset, Unplaced: registration.Unplaced})
+				inlineRegs = append(inlineRegs, goRouteInline{Route: registration.Route, Method: registration.method, Offset: registration.offset, Unplaced: registration.Unplaced})
 			}
 		}
 		// Line lookup by binary search over the file's newline offsets, computed once: counting
@@ -24924,7 +24924,7 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 					FilePath:  from.FilePath,
 					StartLine: from.StartLine,
 					EndLine:   from.EndLine,
-					Detail:    registration.Route,
+					Detail:    goRouteMethodDetail(registration.Method, registration.Route),
 				}},
 				WarningCodes: []string{},
 			}
@@ -26174,6 +26174,9 @@ type goHTTPRouteRegistration struct {
 	Unplaced bool
 	// offset of the registration call in the file (Go route pass only).
 	offset int
+	// method a net/http ServeMux pattern restricts the route to (Go route
+	// pass only; "" for any method).
+	method string
 }
 
 type djangoRouteRegistration struct {
