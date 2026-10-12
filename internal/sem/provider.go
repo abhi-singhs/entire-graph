@@ -24960,6 +24960,9 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 			key := from.ID + "\x00" + registration.Route
 			if index, ok := inlineSeen[key]; ok {
 				goRouteAddMethodEvidence(&inline[index].Relation, registration.Method, goRouteMethodDetail(registration.Method, registration.Route))
+				if !registration.Unplaced {
+					goRouteMarkPlaced(&inline[index].Relation, 0.7, "pattern", goRouteInlineReason)
+				}
 				continue
 			}
 			inlineSeen[key] = len(inline)
@@ -24969,7 +24972,7 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 				ToID:          externalID("route", registration.Route),
 				Type:          "HANDLES_ROUTE",
 				Confidence:    0.7,
-				Reason:        "Go route registration with an inline handler; route composed from its router, attributed to the enclosing symbol",
+				Reason:        goRouteInlineReason,
 				RelationScope: "external",
 				Resolution:    "pattern",
 				TargetKind:    "route",
@@ -24995,6 +24998,9 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 			key := handler.ID + "\x00" + registration.Route
 			if index, ok := seen[key]; ok {
 				goRouteAddMethodEvidence(&relations[index].Relation, registration.method, registration.Detail)
+				if !registration.Unplaced {
+					goRouteMarkPlaced(&relations[index].Relation, 0.86, "exact", goRouteNamedReason)
+				}
 				continue
 			}
 			seen[key] = len(relations)
@@ -25004,7 +25010,7 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 				ToID:          externalID("route", registration.Route),
 				Type:          "HANDLES_ROUTE",
 				Confidence:    0.86,
-				Reason:        "Go net/http route registration resolved to local handler",
+				Reason:        goRouteNamedReason,
 				RelationScope: "external",
 				Resolution:    "exact",
 				TargetKind:    "route",
@@ -25065,6 +25071,31 @@ func goRouteMarkUnplaced(relation *RelationRecord) {
 	relation.Reason += "; the router's mount prefix is not visible, so the route is relative to it and may be incomplete"
 	relation.WarningCodes = append(relation.WarningCodes, goRouteUnplacedWarning)
 }
+
+// goRouteMarkPlaced undoes goRouteMarkUnplaced when a duplicate registration
+// of the same edge has a visible prefix: one placed registration proves the
+// route, whichever of the two the file happens to list first.
+func goRouteMarkPlaced(relation *RelationRecord, confidence float64, resolution, reason string) {
+	if !goRouteRelationUnplaced(*relation) {
+		return
+	}
+	relation.Confidence = confidence
+	relation.Resolution = resolution
+	relation.Reason = reason
+	codes := relation.WarningCodes[:0]
+	for _, code := range relation.WarningCodes {
+		if code != goRouteUnplacedWarning {
+			codes = append(codes, code)
+		}
+	}
+	relation.WarningCodes = codes
+}
+
+// Reasons of placed Go route edges, before goRouteMarkUnplaced extends them.
+const (
+	goRouteNamedReason  = "Go net/http route registration resolved to local handler"
+	goRouteInlineReason = "Go route registration with an inline handler; route composed from its router, attributed to the enclosing symbol"
+)
 
 // goRouteRelationUnplaced reports a relation goRouteMarkUnplaced marked.
 func goRouteRelationUnplaced(relation RelationRecord) bool {
