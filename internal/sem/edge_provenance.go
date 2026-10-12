@@ -137,6 +137,6 @@ func (r RelationRecord) MarshalJSON() ([]byte, error) {
 	type alias RelationRecord
 	return json.Marshal(struct {
 		alias
-		Provenance string `json:"provenance,omitempty"`
+		Provenance string `json:"provenance"`
 	}{alias(r), EdgeProvenance(r.Type, r.Resolution)})
 }

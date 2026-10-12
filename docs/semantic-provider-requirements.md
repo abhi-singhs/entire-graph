@@ -569,7 +569,7 @@ reproduce every Git-only policy and excluded files can therefore be present.
 
 The current globally pattern-driven set is reported as
 `heuristic_relation_types` (`HANDLES_ROUTE`, `HTTP_CALLS`, `EMITS`, `LISTENS_ON`, `HANDLES_TOOL`,
-`SIMILAR_TO`, `TESTS`). A test keeps this list aligned with
+`SIMILAR_TO`, `TESTS`, `HANDLES_GRPC`, `HANDLES_GRAPHQL`, `HANDLES_TRPC`). A test keeps this list aligned with
 `capabilities --json`.
 
 ## Tests
