@@ -76,6 +76,11 @@ class T(unittest.TestCase):
     def test_off_by_default(self):
         env = dict(self.env); env.pop("ENTIRE_GRAPH_PROMPT_CONTEXT")
         self.assertEqual(self.run_hook(self.ev(), env), (0, ""))
+    def test_diagnostic_only_answers_add_no_locations(self):
+        for marker in ("!N I:miss X5", "!N X5", "!D", "!D W1 F2 L3/4 I:hit X5"):
+            self.assertEqual(pc.clean(marker), "")
+            self.assertEqual(pc.clean(marker + "\n1. a.go:1 X s=1"), "1. a.go:1 X s=1")
+
     def test_injects_cleaned_answer_with_heading(self):
         rc, out = self.run_hook(self.ev())
         self.assertEqual(rc, 0)

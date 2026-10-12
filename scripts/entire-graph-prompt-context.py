@@ -73,7 +73,7 @@ def graph_argv(env):
 # the "I:<state>/<ms>[ Q:n][ P:n][ T:n]" header, the "!N|!D W.. F.. L../..[ X..]" coverage diagnostic,
 # and the "!LOW s=.." low-confidence marker. Anchored whole-line matches, so code lines never match.
 COMPACT_HEADER = re.compile(r"^I:[a-z-]+/\d+(?: [QPT]:\d+)*$")
-COMPACT_DIAG = re.compile(r"^![ND] W\d+ F\d+ L\d+/\d+(?: X\d+)?$")
+COMPACT_DIAG = re.compile(r"^![ND](?: W\d+ F\d+ L\d+/\d+)?(?: I:[a-z-]+(?:/\d+)?)?(?: X\d+)?$")
 COMPACT_LOW = re.compile(r"^!LOW s=-?\d+(?:\.\d+)?$")
 
 
