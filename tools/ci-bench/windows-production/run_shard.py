@@ -396,16 +396,16 @@ def run(
                     failure = type(error).__name__
                     raise
                 finally:
+                    duration = time.monotonic() - started
                     heartbeat_stopped = stop_heartbeat(heartbeat_stop, heartbeat)
                     if failure is not None and heartbeat_stopped:
                         # The heartbeat is joined, so this line is terminal.
                         print(
-                            f"{prefix} end {detail} elapsed={time.monotonic() - started:.3f}s "
+                            f"{prefix} end {detail} elapsed={duration:.3f}s "
                             f"exit=exception:{failure}",
                             file=sys.stderr,
                             flush=True,
                         )
-            duration = time.monotonic() - started
             if heartbeat_stopped:
                 print(
                     f"{prefix} end {detail} elapsed={duration:.3f}s exit={completed.returncode}",
