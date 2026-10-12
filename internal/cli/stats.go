@@ -1413,14 +1413,23 @@ func pipelineHeadStages(command string) []string {
 // the operators they look for — `|`, `;`, `&`, `>`, `<<` — is an operator inside quotes:
 // `git commit -m "fix: a; grep the logs"` is one commit, and `cat "odd>name.txt"` is a read.
 //
-// A command whose quotes do not balance gets an all-false mask: masking to end-of-string on an
-// unterminated quote would hide every later statement, and falling back to the unquoted reading is
-// this file's pre-existing behaviour, so the failure stays bounded.
+// Command substitution is masked the same way: in `cat $(git log | head -5) > out.txt` the `|`
+// belongs to the substituted command, and splitting the outer statement there hid its `> out.txt`
+// redirect from the write check. `$(...)` nests (and so does `$((...))` arithmetic); a backtick
+// substitution does not. Quotes inside a substitution are still tracked, so `$(grep ")" x)` closes
+// at the last parenthesis, not the quoted one.
+//
+// A command whose quotes or substitutions do not balance gets an all-false mask: masking to
+// end-of-string on an unterminated quote would hide every later statement, and falling back to the
+// unquoted reading is this file's pre-existing behaviour, so the failure stays bounded.
 func shellQuoteMask(runes []rune) []bool {
 	masked := make([]bool, len(runes))
 	var quote rune
+	depth := 0
+	backtick := false
 	for index := 0; index < len(runes); index++ {
 		character := runes[index]
+		inSubstitution := depth > 0 || backtick
 		switch {
 		case character == '\\' && quote != '\'':
 			masked[index] = true
@@ -1436,9 +1445,24 @@ func shellQuoteMask(runes []rune) []bool {
 		case character == '\'' || character == '"':
 			quote = character
 			masked[index] = true
+		case character == '$' && index+1 < len(runes) && runes[index+1] == '(':
+			masked[index], masked[index+1] = true, true
+			depth++
+			index++
+		case character == '(' && depth > 0:
+			masked[index] = true
+			depth++
+		case character == ')' && depth > 0:
+			masked[index] = true
+			depth--
+		case character == '`':
+			masked[index] = true
+			backtick = !backtick
+		case inSubstitution:
+			masked[index] = true
 		}
 	}
-	if quote != 0 {
+	if quote != 0 || depth != 0 || backtick {
 		return make([]bool, len(runes))
 	}
 	return masked
