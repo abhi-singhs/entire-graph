@@ -326,9 +326,12 @@ func plausibleGraphPath(path string) bool {
 }
 
 // graphJSONResultKeys open the answer sections of query/search, neighbors, impact and def JSON.
+// An ambiguous neighbors/impact answers with its candidates — "match_bodies" and impact's
+// "definitions" — instead of a focus, so those open an answer section too.
 var graphJSONResultKeys = map[string]bool{
 	"results": true, "matches": true, "focus": true, "callers": true, "callees": true,
 	"type_consumers": true, "data_flows": true, "co_changes": true, "siblings": true, "declarations": true,
+	"definitions": true, "match_bodies": true,
 }
 
 var (
