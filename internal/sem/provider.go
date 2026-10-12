@@ -12582,6 +12582,9 @@ func typeReferenceCandidates(name string, from SymbolRecord, shared []SymbolReco
 		}
 		for _, rest := range shared[index+1:] {
 			if keep(rest) {
+				if filtered == nil {
+					filtered = make([]SymbolRecord, 0, len(shared)-1)
+				}
 				filtered = append(filtered, rest)
 			}
 		}
