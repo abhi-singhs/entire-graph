@@ -423,7 +423,8 @@ func b() {
 
 // gorilla: PathPrefix(..).Subrouter() is a router under that prefix, and
 // HandleFunc/Handle place their route by their receiver exactly like router
-// methods: an unknown or field receiver is omitted.
+// methods: an unknown receiver is omitted, and a field this file declares as
+// a root router is unplaced (its serving prefix is not visible).
 func TestGoRouteAccuracyGorillaAndHandleFuncReceivers(t *testing.T) {
 	runGoRouteAccuracyCases(t, []goRouteAccuracyCase{
 		{
@@ -460,7 +461,7 @@ func main(p string) {
 			want: nil,
 		},
 		{
-			name: "HandleFunc receivers: unknown, field, bare, gorilla package",
+			name: "HandleFunc receivers: unknown, router field, bare, gorilla package",
 			content: `package p
 import "github.com/gorilla/mux"
 type S struct{ mux *http.ServeMux }
@@ -471,7 +472,7 @@ func d() { router.HandleFunc("/undeclared", undeclaredHandler) }
 func e() { mux.HandleFunc("/pkg", pkgHandler) }
 func f() { r := newRouter(); r.Handle("/call", http.HandlerFunc(callHandler)) }
 `,
-			want: nil,
+			want: []string{"/field -> fieldHandler [unplaced]"},
 		},
 		{
 			name: "HandleFunc receivers that are roots",
@@ -487,8 +488,9 @@ func c(m *http.ServeMux) { m.Handle("/param", http.HandlerFunc(paramHandler)) }
 }
 
 // http.StripPrefix serves a handler under a prefix its registrations do not
-// show. It is never composed: routers inside it are omitted, and a ServeMux
-// that escapes (where a StripPrefix usually happens) is omitted too.
+// show. It is never composed: routers inside it are omitted, and so is a
+// ServeMux returned from its function (a factory whose caller may strip it).
+// A ServeMux handed to an unseen wrapper is unplaced, never placed at the root.
 func TestGoRouteAccuracyStripPrefixIsNotGuessed(t *testing.T) {
 	runGoRouteAccuracyCases(t, []goRouteAccuracyCase{
 		{
@@ -537,7 +539,7 @@ func main() {
 	http.ListenAndServe(":80", mux)
 }
 `,
-			want: []string{"/ -> rootHandler"},
+			want: []string{"/ -> rootHandler", "/o -> oHandler [unplaced]"},
 		},
 	})
 }

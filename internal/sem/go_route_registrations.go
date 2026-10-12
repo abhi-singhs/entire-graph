@@ -33,6 +33,9 @@ type goRouteCandidate struct {
 	// the enclosing symbol.
 	inline   bool
 	receiver goRouteBinding
+	// constants resolve the route argument at its call (lexically scoped);
+	// nil in the unparseable-file fallback, which has no scopes.
+	constants map[string]string
 }
 
 // goRouteInline is a registration with an inline handler and its composed
@@ -40,6 +43,9 @@ type goRouteCandidate struct {
 type goRouteInline struct {
 	Route  string
 	Offset int
+	// Unplaced: the router's serving prefix is not visible, so Route is
+	// relative to it and may lack a leading prefix.
+	Unplaced bool
 }
 
 // goRouteDetail is everything the Go route pass knows about one file:
@@ -105,14 +111,18 @@ func goRouteEmit(candidates []goRouteCandidate, constants map[string]string) goR
 	})
 	var detail goRouteDetail
 	for _, candidate := range sorted {
-		route, ok := goRouteCandidateRoute(candidate, constants)
+		candidateConstants := constants
+		if candidate.constants != nil {
+			candidateConstants = candidate.constants
+		}
+		route, placed, ok := goRouteCandidateRoute(candidate, candidateConstants)
 		if !ok {
 			// The receiver's prefix at this call is not determined: emitting
 			// the bare path, or another binding's prefix, would invent a route.
 			continue
 		}
 		if candidate.inline {
-			detail.inline = append(detail.inline, goRouteInline{Route: route, Offset: candidate.offset})
+			detail.inline = append(detail.inline, goRouteInline{Route: route, Offset: candidate.offset, Unplaced: !placed})
 			continue
 		}
 		if candidate.handler == "" {
@@ -123,41 +133,46 @@ func goRouteEmit(candidates []goRouteCandidate, constants map[string]string) goR
 			Handler:      candidate.handler,
 			EvidenceKind: candidate.evidence,
 			Detail:       route + " -> " + candidate.handler,
+			Unplaced:     !placed,
 			offset:       candidate.offset,
 		})
 	}
 	return detail
 }
 
-// goRouteCandidateRoute is the full route a registration serves, or false
-// when any part of it (receiver, where the router instance is served, the
-// path argument) is not determined.
-func goRouteCandidateRoute(candidate goRouteCandidate, constants map[string]string) (string, bool) {
+// goRouteCandidateRoute is the route a registration serves. placed is false
+// when the router instance is served under a prefix this file does not show
+// (the route is then relative to the instance); ok is false when any part of
+// it (receiver, the instance's own placement, the path argument) is not
+// determined.
+func goRouteCandidateRoute(candidate goRouteCandidate, constants map[string]string) (string, bool, bool) {
 	receiver := candidate.receiver
 	if receiver.kind == goRouteUnknown {
-		return "", false
+		return "", false, false
 	}
 	framework := receiver.framework
 	literal, ok := goRouteLiteral(framework, candidate.route, constants)
 	if !ok {
-		return "", false
+		return "", false, false
 	}
 	prefix := receiver.prefix
+	placed := true
 	if receiver.kind == goRouteKnown && receiver.origin != nil {
-		// Where the router instance itself is served: a composed Mount, or
-		// unknown when it escaped to code that may mount it.
-		base, ok := receiver.origin.prefix(0)
+		// Where the router instance itself is served: a composed Mount, an
+		// unplaced instance, or unknown when it may be rewritten or mounted.
+		base, basePlaced, ok := receiver.origin.place(0)
 		if !ok {
-			return "", false
+			return "", false, false
 		}
+		placed = basePlaced
 		if base != "" {
 			if len(base)+len(prefix) > goRouteMaxPrefixBytes {
-				return "", false
+				return "", false, false
 			}
 			prefix = goRouteJoin(framework, base, prefix)
 		}
 	}
-	return goRouteFinal(framework, goRouteJoin(framework, prefix, literal)), true
+	return goRouteFinal(framework, goRouteJoin(framework, prefix, literal)), placed, true
 }
 
 // goRouteLiteral is a static path argument. gin, echo and fiber accept
@@ -305,7 +320,8 @@ func (r *goRouteResolver) noteCall(call *ast.CallExpr, scope *goRouteScope) {
 	if index < 0 || len(call.Args) < index+2 {
 		return
 	}
-	candidate := goRouteCandidate{offset: r.offset(call.Pos()), route: r.text(call.Args[index])}
+	lookup := r.lookupIn(scope)
+	candidate := goRouteCandidate{offset: r.offset(call.Pos()), route: r.text(call.Args[index]), constants: r.constantsFor(call.Args[index], lookup)}
 	chainOrder, chainEvidence := 2, "go_router_method"
 	// Only the two-argument forms name their handler; Method/MethodFunc,
 	// middleware arguments and wrapped handlers are inline.
@@ -341,9 +357,15 @@ func (r *goRouteResolver) noteCall(call *ast.CallExpr, scope *goRouteScope) {
 			candidate.order, candidate.evidence = 3, "go_router_group_method"
 		}
 		candidate.receiver = r.groupValue(x, r.lookupIn(scope))
+	case *ast.SelectorExpr:
+		// A field receiver (s.mux.HandleFunc, r.Mux.Get) is a router only
+		// when this file shows the field holds a root router; any other
+		// field (s.api.GET on a group) holds a prefix this pass cannot see.
+		candidate.receiver = r.groupValue(x, lookup)
+		if candidate.receiver.kind != goRouteKnown {
+			return
+		}
 	default:
-		// A field or other selector receiver (s.api.GET, s.mux.HandleFunc)
-		// holds a prefix this pass does not track.
 		return
 	}
 	switch candidate.receiver.framework {
@@ -361,6 +383,7 @@ func (r *goRouteResolver) noteCall(call *ast.CallExpr, scope *goRouteScope) {
 				return
 			}
 			candidate.route = r.text(call.Args[1])
+			candidate.constants = r.constantsFor(call.Args[1], lookup)
 			candidate.handler, candidate.inline = "", true
 		}
 	}
