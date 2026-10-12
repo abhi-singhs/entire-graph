@@ -16,7 +16,7 @@ They live in **`entirehq/graphmark`** (note the org: `entirehq`, not `entireio`)
 carries four suites: Fidelity (`bench.py`, compiler-oracle graph correctness), Tasks
 (`bench_tasks.py`, oracle-derived lookups), Agentic-value (`agentic-swebench/`, official
 swebench-graded agent runs — `R30PUB_r1` and friends are run labels there, tracked in
-`dev/run_validation.py`), and graphify-parity (conversational memory retrieval, above).
+`dev/run_validation.py`), and graphify-parity (conversational memory retrieval).
 The session-level numbers ("79 agent sessions", token attribution) come from the
 agentic-swebench analysis directories.
 
