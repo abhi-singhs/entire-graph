@@ -160,10 +160,7 @@ func runDef(ctx context.Context, opts Options, args []string) error {
 	if err != nil {
 		return err
 	}
-	cacheDir := flags.CacheDir
-	if cacheDir == "" {
-		cacheDir = opts.Env.PluginDataDir
-	}
+	cacheDir := resolveCacheDir(flags.CacheDir, opts.Env.PluginDataDir)
 	totalStarted := time.Now()
 	snapshot, cacheHit, err := sem.LoadOrBuildProviderSnapshot(ctx, repo, opts.Version, sem.ProviderSnapshotOptions{
 		NoNetwork:    true,
