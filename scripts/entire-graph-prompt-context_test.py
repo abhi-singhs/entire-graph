@@ -248,6 +248,16 @@ class T(unittest.TestCase):
         for override, want in (("entire graph", ["entire", "graph"]), ("/opt/entire-graph", ["/opt/entire-graph"]),
                                (self.fake, [self.fake])):
             self.assertEqual(pc.graph_argv({"ENTIRE_GRAPH_BIN": override}), want)
+    def test_probe_requires_well_formed_provider_identity(self):
+        malformed = os.path.join(self.d, "malformed-provider")
+        for index, output in enumerate(("not json", "null", "[]", "{}", '{"provider":"other"}')):
+            with open(malformed, "w") as f:
+                f.write("#!/bin/sh\nprintf '%s\\n' '" + output + "'\n")
+            os.chmod(malformed, 0o755)
+            env = dict(self.env, ENTIRE_GRAPH_BIN=malformed)
+            self.assertEqual(self.run_hook(self.ev(session="malformed"+str(index)), env), (0, ""))
+            self.assertEqual(self.marker("malformed"+str(index))["probe"], "error")
+
     def test_budget_override(self):
         self.run_hook(self.ev(), dict(self.env, ENTIRE_GRAPH_PROMPT_CONTEXT_BYTES="4096"))
         a = open(self.args).read().split("\n"); self.assertEqual(a[a.index("--max-context-bytes") + 1], "4096")

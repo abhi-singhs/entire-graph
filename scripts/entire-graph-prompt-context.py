@@ -175,9 +175,9 @@ def probe(argv, env):
     try:
         info = json.loads(r.stdout)
     except ValueError:
-        info = None
-    if isinstance(info, dict) and info.get("provider", "entire-graph") != "entire-graph":
-        return {"probe": "error", "reason": "provider %r" % info.get("provider")}
+        return {"probe": "error", "reason": "non-json response"}
+    if not isinstance(info, dict) or info.get("provider") != "entire-graph":
+        return {"probe": "error", "reason": "unexpected provider"}
     version = info.get("version") if isinstance(info, dict) else None
     return {"probe": "ok", "version": version if isinstance(version, str) else ""}
 
