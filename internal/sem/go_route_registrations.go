@@ -41,7 +41,9 @@ type goRouteCandidate struct {
 // goRouteInline is a registration with an inline handler and its composed
 // route, at a byte offset into the file.
 type goRouteInline struct {
-	Route  string
+	Route string
+	// Method a net/http ServeMux pattern restricts the route to ("" for any).
+	Method string
 	Offset int
 	// Unplaced: the router's serving prefix is not visible, so Route is
 	// relative to it and may lack a leading prefix.
@@ -115,14 +117,14 @@ func goRouteEmit(candidates []goRouteCandidate, constants map[string]string) goR
 		if candidate.constants != nil {
 			candidateConstants = candidate.constants
 		}
-		route, placed, ok := goRouteCandidateRoute(candidate, candidateConstants)
+		route, method, placed, ok := goRouteCandidateRoute(candidate, candidateConstants)
 		if !ok {
 			// The receiver's prefix at this call is not determined: emitting
 			// the bare path, or another binding's prefix, would invent a route.
 			continue
 		}
 		if candidate.inline {
-			detail.inline = append(detail.inline, goRouteInline{Route: route, Offset: candidate.offset, Unplaced: !placed})
+			detail.inline = append(detail.inline, goRouteInline{Route: route, Method: method, Offset: candidate.offset, Unplaced: !placed})
 			continue
 		}
 		if candidate.handler == "" {
@@ -132,28 +134,36 @@ func goRouteEmit(candidates []goRouteCandidate, constants map[string]string) goR
 			Route:        route,
 			Handler:      candidate.handler,
 			EvidenceKind: candidate.evidence,
-			Detail:       route + " -> " + candidate.handler,
+			Detail:       goRouteMethodDetail(method, route) + " -> " + candidate.handler,
 			Unplaced:     !placed,
 			offset:       candidate.offset,
+			method:       method,
 		})
 	}
 	return detail
 }
 
-// goRouteCandidateRoute is the route a registration serves. placed is false
-// when the router instance is served under a prefix this file does not show
-// (the route is then relative to the instance); ok is false when any part of
-// it (receiver, the instance's own placement, the path argument) is not
-// determined.
-func goRouteCandidateRoute(candidate goRouteCandidate, constants map[string]string) (string, bool, bool) {
+// goRouteCandidateRoute is the route a registration serves, and the HTTP
+// method a net/http ServeMux pattern restricts it to ("" for any method).
+// placed is false when the router instance is served under a prefix this file
+// does not show (the route is then relative to the instance); ok is false when
+// any part of it (receiver, the instance's own placement, the path argument)
+// is not determined.
+func goRouteCandidateRoute(candidate goRouteCandidate, constants map[string]string) (string, string, bool, bool) {
 	receiver := candidate.receiver
 	if receiver.kind == goRouteUnknown {
-		return "", false, false
+		return "", "", false, false
 	}
 	framework := receiver.framework
-	literal, ok := goRouteLiteral(framework, candidate.route, constants)
+	var literal, method string
+	var ok bool
+	if framework == "http" {
+		literal, method, ok = goRouteServeMuxLiteral(candidate.route, constants)
+	} else {
+		literal, ok = goRouteLiteral(framework, candidate.route, constants)
+	}
 	if !ok {
-		return "", false, false
+		return "", "", false, false
 	}
 	prefix := receiver.prefix
 	placed := true
@@ -162,17 +172,98 @@ func goRouteCandidateRoute(candidate goRouteCandidate, constants map[string]stri
 		// unplaced instance, or unknown when it may be rewritten or mounted.
 		base, basePlaced, ok := receiver.origin.place(0)
 		if !ok {
-			return "", false, false
+			return "", "", false, false
 		}
 		placed = basePlaced
 		if base != "" {
 			if len(base)+len(prefix) > goRouteMaxPrefixBytes {
-				return "", false, false
+				return "", "", false, false
 			}
 			prefix = goRouteJoin(framework, base, prefix)
 		}
 	}
-	return goRouteFinal(framework, goRouteJoin(framework, prefix, literal)), placed, true
+	return goRouteFinal(framework, goRouteJoin(framework, prefix, literal)), method, placed, true
+}
+
+// goRouteServeMuxLiteral is the path of a static net/http ServeMux pattern
+// argument and the method it restricts the route to.
+func goRouteServeMuxLiteral(expr string, constants map[string]string) (string, string, bool) {
+	value, ok := staticStringExpressionValue(expr, constants)
+	if !ok {
+		return "", "", false
+	}
+	path, method, ok := goServeMuxPattern(value)
+	return path, method, ok
+}
+
+// goServeMuxPattern splits a net/http ServeMux pattern. Since Go 1.22 a
+// pattern is "[METHOD ][HOST]/[PATH]" (net/http parsePattern): an optional
+// method token followed by spaces or tabs, an optional host (everything
+// before the first slash), then the path. Wildcards ({id}, {path...}, {$})
+// stay as written in the path; the host is not part of the route.
+//
+// A pattern that starts with a slash is a plain path, kept as it always was.
+// Anything else is accepted only in the strict shape: an all-uppercase method
+// token, a host without whitespace or braces, and a path whose wildcards are
+// whole, well-formed segments (a "scheme://" prefix is not a host). A
+// lowercase method, a method with no path, or
+// any other shape Go would reject or match differently is omitted.
+func goServeMuxPattern(pattern string) (path, method string, ok bool) {
+	if strings.HasPrefix(pattern, "/") {
+		return pattern, "", true
+	}
+	rest := pattern
+	if i := strings.IndexAny(pattern, " \t"); i >= 0 {
+		method, rest = pattern[:i], strings.TrimLeft(pattern[i+1:], " \t")
+		if !goServeMuxMethodRe.MatchString(method) {
+			return "", "", false
+		}
+	}
+	slash := strings.IndexByte(rest, '/')
+	if slash < 0 {
+		return "", "", false
+	}
+	host, path := rest[:slash], rest[slash:]
+	if strings.ContainsAny(host, " \t{}") || strings.ContainsAny(path, " \t") || strings.HasPrefix(path, "//") || !goServeMuxWildcardsValid(path) {
+		return "", "", false
+	}
+	return path, method, true
+}
+
+// goServeMuxMethodRe is the method token this pass accepts: net/http matches
+// methods case-sensitively, so only the uppercase spelling names a real one.
+var goServeMuxMethodRe = regexp.MustCompile(`^[A-Z]+$`)
+
+// goServeMuxWildcardRe is a whole-segment ServeMux wildcard: {name},
+// {name...} or {$}.
+var goServeMuxWildcardRe = regexp.MustCompile(`^\{(?:[A-Za-z_][A-Za-z0-9_]*(?:\.\.\.)?|\$)\}$`)
+
+// goServeMuxWildcardsValid reports whether every brace in path belongs to a
+// whole-segment wildcard, with {name...} and {$} only in the last segment.
+func goServeMuxWildcardsValid(path string) bool {
+	segments := strings.Split(path, "/")
+	for i, segment := range segments {
+		if !strings.ContainsAny(segment, "{}") {
+			continue
+		}
+		if !goServeMuxWildcardRe.MatchString(segment) {
+			return false
+		}
+		if i != len(segments)-1 && (segment == "{$}" || strings.HasSuffix(segment, "...}")) {
+			return false
+		}
+	}
+	return true
+}
+
+// goRouteMethodDetail is a route as evidence shows it: "GET /x" when a
+// ServeMux pattern names a method (the route id stays the path, like an
+// HTTP_CALLS target), the bare route otherwise.
+func goRouteMethodDetail(method, route string) string {
+	if method == "" {
+		return route
+	}
+	return method + " " + route
 }
 
 // goRouteLiteral is a static path argument. gin, echo and fiber accept
