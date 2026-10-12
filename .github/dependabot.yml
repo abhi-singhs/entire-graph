@@ -1,41 +1,42 @@
 version: 2
+
 updates:
-  - package-ecosystem: "gomod"
-    directory: "/"
+  - package-ecosystem: gomod
+    directory: /
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-    labels:
-      - "dependencies"
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
     groups:
-      gomod-minor-patch:
-        applies-to: version-updates
-        update-types:
-          - "minor"
-          - "patch"
-  - package-ecosystem: "pip"
-    directory: "/bench/memory"
+      go-minor-and-patch:
+        patterns: ["*"]
+        exclude-patterns:
+          - github.com/smacker/go-tree-sitter
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore
+      include: scope
+
+  - package-ecosystem: github-actions
+    directory: /
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-    labels:
-      - "dependencies"
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
     groups:
-      pip-minor-patch:
-        applies-to: version-updates
-        update-types:
-          - "minor"
-          - "patch"
-  - package-ecosystem: "github-actions"
-    directory: "/"
+      actions-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    commit-message:
+      prefix: chore
+      include: scope
+
+  - package-ecosystem: pip
+    directory: /bench/memory
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 5
-    labels:
-      - "dependencies"
-    groups:
-      github-actions-minor-patch:
-        applies-to: version-updates
-        update-types:
-          - "minor"
-          - "patch"
+      interval: weekly
+    # Disable routine version PRs; retain security updates.
+    open-pull-requests-limit: 0
+    commit-message:
+      prefix: chore
+      include: scope
