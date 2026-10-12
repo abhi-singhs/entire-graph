@@ -24856,8 +24856,12 @@ func routeLiteralsForSymbol(path, content, block string, symbol SymbolRecord, sy
 func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolRecord, readContent contentReader, constantsByFile *fileStringConstants) ([]expressRouteRelation, []expressRouteRelation, map[string][][2]int) {
 	var relations, inline []expressRouteRelation
 	masks := map[string][][2]int{}
-	seen := map[string]bool{}
-	inlineSeen := map[string]bool{}
+	// seen and inlineSeen map an edge (symbol, route) to its index in
+	// relations or inline. The route id is the path, so a second ServeMux
+	// method on the same path and symbol ("GET /x" and "DELETE /x") is the
+	// same edge: its method is added to that edge's evidence instead.
+	seen := map[string]int{}
+	inlineSeen := map[string]int{}
 	for _, file := range files {
 		if !strings.EqualFold(filepath.Ext(file.Path), ".go") {
 			continue
@@ -24905,10 +24909,11 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 				continue
 			}
 			key := from.ID + "\x00" + registration.Route
-			if inlineSeen[key] {
+			if index, ok := inlineSeen[key]; ok {
+				goRouteAddMethodEvidence(&inline[index].Relation, registration.Method, goRouteMethodDetail(registration.Method, registration.Route))
 				continue
 			}
-			inlineSeen[key] = true
+			inlineSeen[key] = len(inline)
 			relation := RelationRecord{
 				RecordType:    "relation",
 				FromID:        from.ID,
@@ -24939,10 +24944,11 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 				continue
 			}
 			key := handler.ID + "\x00" + registration.Route
-			if seen[key] {
+			if index, ok := seen[key]; ok {
+				goRouteAddMethodEvidence(&relations[index].Relation, registration.method, registration.Detail)
 				continue
 			}
-			seen[key] = true
+			seen[key] = len(relations)
 			relation := RelationRecord{
 				RecordType:    "relation",
 				FromID:        handler.ID,
@@ -24975,6 +24981,24 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 		return relations[i].Handler.ID < relations[j].Handler.ID
 	})
 	return relations, inline, masks
+}
+
+// goRouteAddMethodEvidence records one more ServeMux method registration of
+// an edge that already exists: a copy of its first evidence with this
+// registration's detail. A registration without a method, or a detail the
+// edge already carries, adds nothing, so other frameworks' edges are unchanged.
+func goRouteAddMethodEvidence(relation *RelationRecord, method, detail string) {
+	if method == "" || len(relation.Evidence) == 0 {
+		return
+	}
+	for _, evidence := range relation.Evidence {
+		if evidence.Detail == detail {
+			return
+		}
+	}
+	evidence := relation.Evidence[0]
+	evidence.Detail = detail
+	relation.Evidence = append(relation.Evidence, evidence)
 }
 
 // goRouteUnplacedWarning marks a Go route whose router is served under a

@@ -177,7 +177,9 @@ func main() {
 }
 
 // End to end: a ServeMux with method patterns yields HANDLES_ROUTE edges to
-// the path route, with the method in the evidence detail.
+// the path route, with the method in the evidence detail. A second method on
+// the same path and symbol is the same edge and adds one evidence entry; the
+// same pattern registered twice adds none.
 func TestGoRouteServeMuxMethodPatternsSnapshot(t *testing.T) {
 	repo := t.TempDir()
 	writeFile(t, repo, "server.go", `package main
@@ -189,7 +191,10 @@ func main() {
 	mux.HandleFunc("GET /users/{id}", getUser)
 	mux.HandleFunc("POST example.com/users", createUser)
 	mux.Handle("DELETE /users/{id}", http.HandlerFunc(deleteUser))
+	mux.HandleFunc("PUT /users/{id}", getUser)
+	mux.HandleFunc("GET /users/{id}", getUser)
 	mux.HandleFunc("GET /files/{path...}", func(w http.ResponseWriter, r *http.Request) {})
+	mux.HandleFunc("HEAD /files/{path...}", func(w http.ResponseWriter, r *http.Request) {})
 	mux.HandleFunc("get /lower", lower)
 	http.ListenAndServe(":8080", mux)
 }
@@ -211,17 +216,17 @@ func lower(w http.ResponseWriter, r *http.Request)      {}
 		if strings.Contains(relation.ToID, "GET") || strings.Contains(relation.ToID, "example.com") || strings.Contains(relation.ToID, "lower") {
 			t.Fatalf("route id carries pattern text: %#v", relation)
 		}
-		detail := ""
-		if len(relation.Evidence) > 0 {
-			detail = relation.Evidence[0].Detail
+		var details []string
+		for _, evidence := range relation.Evidence {
+			details = append(details, evidence.Detail)
 		}
-		got[lastSegment(relation.FromID)+" "+relation.ToID] = detail
+		got[lastSegment(relation.FromID)+" "+relation.ToID] = strings.Join(details, " | ")
 	}
 	want := map[string]string{
-		"getUser " + externalID("route", "/users/{id}"):    "GET /users/{id} -> getUser",
+		"getUser " + externalID("route", "/users/{id}"):    "GET /users/{id} -> getUser | PUT /users/{id} -> getUser",
 		"createUser " + externalID("route", "/users"):      "POST /users -> createUser",
 		"deleteUser " + externalID("route", "/users/{id}"): "DELETE /users/{id} -> deleteUser",
-		"main " + externalID("route", "/files/{path...}"):  "GET /files/{path...}",
+		"main " + externalID("route", "/files/{path...}"):  "GET /files/{path...} | HEAD /files/{path...}",
 	}
 	for key, detail := range want {
 		if got[key] != detail {
