@@ -678,7 +678,7 @@ func Capabilities() CapabilityReport {
 		SupportedRelationTypes:          append([]string(nil), relationTypes...),
 		RelationSupportByLanguage:       relationSupportByLanguage(),
 		RelationSupportByProfile:        relationSupportByProfile(),
-		HeuristicRelationTypes:          []string{"HANDLES_ROUTE", "HTTP_CALLS", "EMITS", "LISTENS_ON", "HANDLES_TOOL", "SIMILAR_TO", "TESTS"},
+		HeuristicRelationTypes:          []string{"HANDLES_ROUTE", "HANDLES_GRPC", "HANDLES_GRAPHQL", "HANDLES_TRPC", "HTTP_CALLS", "EMITS", "LISTENS_ON", "HANDLES_TOOL", "SIMILAR_TO", "TESTS"},
 		OptionalLocalOnlyFeatures: map[string]bool{
 			"stable_symbol_ids":          true,
 			"semantic_diff":              true,

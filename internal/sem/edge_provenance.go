@@ -42,13 +42,16 @@ const (
 // HeuristicRelationTypes; the two are asserted equal by test, so the provenance
 // label and the advertised capability can never drift apart.
 var heuristicEdgeTypes = map[string]bool{
-	"HANDLES_ROUTE": true,
-	"HTTP_CALLS":    true,
-	"EMITS":         true,
-	"LISTENS_ON":    true,
-	"HANDLES_TOOL":  true,
-	"SIMILAR_TO":    true,
-	"TESTS":         true,
+	"HANDLES_ROUTE":   true,
+	"HANDLES_GRPC":    true,
+	"HANDLES_GRAPHQL": true,
+	"HANDLES_TRPC":    true,
+	"HTTP_CALLS":      true,
+	"EMITS":           true,
+	"LISTENS_ON":      true,
+	"HANDLES_TOOL":    true,
+	"SIMILAR_TO":      true,
+	"TESTS":           true,
 }
 
 // knownResolutions classifies every Resolution value the providers emit. It is
