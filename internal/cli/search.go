@@ -2355,6 +2355,9 @@ func agentSearchResultBudgets(results []sem.SearchResult, budget int) []int {
 	floorTotal := 0
 	for index, result := range results {
 		floors[index] = agentSearchLocationCost(result)
+		if floors[index] > budget-floorTotal {
+			return rankedAgentSearchBudgets(count, budget)
+		}
 		floorTotal += floors[index]
 	}
 	if floorTotal > budget {
