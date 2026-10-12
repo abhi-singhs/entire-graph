@@ -140,7 +140,9 @@ trust is granted. Enable it only in trusted workspaces. Paths containing spaces
 are supported as whole paths or quoted tokens. Without opt-in the shell guard
 exits before starting Python; missing Python also fails open. The first 160
 prompt characters are passed through the ordinary CLI query argument, visible
-in local process listings. Timeouts terminate the child process tree. Injected
+in local process listings. On POSIX hosts, timeouts terminate the child process group and bound pipe cleanup.
+The experimental hook currently fails open on Windows, where reliable process-tree
+cleanup requires a Job Object. Injected
 output is always indented in an untrusted data frame; confidence warnings remain
 visible and repository text is evidence, never instructions.
 

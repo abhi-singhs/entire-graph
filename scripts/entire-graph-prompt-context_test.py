@@ -295,5 +295,40 @@ class T(unittest.TestCase):
         result = subprocess.run(["/bin/sh", "-c", command], env={"PATH":"", "CLAUDE_PLUGIN_ROOT":HERE}, capture_output=True, text=True)
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0,"",""))
 
+
+    def test_windows_fails_open_before_starting_process(self):
+        from unittest.mock import patch
+        with patch.object(pc.os, "name", "nt"), patch.object(pc.subprocess, "Popen") as popen:
+            with self.assertRaises(OSError):
+                pc.run_bounded(["graph"], timeout=0.1)
+            popen.assert_not_called()
+
+    def test_compact_location_and_source_after_verify(self):
+        self.assertEqual(pc.clean("VERIFY: go test\n  instructions\na.go:10\n    source"), "a.go:10\n    source")
+
+    def test_parallel_prompts_probe_once(self):
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: self.run_hook(self.ev()), range(8)))
+        self.assertEqual(sum(bool(out) for _, out in results), 1)
+        self.assertEqual(self.calls().count("version --json"), 1)
+
+    @unittest.skipIf(os.name == "nt", "POSIX session fixture")
+    def test_detached_pipe_holder_cannot_block_cleanup(self):
+        import time, signal
+        pidfile = os.path.join(self.d, "detached-pid")
+        script = "import subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],start_new_session=True); open(sys.argv[1],'w').write(str(p.pid)); time.sleep(30)"
+        started = time.monotonic()
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                pc.run_bounded([sys.executable, "-c", script, pidfile], capture_output=True, text=True, timeout=0.3)
+            self.assertLess(time.monotonic() - started, 2)
+        finally:
+            if os.path.exists(pidfile):
+                try:
+                    os.kill(int(open(pidfile).read()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
 if __name__ == "__main__":
     unittest.main()

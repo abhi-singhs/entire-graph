@@ -88,8 +88,10 @@ def clean(answer):
     for line in answer.splitlines():
         if line.startswith("VERIFY:"):
             block = "verify"; continue
-        if block == "verify" and (line.startswith("  ") or line.startswith("\t")):
-            continue
+        if block == "verify":
+            if line.startswith("  ") or line.startswith("\t"):
+                continue
+            block = None
         if not source:
             if block == "coverage" and line.startswith("- "):
                 continue
@@ -98,7 +100,7 @@ def clean(answer):
                 continue
             if line.startswith("Coverage: "):
                 block = "coverage"; continue
-        if re.match(r"^\d+\. ", line):
+        if re.match(r"^(?:\d+\. )?[^\n]+:\d+(?:-\d+)?(?:\s|$)", line):
             source = True
         keep.append(line)
     # Diagnostics without a source location do not establish useful context.
@@ -127,31 +129,35 @@ def safe_path_executable(name, env):
 
 
 def run_bounded(argv, **kwargs):
+    # Windows process-tree cleanup needs a Job Object. Until that is implemented,
+    # this experimental hook fails open before starting any graph process there.
+    if os.name == "nt":
+        raise OSError("prompt context hook currently requires a POSIX host")
     timeout = kwargs.pop("timeout")
     capture = kwargs.pop("capture_output", False)
     if capture:
         kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    process = subprocess.Popen(argv, start_new_session=os.name != "nt", **kwargs)
+    process = subprocess.Popen(argv, start_new_session=True, **kwargs)
     try:
         out, err = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        if os.name == "nt":
-            import ctypes
-            directory = ctypes.create_unicode_buffer(32768)
-            ctypes.windll.kernel32.GetSystemDirectoryW(directory, len(directory))
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.communicate(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            # A detached service can retain inherited descriptors after leaving
+            # our process group. Stop waiting on those pipes, then reap only our child.
+            if process.stdout:
+                process.stdout.close()
+            if process.stderr:
+                process.stderr.close()
             try:
-                subprocess.run([os.path.join(directory.value, "taskkill.exe"), "/T", "/F", "/PID", str(process.pid)],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-            except (OSError, subprocess.SubprocessError):
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
                 pass
-            if process.poll() is None:
-                process.kill()
-        else:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        process.communicate()
         raise
     return subprocess.CompletedProcess(argv, process.returncode, out, err)
 
@@ -226,11 +232,14 @@ def handle(stdin, stdout, env):
     if not query or query.startswith("/") or not session:
         return 0
     marker = once_marker(env, session)
-    if os.path.exists(marker):
+    try:
+        descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
         return 0
+    with os.fdopen(descriptor, "w") as initial:
+        json.dump({"probe": "pending"}, initial)
     # Mark first, so a slow or failing probe or search is never retried on later prompts of the same session.
     # The marker also caches the probe result for the session.
-    write_marker(marker, {"probe": "pending"})
     argv = graph_argv(dict(env, CLAUDE_PROJECT_DIR=repo))
     if not argv:
         write_marker(marker, {"probe": "absent"})
