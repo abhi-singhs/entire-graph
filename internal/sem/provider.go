@@ -27866,7 +27866,7 @@ func springAnnotationRouteLiteralsAroundSymbol(content string, symbol SymbolReco
 		current = strings.TrimSpace(lines[index])
 	}
 	if strings.HasPrefix(current, "@") {
-		collect(springAnnotationBlock(lines, index, minInt(len(lines)-1, index+8)))
+		collect(springAnnotationBlock(lines, index, minInt(len(lines)-1, index+annotationScanLines)))
 		for i := index + 1; i < len(lines) && i-index <= annotationScanLines; i++ {
 			line := strings.TrimSpace(lines[i])
 			if line == "" {
@@ -27875,7 +27875,7 @@ func springAnnotationRouteLiteralsAroundSymbol(content string, symbol SymbolReco
 			if !strings.HasPrefix(line, "@") {
 				break
 			}
-			collect(springAnnotationBlock(lines, i, minInt(len(lines)-1, index+8)))
+			collect(springAnnotationBlock(lines, i, minInt(len(lines)-1, index+annotationScanLines)))
 		}
 	}
 	for i := index - 1; i >= 0 && index-i <= annotationScanLines; i-- {
