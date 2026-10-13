@@ -1640,6 +1640,51 @@ func searchVerifyIsPytestConfig(name, content string) bool {
 			return true
 		}
 	}
+	return name == "tox.ini" && searchVerifyToxInvokesPytest(content)
+}
+
+var searchVerifyINIKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// A tox testenv command is invocation evidence even without a [pytest] section.
+// Dependency names, descriptions and commands in other sections are not.
+func searchVerifyToxInvokesPytest(content string) bool {
+	inTestenv, inCommands := false, false
+	for _, raw := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") {
+			inTestenv = line == "[testenv]" || (strings.HasPrefix(line, "[testenv:") && strings.HasSuffix(line, "]"))
+			inCommands = false
+			continue
+		}
+		if !inTestenv {
+			continue
+		}
+		if key, value, found := strings.Cut(line, "="); found && searchVerifyINIKey.MatchString(strings.TrimSpace(key)) {
+			inCommands = strings.TrimSpace(key) == "commands"
+			line = strings.TrimSpace(value)
+		} else if len(raw) == len(strings.TrimLeft(raw, " \t")) {
+			inCommands = false
+		}
+		if !inCommands || line == "" {
+			continue
+		}
+		if searchVerifyScriptInvokesRunner(line, "pytest") {
+			return true
+		}
+		statements, valid := searchVerifyShellStatements(line)
+		if !valid {
+			continue
+		}
+		for _, statement := range statements {
+			words, valid := searchVerifyShellWords(statement)
+			if valid && len(words) >= 3 && (words[0] == "python" || words[0] == "python3") && words[1] == "-m" && words[2] == "pytest" {
+				return true
+			}
+		}
+	}
 	return false
 }
 
