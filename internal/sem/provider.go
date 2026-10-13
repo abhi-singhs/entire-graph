@@ -27335,14 +27335,10 @@ func pythonRouteDecoratorsNearSymbol(content string, symbol SymbolRecord) []pyth
 	if symbol.StartLine <= 0 {
 		return nil
 	}
-	lines := strings.Split(content, "\n")
-	index := symbol.StartLine - 1
-	if index >= len(lines) {
-		index = len(lines) - 1
-	}
+	lines, index := splitLineWindow(content, symbol.StartLine-1, annotationScanLines)
 	seen := map[string]bool{}
 	var routes []pythonRouteDecorator
-	for i := index; i >= 0 && index-i <= 8; i-- {
+	for i := index; i >= 0 && index-i <= annotationScanLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
@@ -27660,12 +27656,100 @@ func nestJSMethodRouteLiteralsAroundSymbol(content string, symbol SymbolRecord) 
 	return nestJSRouteDecoratorLiteralsAroundSymbol(content, symbol, false)
 }
 
-func nestJSRouteDecoratorLiteralsAroundSymbol(content string, symbol SymbolRecord, controllerOnly bool) []string {
-	lines := strings.Split(content, "\n")
-	index := symbol.StartLine - 1
-	if index >= len(lines) {
-		index = len(lines) - 1
+// annotationScanLines is how far either side of a symbol's first line the
+// decorator, annotation and attribute scans (NestJS, Spring, C#, PHP, Python
+// routes) ever look. Every one of their loops is bounded by it.
+const annotationScanLines = 8
+
+// splitLineWindow returns the lines of content within radius of line index
+// (0-based) and index's position inside that window. It answers exactly what
+// strings.Split(content, "\n") would for those lines, including clamping an
+// index past the last line to the last line, without materialising the lines
+// it does not return.
+//
+// The annotation scans run once per symbol but only look a few lines either
+// side, and each used to split the whole file to do it, so a file with S
+// symbols and L lines cost S*L slice entries. Generated declaration files have
+// both in the tens of thousands: indexing @cloudflare/workers-types spent
+// 24.8 GB of its 38 GB of allocation in two of these splits. Finding the
+// window by scanning for newlines instead removed the allocation but kept the
+// S*L scan, so line starts are memoized per file content. The memo is bounded
+// (8 entries, round-robin), so the saving is amortized rather than exactly once
+// per file: eviction, or two workers missing on the same content at the same
+// time, recomputes them. Recomputing yields identical offsets, so output is
+// unaffected either way.
+func splitLineWindow(content string, index, radius int) ([]string, int) {
+	if index < 0 {
+		return nil, index
 	}
+	starts := recentLineStarts.lookup(content)
+	if index >= len(starts) {
+		index = len(starts) - 1
+	}
+	low := max(index-radius, 0)
+	high := min(index+radius, len(starts)-1)
+	window := make([]string, 0, high-low+1)
+	for line := low; line <= high; line++ {
+		end := len(content)
+		if line+1 < len(starts) {
+			end = starts[line+1] - 1
+		}
+		window = append(window, content[starts[line]:end])
+	}
+	return window, index - low
+}
+
+// lineStartsMemo remembers the line start offsets of the last few file
+// contents it was asked about. Every per-symbol scan of one file passes the
+// same content string, so a handful of entries covers the relation workers
+// running side by side. Entries hold their content, so an entry can only
+// match a string with identical bytes.
+//
+// All access to entries and next is under mu. The offsets are computed outside
+// the lock, so concurrent misses on one content each compute and insert their
+// own copy (a wasted scan and a duplicate entry, never a wrong answer). A
+// published starts slice is never written again, so callers share it
+// read-only without holding the lock.
+type lineStartsMemo struct {
+	mu      sync.Mutex
+	entries [8]lineStartsEntry
+	next    int
+}
+
+type lineStartsEntry struct {
+	content string
+	starts  []int
+}
+
+var recentLineStarts = &lineStartsMemo{}
+
+func (memo *lineStartsMemo) lookup(content string) []int {
+	memo.mu.Lock()
+	for _, entry := range memo.entries {
+		if entry.starts != nil && len(entry.content) == len(content) && entry.content == content {
+			memo.mu.Unlock()
+			return entry.starts
+		}
+	}
+	memo.mu.Unlock()
+	starts := make([]int, 1, strings.Count(content, "\n")+1)
+	for offset := 0; ; {
+		next := strings.IndexByte(content[offset:], '\n')
+		if next < 0 {
+			break
+		}
+		offset += next + 1
+		starts = append(starts, offset)
+	}
+	memo.mu.Lock()
+	memo.entries[memo.next] = lineStartsEntry{content: content, starts: starts}
+	memo.next = (memo.next + 1) % len(memo.entries)
+	memo.mu.Unlock()
+	return starts
+}
+
+func nestJSRouteDecoratorLiteralsAroundSymbol(content string, symbol SymbolRecord, controllerOnly bool) []string {
+	lines, index := splitLineWindow(content, symbol.StartLine-1, annotationScanLines)
 	seen := map[string]struct{}{}
 	collect := func(line string) {
 		for _, route := range nestJSRouteDecoratorLiterals(line, controllerOnly) {
@@ -27673,7 +27757,7 @@ func nestJSRouteDecoratorLiteralsAroundSymbol(content string, symbol SymbolRecor
 		}
 	}
 	if index >= 0 && index < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[index]), "@") {
-		for i := index; i < len(lines) && i-index <= 8; i++ {
+		for i := index; i < len(lines) && i-index <= annotationScanLines; i++ {
 			line := strings.TrimSpace(lines[i])
 			if line == "" {
 				continue
@@ -27684,7 +27768,7 @@ func nestJSRouteDecoratorLiteralsAroundSymbol(content string, symbol SymbolRecor
 			collect(line)
 		}
 	}
-	for i := index - 1; i >= 0 && index-i <= 8; i-- {
+	for i := index - 1; i >= 0 && index-i <= annotationScanLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
@@ -27699,9 +27783,14 @@ func nestJSRouteDecoratorLiteralsAroundSymbol(content string, symbol SymbolRecor
 
 var nestJSRouteDecoratorLiteralsDecoratorRe = regexp.MustCompile("(?i)@(?:[A-Za-z_$][A-Za-z0-9_$]*\\.)?(Controller|Get|Post|Put|Patch|Delete|Head|Options|All)\\s*(?:\\((.*)\\))?")
 
+var (
+	nestJSRouteDecoratorStringRe       = regexp.MustCompile(`^\s*(?:"([^"]*)"|'([^']*)'|` + "`" + `([^` + "`" + `]*)` + "`" + `)`)
+	nestJSRouteDecoratorPathPropertyRe = regexp.MustCompile(`(?i)\bpath\s*:\s*(?:"([^"]*)"|'([^']*)'|` + "`" + `([^` + "`" + `]*)` + "`" + `)`)
+)
+
 func nestJSRouteDecoratorLiterals(line string, controllerOnly bool) []string {
-	stringRe := regexp.MustCompile(`^\s*(?:"([^"]*)"|'([^']*)'|` + "`" + `([^` + "`" + `]*)` + "`" + `)`)
-	pathPropertyRe := regexp.MustCompile(`(?i)\bpath\s*:\s*(?:"([^"]*)"|'([^']*)'|` + "`" + `([^` + "`" + `]*)` + "`" + `)`)
+	stringRe := nestJSRouteDecoratorStringRe
+	pathPropertyRe := nestJSRouteDecoratorPathPropertyRe
 	var routes []string
 	for _, match := range nestJSRouteDecoratorLiteralsDecoratorRe.FindAllStringSubmatch(line, -1) {
 		if len(match) != 3 {
@@ -27746,11 +27835,7 @@ var (
 // (`@MessagePattern({ cmd: 'sum' })`) are recognized. Non-literal patterns
 // (identifiers/enums) are skipped since they cannot be resolved statically.
 func nestJSMessagePatternChannelsAroundSymbol(content string, symbol SymbolRecord) []string {
-	lines := strings.Split(content, "\n")
-	index := symbol.StartLine - 1
-	if index >= len(lines) {
-		index = len(lines) - 1
-	}
+	lines, index := splitLineWindow(content, symbol.StartLine-1, annotationScanLines)
 	seen := map[string]struct{}{}
 	collect := func(line string) {
 		for _, channel := range nestJSMessagePatternChannels(line) {
@@ -27758,7 +27843,7 @@ func nestJSMessagePatternChannelsAroundSymbol(content string, symbol SymbolRecor
 		}
 	}
 	if index >= 0 && index < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[index]), "@") {
-		for i := index; i < len(lines) && i-index <= 8; i++ {
+		for i := index; i < len(lines) && i-index <= annotationScanLines; i++ {
 			line := strings.TrimSpace(lines[i])
 			if line == "" {
 				continue
@@ -27769,7 +27854,7 @@ func nestJSMessagePatternChannelsAroundSymbol(content string, symbol SymbolRecor
 			collect(line)
 		}
 	}
-	for i := index - 1; i >= 0 && index-i <= 8; i-- {
+	for i := index - 1; i >= 0 && index-i <= annotationScanLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
@@ -27819,13 +27904,9 @@ func annotationRouteLiteralsNearSymbol(content string, symbol SymbolRecord, spri
 	if springOnly {
 		return springAnnotationRouteLiteralsAroundSymbol(content, symbol)
 	}
-	lines := strings.Split(content, "\n")
-	index := symbol.StartLine - 1
-	if index >= len(lines) {
-		index = len(lines) - 1
-	}
+	lines, index := splitLineWindow(content, symbol.StartLine-1, annotationScanLines)
 	seen := map[string]struct{}{}
-	for i := index; i >= 0 && index-i <= 8; i-- {
+	for i := index; i >= 0 && index-i <= annotationScanLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
@@ -27844,11 +27925,7 @@ func annotationRouteLiteralsNearSymbol(content string, symbol SymbolRecord, spri
 }
 
 func springAnnotationRouteLiteralsAroundSymbol(content string, symbol SymbolRecord) []string {
-	lines := strings.Split(content, "\n")
-	index := symbol.StartLine - 1
-	if index >= len(lines) {
-		index = len(lines) - 1
-	}
+	lines, index := splitLineWindow(content, symbol.StartLine-1, annotationScanLines)
 	seen := map[string]struct{}{}
 	collect := func(block string) {
 		if !springRouteAnnotationLine(block) {
@@ -27863,8 +27940,8 @@ func springAnnotationRouteLiteralsAroundSymbol(content string, symbol SymbolReco
 		current = strings.TrimSpace(lines[index])
 	}
 	if strings.HasPrefix(current, "@") {
-		collect(springAnnotationBlock(lines, index, minInt(len(lines)-1, index+8)))
-		for i := index + 1; i < len(lines) && i-index <= 8; i++ {
+		collect(springAnnotationBlock(lines, index, minInt(len(lines)-1, index+annotationScanLines)))
+		for i := index + 1; i < len(lines) && i-index <= annotationScanLines; i++ {
 			line := strings.TrimSpace(lines[i])
 			if line == "" {
 				continue
@@ -27872,10 +27949,10 @@ func springAnnotationRouteLiteralsAroundSymbol(content string, symbol SymbolReco
 			if !strings.HasPrefix(line, "@") {
 				break
 			}
-			collect(springAnnotationBlock(lines, i, minInt(len(lines)-1, index+8)))
+			collect(springAnnotationBlock(lines, i, minInt(len(lines)-1, index+annotationScanLines)))
 		}
 	}
-	for i := index - 1; i >= 0 && index-i <= 8; i-- {
+	for i := index - 1; i >= 0 && index-i <= annotationScanLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
@@ -27957,14 +28034,10 @@ func springRouteAnnotationLine(line string) bool {
 }
 
 func csharpRouteAnnotationLiteralsAroundSymbol(content string, symbol SymbolRecord, tokens map[string]string) []string {
-	lines := strings.Split(content, "\n")
-	index := symbol.StartLine - 1
-	if index >= len(lines) {
-		index = len(lines) - 1
-	}
+	lines, index := splitLineWindow(content, symbol.StartLine-1, annotationScanLines)
 	seen := map[string]struct{}{}
 	if index >= 0 && index < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[index]), "[") {
-		for i := index; i < len(lines) && i-index <= 8; i++ {
+		for i := index; i < len(lines) && i-index <= annotationScanLines; i++ {
 			line := strings.TrimSpace(lines[i])
 			if line == "" {
 				continue
@@ -27977,7 +28050,7 @@ func csharpRouteAnnotationLiteralsAroundSymbol(content string, symbol SymbolReco
 			}
 		}
 	}
-	for i := index - 1; i >= 0 && index-i <= 8; i-- {
+	for i := index - 1; i >= 0 && index-i <= annotationScanLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
@@ -28045,14 +28118,10 @@ func csharpControllerRouteToken(name string) string {
 }
 
 func phpRouteAttributeLiteralsAroundSymbol(content string, symbol SymbolRecord) []string {
-	lines := strings.Split(content, "\n")
-	index := symbol.StartLine - 1
-	if index >= len(lines) {
-		index = len(lines) - 1
-	}
+	lines, index := splitLineWindow(content, symbol.StartLine-1, annotationScanLines)
 	seen := map[string]struct{}{}
 	if index >= 0 && index < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[index]), "#[") {
-		for i := index; i < len(lines) && i-index <= 8; i++ {
+		for i := index; i < len(lines) && i-index <= annotationScanLines; i++ {
 			line := strings.TrimSpace(lines[i])
 			if line == "" {
 				continue
@@ -28065,7 +28134,7 @@ func phpRouteAttributeLiteralsAroundSymbol(content string, symbol SymbolRecord) 
 			}
 		}
 	}
-	for i := index - 1; i >= 0 && index-i <= 8; i-- {
+	for i := index - 1; i >= 0 && index-i <= annotationScanLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
