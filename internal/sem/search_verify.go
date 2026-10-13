@@ -2285,12 +2285,14 @@ func searchVerifyTomlPackageName(content string) (string, bool) {
 // the covering test when there is one. The `-run` pattern is anchored: an unanchored name also runs
 // every test whose name contains it.
 func deriveSearchVerifyGo(dir string, subject searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
-	// The selected covering test determines the narrow command's language. A
-	// Python integration test of Go code is not a Go package; let its own runner
-	// handle it, or let the suite tier fall back to the Go source's module.
-	targetPath := subject.testPath
-	if targetPath == "" {
-		targetPath = subject.sourcePath
+	// A covering test determines the language only when this module can target it.
+	// An outside test is ignored by the package selector below, so it must not
+	// suppress a narrow command for the edited Go package.
+	targetPath := subject.sourcePath
+	if subject.testPath != "" {
+		if _, inside := searchVerifyRelative(dir, subject.testPath); inside {
+			targetPath = subject.testPath
+		}
 	}
 	if !searchVerifyGoApplies(targetPath, evidence) {
 		return nil
