@@ -102,6 +102,8 @@ func TestACompleteSymbolOnlyMarksAnUnabbreviatedBody(t *testing.T) {
 	}
 }
 
+// Unmarked fallback follows the merged renderer's header-tier priority.
+// The separate marked pass still certifies only the unchanged whole body.
 func TestCompleteSymbolRetainsSourceAtIndependentWireThresholds(t *testing.T) {
 	t.Parallel()
 	const body = "func RetryBudgetExhausted(attempt, budget int) bool {\n\t// α: preserve the available retry count.\n\tremaining := budget - attempt\n\tif remaining <= 0 {\n\t\treturn true\n\t}\n\treturn false\n}"
@@ -113,8 +115,8 @@ func TestCompleteSymbolRetainsSourceAtIndependentWireThresholds(t *testing.T) {
 		budget int
 		want   string
 	}{
-		{77, "retry.go:12 *\n\tremaining := budget - attempt\n\tif remaining <= 0 {\n"},
-		{231, "1. retry.go:10-17 RetryBudgetExhausted s=29.2 *\n" + body + "\n"},
+		{77, "1. retry.go:12 RetryBudgetExhausted s=29.2 *\n\tremaining := budget - attempt\n"},
+		{231, "1. retry.go:11-17 RetryBudgetExhausted s=29.2 [focus:12]\n" + strings.Join(strings.Split(body, "\n")[1:], "\n") + "\n"},
 		{241, "1. retry.go:10-17 RetryBudgetExhausted s=29.2 [focus:12]\n" + body + "\n"},
 		{242, "1. retry.go:10-17 RetryBudgetExhausted [complete] s=29.2 *\n" + body + "\n"},
 		{251, "1. retry.go:10-17 RetryBudgetExhausted [complete] s=29.2 [focus:12]\n" + body + "\n"},
