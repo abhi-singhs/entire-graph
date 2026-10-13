@@ -252,6 +252,10 @@ func resolveGoRouteReceiversWithBudget(content string, constants map[string]stri
 		imports:    goRouteImports(file),
 	}
 	receivers.masks = resolver.maskSpans()
+	if resolver.steps > resolver.budget {
+		receivers.exhausted = true
+		return receivers
+	}
 	if !resolver.resolve() {
 		receivers.exhausted = true
 		return receivers
