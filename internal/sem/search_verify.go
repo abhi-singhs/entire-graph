@@ -1667,7 +1667,8 @@ func searchVerifyToxInvokesPytest(content string) bool {
 		if inCommands && indent > commandsIndent {
 			// More-indented lines continue the current INI value, including '='.
 		} else if key, value, found := strings.Cut(line, "="); found && searchVerifyINIKey.MatchString(strings.TrimSpace(key)) {
-			inCommands = strings.TrimSpace(key) == "commands"
+			option := strings.TrimSpace(key)
+			inCommands = option == "commands" || option == "commands_pre" || option == "commands_post"
 			commandsIndent = indent
 			line = strings.TrimSpace(value)
 		} else {
