@@ -1634,9 +1634,56 @@ func searchVerifyHasSection(content, heading string) bool {
 	return false
 }
 
-func searchVerifyPytestConfigDeclaresRunner(file, content string) bool {
-	for _, section := range searchVerifyPytestSections[path.Base(file)] {
+func searchVerifyIsPytestConfig(name, content string) bool {
+	for _, section := range searchVerifyPytestSections[name] {
 		if searchVerifyHasSection(content, section) {
+			return true
+		}
+	}
+	return name == "tox.ini" && searchVerifyToxInvokesPytest(content)
+}
+
+var searchVerifyINIKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// A tox testenv command is invocation evidence even without a [pytest] section.
+// Dependency names, descriptions and commands in other sections are not.
+func searchVerifyToxInvokesPytest(content string) bool {
+	inTestenv, inCommands := false, false
+	commandsIndent := 0
+	for _, raw := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") {
+			inTestenv = line == "[testenv]" || (strings.HasPrefix(line, "[testenv:") && strings.HasSuffix(line, "]"))
+			inCommands = false
+			continue
+		}
+		if !inTestenv {
+			continue
+		}
+		indent := len(raw) - len(strings.TrimLeft(raw, " \t"))
+		if inCommands && indent > commandsIndent {
+			// More-indented lines continue the current INI value, including '='.
+		} else if key, value, found := strings.Cut(line, "="); found && searchVerifyINIKey.MatchString(strings.TrimSpace(key)) {
+			option := strings.TrimSpace(key)
+			inCommands = option == "commands" || option == "commands_pre" || option == "commands_post"
+			commandsIndent = indent
+			line = strings.TrimSpace(value)
+		} else {
+			inCommands = false
+		}
+		if !inCommands || line == "" {
+			continue
+		}
+		// tox executes argv, not an implicit shell: 'echo x && pytest' and
+		// 'ENV=value pytest' do not invoke pytest. Never apply Node shell rules.
+		words, valid := searchVerifyShellWords(line)
+		if !valid || len(words) == 0 {
+			continue
+		}
+		if words[0] == "pytest" || (len(words) >= 3 && (words[0] == "python" || words[0] == "python3") && words[1] == "-m" && words[2] == "pytest") {
 			return true
 		}
 	}
@@ -1660,10 +1707,8 @@ func deriveSearchVerifySuitePytest(dir string, evidence *searchVerifyEvidence) *
 		// often still works. Not always: where pytest is merely named and not installed, the
 		// derived VERIFY fails with "No module named pytest", and the agent is told to treat a
 		// failure as its own code's fault.
-		for _, section := range searchVerifyPytestSections[name] {
-			if searchVerifyHasSection(content, section) {
-				return searchVerifySuiteCommand(dir, "python -m pytest", candidate+" pytest config")
-			}
+		if searchVerifyIsPytestConfig(name, content) {
+			return searchVerifySuiteCommand(dir, "python -m pytest", candidate+" pytest config")
 		}
 	}
 	return nil
@@ -2636,13 +2681,85 @@ func searchVerifyShellStatements(script string) ([]string, bool) {
 //
 // A runner counts when it is the HEAD of a statement, after environment assignments and the
 // usual wrappers are stepped over. Anything else -- a flag value, a path, prose -- does not.
+// searchVerifyShellWords preserves shell word boundaries through quoting and escapes.
+// It does not evaluate expansions; a quoted environment value cannot become a command.
+func searchVerifyShellWords(statement string) ([]string, bool) {
+	var words []string
+	var word strings.Builder
+	var quote byte
+	active := false
+	flush := func() {
+		if active {
+			words = append(words, word.String())
+			word.Reset()
+			active = false
+		}
+	}
+	for i := 0; i < len(statement); i++ {
+		c := statement[i]
+		if quote != 0 {
+			if c == quote {
+				// Keep substitutions opaque: `jest` is not a literal command name.
+				if quote == '`' {
+					word.WriteByte(c)
+				}
+				quote = 0
+				continue
+			}
+			if c == '\\' && (quote == '"' || quote == '`') && i+1 < len(statement) {
+				next := statement[i+1]
+				if strings.ContainsRune("\\$`\"\n", rune(next)) {
+					i++
+					if next != '\n' {
+						word.WriteByte(next)
+					}
+					continue
+				}
+			}
+			word.WriteByte(c)
+			continue
+		}
+		switch c {
+		case ' ', '\t', '\r', '\n':
+			flush()
+		case '`':
+			quote = c
+			word.WriteByte(c)
+			active = true
+		case '\'', '"':
+			quote = c
+			active = true
+		case '\\':
+			if i+1 >= len(statement) {
+				return nil, false
+			}
+			i++
+			if statement[i] != '\n' {
+				word.WriteByte(statement[i])
+				active = true
+			}
+		default:
+			word.WriteByte(c)
+			active = true
+		}
+	}
+	if quote != 0 {
+		return nil, false
+	}
+	flush()
+	return words, true
+}
+
 func searchVerifyScriptInvokesRunner(script, runner string) bool {
 	statements, parsed := searchVerifyShellStatements(script)
 	if !parsed {
 		return false // a form we do not model: fail closed rather than guess
 	}
 	for _, statement := range statements {
-		fields := strings.Fields(statement)
+		fields, valid := searchVerifyShellWords(statement)
+		if !valid {
+			continue
+		}
 		index := 0
 		// Assignments and wrappers INTERLEAVE and must be consumed in one loop, not in two
 		// passes: `cross-env NODE_ENV=test jest` puts a wrapper before the assignment, and a
@@ -2668,6 +2785,9 @@ func searchVerifyScriptInvokesRunner(script, runner string) bool {
 				for index < len(fields) && (fields[index] == "-s" || fields[index] == "--silent") {
 					index++
 				}
+				continue
+			case "bunx":
+				index++
 				continue
 			case "npx":
 				// npx has options of its own -- moving it in with the environment wrappers
@@ -2775,7 +2895,7 @@ func deriveSearchVerifyPytest(dir string, subject searchVerifySubject, evidence 
 		if !ok {
 			continue
 		}
-		if !searchVerifyPytestConfigDeclaresRunner(candidate, content) {
+		if !searchVerifyIsPytestConfig(name, content) {
 			continue
 		}
 		config = candidate
