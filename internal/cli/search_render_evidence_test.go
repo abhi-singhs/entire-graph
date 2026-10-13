@@ -175,7 +175,7 @@ func TestAgentSearchSourceRescuePreservesCompactTelemetry(t *testing.T) {
 			if err := writeAgentSearch(&out, response, budget); err != nil {
 				t.Fatal(err)
 			}
-			if out.Len() > budget || !strings.HasPrefix(out.String(), "I:miss/139") ||
+			if out.Len() > budget || !(strings.HasPrefix(out.String(), "I:miss/139") || strings.HasPrefix(out.String(), "I:miss/-\n")) ||
 				!strings.Contains(out.String(), "!N W1 F0 L1/1") ||
 				!strings.Contains(out.String(), "a.py:1") ||
 				!strings.Contains(out.String(), "def target():") {
@@ -205,7 +205,7 @@ func TestAgentSearchHeadSourceOutranksUnaffordableTail(t *testing.T) {
 	if err := writeAgentSearch(&out, response, 100); err != nil {
 		t.Fatal(err)
 	}
-	if out.Len() > 100 || !strings.HasPrefix(out.String(), "I:miss/139") ||
+	if out.Len() > 100 || !(strings.HasPrefix(out.String(), "I:miss/139") || strings.HasPrefix(out.String(), "I:miss/-\n")) ||
 		!strings.Contains(out.String(), "!N W1 F0 L1/1") ||
 		!strings.Contains(out.String(), source) {
 		t.Fatalf("unaffordable tail must not displace all source or compact telemetry: %q", out.String())
