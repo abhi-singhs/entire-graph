@@ -633,7 +633,7 @@ func searchVerifySuiteCommandLiteral(command, derived string) *SearchVerifyComma
 // A covering test can establish the ecosystem for native or generated sources.
 func searchVerifySuiteApplies(subject searchVerifySubject, ecosystem string) bool {
 	extensions := map[string]string{
-		"Cargo": ".rs .c .cc .cpp .h", "Maven": ".java .kt .scala .groovy", "Gradle": ".java .kt .kts .scala .groovy",
+		"Cargo": ".rs .c .cc .cpp .h .hh .hpp .hxx", "Maven": ".java .kt .scala .groovy", "Gradle": ".java .kt .kts .scala .groovy",
 		"Node": ".js .jsx .mjs .cjs .ts .tsx .mts .cts .vue .svelte", "Composer": ".php", "Pytest": ".py .pyw",
 		"Ruby": ".rb", "CMake": ".c .cc .cpp .cxx .h .hh .hpp .hxx .m .mm",
 	}

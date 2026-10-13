@@ -15,3 +15,17 @@ func TestSuiteSubjectCannotBeCapturedByUnrelatedManifest(t *testing.T) {
 		t.Fatal("covering test not recognized")
 	}
 }
+
+func TestCargoSuiteRecognizesNativeBridgeHeaders(t *testing.T) {
+	for _, extension := range []string{".hh", ".hpp", ".hxx"} {
+		t.Run(extension, func(t *testing.T) {
+			evidence := searchVerifyTestEvidenceWithout(map[string]string{
+				"Cargo.toml": "[package]\nname = \"native_bridge\"\nversion = \"0.1.0\"\n",
+			})
+			command := deriveSearchVerifySuiteCommand(searchVerifySubject{sourcePath: "include/bridge" + extension}, &evidence)
+			if command == nil || command.Command != "cargo test" {
+				t.Fatalf("Cargo-only native bridge header: command = %+v, want cargo test", command)
+			}
+		})
+	}
+}
