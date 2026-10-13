@@ -14294,6 +14294,10 @@ func readGitDirPointerFromOpened(file *os.File, observedSize int64) (string, boo
 type gitDirExcluder struct {
 	repo    string
 	targets map[string]struct{}
+	// nestedWorktrees records validated pointer owners separately from their
+	// metadata targets: only the fallback's untracked-directory decision may
+	// prune their source, never the unconditional metadata exclusion rule.
+	nestedWorktrees map[string]struct{}
 	// gitDirRoot records the special target whose git directory and worktree
 	// share the repository root. Variable Git-owned names are then recognized
 	// directly by excluded, avoiding an unbounded root ReadDir merely to find a
@@ -14856,6 +14860,7 @@ func (g *gitDirExcluder) observe(dir string) {
 		}
 	case ok && hasGitDirStructureWithBudget(filepath.Join(g.repo, filepath.FromSlash(target)), g.admitPointerRead) != gitDirStructureAbsent:
 		g.addTarget(target)
+		g.noteNestedWorkingTree(dir)
 	}
 	switch target, ok, hidden := gitDirLinkTarget(g.repo, dir); {
 	case hidden:
@@ -14863,6 +14868,7 @@ func (g *gitDirExcluder) observe(dir string) {
 		g.noteUnreadablePointer(dir)
 	case ok && hasGitDirStructureWithBudget(filepath.Join(g.repo, filepath.FromSlash(target)), g.admitPointerRead) != gitDirStructureAbsent:
 		g.addTarget(target)
+		g.noteNestedWorkingTree(dir)
 	}
 	if dir == "" {
 		return
@@ -14878,6 +14884,29 @@ func (g *gitDirExcluder) observe(dir string) {
 	if foldedGitDirName(g.repo, dir) {
 		g.addTarget(filepath.ToSlash(dir))
 	}
+}
+
+func (g *gitDirExcluder) noteNestedWorkingTree(dir string) {
+	if dir == "" {
+		return
+	}
+	if g.nestedWorktrees == nil {
+		g.nestedWorktrees = map[string]struct{}{}
+	}
+	g.nestedWorktrees[dir] = struct{}{}
+}
+
+// nestedWorkingTree is asked only after observe. Gitfiles and directory links
+// reuse its confined, same-volume target validation. An ordinary .git directory
+// must pass the standalone structure test; a name or bogus gitfile is not enough
+// to hide the source beside it. Do not resolve a fresh redirect here.
+func (g *gitDirExcluder) nestedWorkingTree(dir string) bool {
+	if _, ok := g.nestedWorktrees[dir]; ok {
+		return true
+	}
+	marker := filepath.Join(g.repo, filepath.FromSlash(dir), ".git")
+	info, err := lstatSameVolumePath(g.repo, marker)
+	return err == nil && info.IsDir() && !pathMayRedirect(info) && looksLikeGitDirWithBudget(marker, g.admitPointerRead)
 }
 
 // foldedGitDirName reports whether dir's last component is a differently-cased
@@ -18988,9 +19017,10 @@ func walkWorktreeFilesAfterGitFailure(
 	ignores ignoreMatcher,
 	dirTracked func(string) bool,
 	ledger *repoIgnoreLedger,
+	hasGitIndex bool,
 	cause error,
 ) ([]string, []ProviderWarning, error) {
-	paths, warnings, err := walkWorktreeFiles(ctx, repo, ignores, dirTracked, ledger)
+	paths, warnings, err := walkWorktreeFilesWithGitScope(ctx, repo, ignores, dirTracked, ledger, hasGitIndex)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -19101,7 +19131,7 @@ func worktreeSourceFilesWithLister(
 		// directory as potentially tracked so unsafe metadata cannot cause source
 		// omissions, and the warning reports the Git-only policy that is unavailable.
 		dirTracked := func(string) bool { return true }
-		return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, err)
+		return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, false, err)
 	}
 	trackedDirs, trackedErr := trackedDirSet(ctx, repo)
 	if trackedErr != nil {
@@ -19110,7 +19140,7 @@ func worktreeSourceFilesWithLister(
 		}
 		if repositoryHasGitMetadata(repo) {
 			dirTracked := func(string) bool { return true }
-			return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, trackedErr)
+			return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, false, trackedErr)
 		}
 		dirTracked := func(string) bool { return false }
 		return walkWorktreeFiles(ctx, repo, ignores, dirTracked, ledger)
@@ -19123,7 +19153,7 @@ func worktreeSourceFilesWithLister(
 		if errors.Is(err, errGitWorktreeFallbackUnsafe) {
 			return nil, nil, err
 		}
-		return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, err)
+		return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, true, err)
 	}
 	listed, err := listWorktreeFiles(ctx, repo)
 	if err != nil {
@@ -19135,7 +19165,7 @@ func worktreeSourceFilesWithLister(
 			return nil, nil, fmt.Errorf("list Git worktree paths: %w", err)
 		}
 		if repositoryHasGitMetadata(repo) {
-			return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, err)
+			return walkWorktreeFilesAfterGitFailure(ctx, repo, ignores, dirTracked, ledger, true, err)
 		}
 		return walkWorktreeFiles(ctx, repo, ignores, dirTracked, ledger)
 	}
@@ -19480,6 +19510,13 @@ func listingOrderKey(entry fs.DirEntry) string {
 // narrower test, and not every ignored path, is what this mode can disclose
 // honestly.
 func walkWorktreeFiles(ctx context.Context, repo string, ignores ignoreMatcher, dirTracked func(string) bool, ledger *repoIgnoreLedger) ([]string, []ProviderWarning, error) {
+	return walkWorktreeFilesWithGitScope(ctx, repo, ignores, dirTracked, ledger, false)
+}
+
+// hasGitIndex licenses preserving the outer Git repository's nested boundaries.
+// A non-Git workspace may intentionally contain multiple independent projects;
+// its dirTracked=false also drives vendor policy, not proof of outer ownership.
+func walkWorktreeFilesWithGitScope(ctx context.Context, repo string, ignores ignoreMatcher, dirTracked func(string) bool, ledger *repoIgnoreLedger, hasGitIndex bool) ([]string, []ProviderWarning, error) {
 	// Every filesystem fallback enters through here, including paths selected
 	// before Git's index listing succeeds. Require the same complete held-root
 	// safety proof so an earlier Git failure cannot bypass mount detection.
@@ -19487,7 +19524,7 @@ func walkWorktreeFiles(ctx context.Context, repo string, ignores ignoreMatcher, 
 		return nil, nil, err
 	}
 	var paths []string
-	warnings, err := visitWalkWorktreeFiles(ctx, repo, ignores, dirTracked, ledger, func(rel string) bool {
+	warnings, err := visitWalkWorktreeFiles(ctx, repo, ignores, dirTracked, ledger, hasGitIndex, func(rel string) bool {
 		paths = append(paths, rel)
 		return true
 	})
@@ -19504,9 +19541,10 @@ func visitWalkWorktreeFiles(
 	ignores ignoreMatcher,
 	dirTracked func(string) bool,
 	ledger *repoIgnoreLedger,
+	hasGitIndex bool,
 	visit func(string) bool,
 ) ([]ProviderWarning, error) {
-	return visitWalkWorktreeFilesWithRawLimit(ctx, repo, ignores, dirTracked, ledger, 0, visit)
+	return visitWalkWorktreeFilesWithRawLimit(ctx, repo, ignores, dirTracked, ledger, hasGitIndex, 0, visit)
 }
 
 var errWorktreeRawPathLimit = errors.New("filesystem worktree raw path limit exceeded")
@@ -19576,6 +19614,7 @@ func visitWalkWorktreeFilesWithRawLimit(
 	ignores ignoreMatcher,
 	dirTracked func(string) bool,
 	ledger *repoIgnoreLedger,
+	hasGitIndex bool,
 	rawPathLimit int,
 	visit func(string) bool,
 ) ([]ProviderWarning, error) {
@@ -19681,6 +19720,16 @@ func visitWalkWorktreeFilesWithRawLimit(
 				// `gitdir: ../../.dep-git` names a root-level directory that is
 				// indexed, and whose damaged HEAD puts it out of every other
 				// rule's reach. Read the directories, then stop.
+				gitDirs.observePrunedSubtree(rel)
+				frames = frames[:len(frames)-1]
+				continue
+			}
+			if hasGitIndex && rel != "" && dirTracked != nil && !dirTracked(rel) && gitDirs.nestedWorkingTree(rel) {
+				// Preflight deliberately refuses Git enumeration on nested markers.
+				// Preserve Git's source boundary on this fallback without changing
+				// the metadata guards or letting a prune conceal another pointer.
+				// Unknown-index fallbacks use dirTracked=true, conservatively keeping
+				// source that the outer repository might own below this boundary.
 				gitDirs.observePrunedSubtree(rel)
 				frames = frames[:len(frames)-1]
 				continue
@@ -27335,14 +27384,10 @@ func pythonRouteDecoratorsNearSymbol(content string, symbol SymbolRecord) []pyth
 	if symbol.StartLine <= 0 {
 		return nil
 	}
-	lines := strings.Split(content, "\n")
-	index := symbol.StartLine - 1
-	if index >= len(lines) {
-		index = len(lines) - 1
-	}
+	lines, index := splitLineWindow(content, symbol.StartLine-1, annotationScanLines)
 	seen := map[string]bool{}
 	var routes []pythonRouteDecorator
-	for i := index; i >= 0 && index-i <= 8; i-- {
+	for i := index; i >= 0 && index-i <= annotationScanLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
@@ -27660,12 +27705,100 @@ func nestJSMethodRouteLiteralsAroundSymbol(content string, symbol SymbolRecord) 
 	return nestJSRouteDecoratorLiteralsAroundSymbol(content, symbol, false)
 }
 
-func nestJSRouteDecoratorLiteralsAroundSymbol(content string, symbol SymbolRecord, controllerOnly bool) []string {
-	lines := strings.Split(content, "\n")
-	index := symbol.StartLine - 1
-	if index >= len(lines) {
-		index = len(lines) - 1
+// annotationScanLines is how far either side of a symbol's first line the
+// decorator, annotation and attribute scans (NestJS, Spring, C#, PHP, Python
+// routes) ever look. Every one of their loops is bounded by it.
+const annotationScanLines = 8
+
+// splitLineWindow returns the lines of content within radius of line index
+// (0-based) and index's position inside that window. It answers exactly what
+// strings.Split(content, "\n") would for those lines, including clamping an
+// index past the last line to the last line, without materialising the lines
+// it does not return.
+//
+// The annotation scans run once per symbol but only look a few lines either
+// side, and each used to split the whole file to do it, so a file with S
+// symbols and L lines cost S*L slice entries. Generated declaration files have
+// both in the tens of thousands: indexing @cloudflare/workers-types spent
+// 24.8 GB of its 38 GB of allocation in two of these splits. Finding the
+// window by scanning for newlines instead removed the allocation but kept the
+// S*L scan, so line starts are memoized per file content. The memo is bounded
+// (8 entries, round-robin), so the saving is amortized rather than exactly once
+// per file: eviction, or two workers missing on the same content at the same
+// time, recomputes them. Recomputing yields identical offsets, so output is
+// unaffected either way.
+func splitLineWindow(content string, index, radius int) ([]string, int) {
+	if index < 0 {
+		return nil, index
 	}
+	starts := recentLineStarts.lookup(content)
+	if index >= len(starts) {
+		index = len(starts) - 1
+	}
+	low := max(index-radius, 0)
+	high := min(index+radius, len(starts)-1)
+	window := make([]string, 0, high-low+1)
+	for line := low; line <= high; line++ {
+		end := len(content)
+		if line+1 < len(starts) {
+			end = starts[line+1] - 1
+		}
+		window = append(window, content[starts[line]:end])
+	}
+	return window, index - low
+}
+
+// lineStartsMemo remembers the line start offsets of the last few file
+// contents it was asked about. Every per-symbol scan of one file passes the
+// same content string, so a handful of entries covers the relation workers
+// running side by side. Entries hold their content, so an entry can only
+// match a string with identical bytes.
+//
+// All access to entries and next is under mu. The offsets are computed outside
+// the lock, so concurrent misses on one content each compute and insert their
+// own copy (a wasted scan and a duplicate entry, never a wrong answer). A
+// published starts slice is never written again, so callers share it
+// read-only without holding the lock.
+type lineStartsMemo struct {
+	mu      sync.Mutex
+	entries [8]lineStartsEntry
+	next    int
+}
+
+type lineStartsEntry struct {
+	content string
+	starts  []int
+}
+
+var recentLineStarts = &lineStartsMemo{}
+
+func (memo *lineStartsMemo) lookup(content string) []int {
+	memo.mu.Lock()
+	for _, entry := range memo.entries {
+		if entry.starts != nil && len(entry.content) == len(content) && entry.content == content {
+			memo.mu.Unlock()
+			return entry.starts
+		}
+	}
+	memo.mu.Unlock()
+	starts := make([]int, 1, strings.Count(content, "\n")+1)
+	for offset := 0; ; {
+		next := strings.IndexByte(content[offset:], '\n')
+		if next < 0 {
+			break
+		}
+		offset += next + 1
+		starts = append(starts, offset)
+	}
+	memo.mu.Lock()
+	memo.entries[memo.next] = lineStartsEntry{content: content, starts: starts}
+	memo.next = (memo.next + 1) % len(memo.entries)
+	memo.mu.Unlock()
+	return starts
+}
+
+func nestJSRouteDecoratorLiteralsAroundSymbol(content string, symbol SymbolRecord, controllerOnly bool) []string {
+	lines, index := splitLineWindow(content, symbol.StartLine-1, annotationScanLines)
 	seen := map[string]struct{}{}
 	collect := func(line string) {
 		for _, route := range nestJSRouteDecoratorLiterals(line, controllerOnly) {
@@ -27673,7 +27806,7 @@ func nestJSRouteDecoratorLiteralsAroundSymbol(content string, symbol SymbolRecor
 		}
 	}
 	if index >= 0 && index < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[index]), "@") {
-		for i := index; i < len(lines) && i-index <= 8; i++ {
+		for i := index; i < len(lines) && i-index <= annotationScanLines; i++ {
 			line := strings.TrimSpace(lines[i])
 			if line == "" {
 				continue
@@ -27684,7 +27817,7 @@ func nestJSRouteDecoratorLiteralsAroundSymbol(content string, symbol SymbolRecor
 			collect(line)
 		}
 	}
-	for i := index - 1; i >= 0 && index-i <= 8; i-- {
+	for i := index - 1; i >= 0 && index-i <= annotationScanLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
@@ -27699,9 +27832,14 @@ func nestJSRouteDecoratorLiteralsAroundSymbol(content string, symbol SymbolRecor
 
 var nestJSRouteDecoratorLiteralsDecoratorRe = regexp.MustCompile("(?i)@(?:[A-Za-z_$][A-Za-z0-9_$]*\\.)?(Controller|Get|Post|Put|Patch|Delete|Head|Options|All)\\s*(?:\\((.*)\\))?")
 
+var (
+	nestJSRouteDecoratorStringRe       = regexp.MustCompile(`^\s*(?:"([^"]*)"|'([^']*)'|` + "`" + `([^` + "`" + `]*)` + "`" + `)`)
+	nestJSRouteDecoratorPathPropertyRe = regexp.MustCompile(`(?i)\bpath\s*:\s*(?:"([^"]*)"|'([^']*)'|` + "`" + `([^` + "`" + `]*)` + "`" + `)`)
+)
+
 func nestJSRouteDecoratorLiterals(line string, controllerOnly bool) []string {
-	stringRe := regexp.MustCompile(`^\s*(?:"([^"]*)"|'([^']*)'|` + "`" + `([^` + "`" + `]*)` + "`" + `)`)
-	pathPropertyRe := regexp.MustCompile(`(?i)\bpath\s*:\s*(?:"([^"]*)"|'([^']*)'|` + "`" + `([^` + "`" + `]*)` + "`" + `)`)
+	stringRe := nestJSRouteDecoratorStringRe
+	pathPropertyRe := nestJSRouteDecoratorPathPropertyRe
 	var routes []string
 	for _, match := range nestJSRouteDecoratorLiteralsDecoratorRe.FindAllStringSubmatch(line, -1) {
 		if len(match) != 3 {
@@ -27746,11 +27884,7 @@ var (
 // (`@MessagePattern({ cmd: 'sum' })`) are recognized. Non-literal patterns
 // (identifiers/enums) are skipped since they cannot be resolved statically.
 func nestJSMessagePatternChannelsAroundSymbol(content string, symbol SymbolRecord) []string {
-	lines := strings.Split(content, "\n")
-	index := symbol.StartLine - 1
-	if index >= len(lines) {
-		index = len(lines) - 1
-	}
+	lines, index := splitLineWindow(content, symbol.StartLine-1, annotationScanLines)
 	seen := map[string]struct{}{}
 	collect := func(line string) {
 		for _, channel := range nestJSMessagePatternChannels(line) {
@@ -27758,7 +27892,7 @@ func nestJSMessagePatternChannelsAroundSymbol(content string, symbol SymbolRecor
 		}
 	}
 	if index >= 0 && index < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[index]), "@") {
-		for i := index; i < len(lines) && i-index <= 8; i++ {
+		for i := index; i < len(lines) && i-index <= annotationScanLines; i++ {
 			line := strings.TrimSpace(lines[i])
 			if line == "" {
 				continue
@@ -27769,7 +27903,7 @@ func nestJSMessagePatternChannelsAroundSymbol(content string, symbol SymbolRecor
 			collect(line)
 		}
 	}
-	for i := index - 1; i >= 0 && index-i <= 8; i-- {
+	for i := index - 1; i >= 0 && index-i <= annotationScanLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
@@ -27819,13 +27953,9 @@ func annotationRouteLiteralsNearSymbol(content string, symbol SymbolRecord, spri
 	if springOnly {
 		return springAnnotationRouteLiteralsAroundSymbol(content, symbol)
 	}
-	lines := strings.Split(content, "\n")
-	index := symbol.StartLine - 1
-	if index >= len(lines) {
-		index = len(lines) - 1
-	}
+	lines, index := splitLineWindow(content, symbol.StartLine-1, annotationScanLines)
 	seen := map[string]struct{}{}
-	for i := index; i >= 0 && index-i <= 8; i-- {
+	for i := index; i >= 0 && index-i <= annotationScanLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
@@ -27844,11 +27974,7 @@ func annotationRouteLiteralsNearSymbol(content string, symbol SymbolRecord, spri
 }
 
 func springAnnotationRouteLiteralsAroundSymbol(content string, symbol SymbolRecord) []string {
-	lines := strings.Split(content, "\n")
-	index := symbol.StartLine - 1
-	if index >= len(lines) {
-		index = len(lines) - 1
-	}
+	lines, index := splitLineWindow(content, symbol.StartLine-1, annotationScanLines)
 	seen := map[string]struct{}{}
 	collect := func(block string) {
 		if !springRouteAnnotationLine(block) {
@@ -27863,8 +27989,8 @@ func springAnnotationRouteLiteralsAroundSymbol(content string, symbol SymbolReco
 		current = strings.TrimSpace(lines[index])
 	}
 	if strings.HasPrefix(current, "@") {
-		collect(springAnnotationBlock(lines, index, minInt(len(lines)-1, index+8)))
-		for i := index + 1; i < len(lines) && i-index <= 8; i++ {
+		collect(springAnnotationBlock(lines, index, minInt(len(lines)-1, index+annotationScanLines)))
+		for i := index + 1; i < len(lines) && i-index <= annotationScanLines; i++ {
 			line := strings.TrimSpace(lines[i])
 			if line == "" {
 				continue
@@ -27872,10 +27998,10 @@ func springAnnotationRouteLiteralsAroundSymbol(content string, symbol SymbolReco
 			if !strings.HasPrefix(line, "@") {
 				break
 			}
-			collect(springAnnotationBlock(lines, i, minInt(len(lines)-1, index+8)))
+			collect(springAnnotationBlock(lines, i, minInt(len(lines)-1, index+annotationScanLines)))
 		}
 	}
-	for i := index - 1; i >= 0 && index-i <= 8; i-- {
+	for i := index - 1; i >= 0 && index-i <= annotationScanLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
@@ -27957,14 +28083,10 @@ func springRouteAnnotationLine(line string) bool {
 }
 
 func csharpRouteAnnotationLiteralsAroundSymbol(content string, symbol SymbolRecord, tokens map[string]string) []string {
-	lines := strings.Split(content, "\n")
-	index := symbol.StartLine - 1
-	if index >= len(lines) {
-		index = len(lines) - 1
-	}
+	lines, index := splitLineWindow(content, symbol.StartLine-1, annotationScanLines)
 	seen := map[string]struct{}{}
 	if index >= 0 && index < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[index]), "[") {
-		for i := index; i < len(lines) && i-index <= 8; i++ {
+		for i := index; i < len(lines) && i-index <= annotationScanLines; i++ {
 			line := strings.TrimSpace(lines[i])
 			if line == "" {
 				continue
@@ -27977,7 +28099,7 @@ func csharpRouteAnnotationLiteralsAroundSymbol(content string, symbol SymbolReco
 			}
 		}
 	}
-	for i := index - 1; i >= 0 && index-i <= 8; i-- {
+	for i := index - 1; i >= 0 && index-i <= annotationScanLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
@@ -28045,14 +28167,10 @@ func csharpControllerRouteToken(name string) string {
 }
 
 func phpRouteAttributeLiteralsAroundSymbol(content string, symbol SymbolRecord) []string {
-	lines := strings.Split(content, "\n")
-	index := symbol.StartLine - 1
-	if index >= len(lines) {
-		index = len(lines) - 1
-	}
+	lines, index := splitLineWindow(content, symbol.StartLine-1, annotationScanLines)
 	seen := map[string]struct{}{}
 	if index >= 0 && index < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[index]), "#[") {
-		for i := index; i < len(lines) && i-index <= 8; i++ {
+		for i := index; i < len(lines) && i-index <= annotationScanLines; i++ {
 			line := strings.TrimSpace(lines[i])
 			if line == "" {
 				continue
@@ -28065,7 +28183,7 @@ func phpRouteAttributeLiteralsAroundSymbol(content string, symbol SymbolRecord) 
 			}
 		}
 	}
-	for i := index - 1; i >= 0 && index-i <= 8; i-- {
+	for i := index - 1; i >= 0 && index-i <= annotationScanLines; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
