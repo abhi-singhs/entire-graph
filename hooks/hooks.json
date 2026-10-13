@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "case \"${ENTIRE_GRAPH_PROMPT_CONTEXT:-}\" in 1|true|TRUE|on|ON|yes|YES) command -v python3 >/dev/null 2>&1 && python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/entire-graph-prompt-context.py\";; esac; exit 0",
+            "command": "eg_prompt_opt_in=\"${ENTIRE_GRAPH_PROMPT_CONTEXT:-}\"; eg_prompt_spaces=' \t\r\n\u000b\f'; eg_prompt_opt_in=\"${eg_prompt_opt_in#\"${eg_prompt_opt_in%%[!$eg_prompt_spaces]*}\"}\"; eg_prompt_opt_in=\"${eg_prompt_opt_in%\"${eg_prompt_opt_in##*[!$eg_prompt_spaces]}\"}\"; case \"$eg_prompt_opt_in\" in 1|[tT][rR][uU][eE]|[oO][nN]|[yY][eE][sS]) command -v python3 >/dev/null 2>&1 && python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/entire-graph-prompt-context.py\";; esac; exit 0",
             "timeout": 16
           }
         ]

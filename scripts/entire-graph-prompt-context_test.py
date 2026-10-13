@@ -306,6 +306,22 @@ class T(unittest.TestCase):
         self.assertEqual((result.returncode, result.stdout, result.stderr), (0,"",""))
 
 
+    def test_shell_gate_matches_python_opt_in(self):
+        with open(os.path.join(HERE, "..", "hooks", "hooks.json")) as stream:
+            command = json.load(stream)["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+        fake_python = os.path.join(self.d, "python3")
+        with open(fake_python, "w") as stream:
+            stream.write("#!/bin/sh\nprintf ran\n")
+        os.chmod(fake_python, 0o755)
+        for value in ("1", "true", "TRUE", "TrUe", "On", "yEs", " 1 ", "\tOn\n", "\r\vyes\f",
+                      "", "false", "0", "truthy", "disabledTrue", "   ", "\u00a0true\u00a0"):
+            with self.subTest(value=value):
+                env = {"PATH": self.d, "CLAUDE_PLUGIN_ROOT": HERE, "ENTIRE_GRAPH_PROMPT_CONTEXT": value}
+                result = subprocess.run(["/bin/sh", "-c", command], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout == "ran", pc.enabled(env))
+                self.assertEqual(result.stderr, "")
+
     def test_windows_fails_open_before_starting_process(self):
         from unittest.mock import patch
         with patch.object(pc.os, "name", "nt"), patch.object(pc.subprocess, "Popen") as popen:

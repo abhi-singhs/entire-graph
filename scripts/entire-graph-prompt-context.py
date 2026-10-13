@@ -39,7 +39,8 @@ HEAD_REJECTED = re.compile(r"(does not accept|unknown flag|flag provided but not
 
 
 def enabled(env):
-    return env.get("ENTIRE_GRAPH_PROMPT_CONTEXT", "").strip().lower() in ("1", "true", "on", "yes")
+    # Match the shell gate: ASCII whitespace and case-insensitive boolean spellings.
+    return env.get("ENTIRE_GRAPH_PROMPT_CONTEXT", "").strip(" \t\r\n\v\f").lower() in ("1", "true", "on", "yes")
 
 
 def first_line(prompt):
