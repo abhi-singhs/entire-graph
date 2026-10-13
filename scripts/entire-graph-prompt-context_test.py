@@ -66,7 +66,7 @@ class T(unittest.TestCase):
                   "1. src/a.go:10-20 Handler s=9.1\nfunc Handler() {}\nI:x = 1  // code line, kept\n")
         got = pc.clean(answer)
         self.assertEqual(got, "!LOW s=8.4\n1. src/a.go:10-20 Handler s=9.1\nfunc Handler() {}\nI:x = 1  // code line, kept")
-        for header in ("I:hit/3", "I:miss/12 T:40", "I:miss/1 Q:2 P:3 T:4"):
+        for header in ("I:hit/3", "I:miss/12 T:40", "I:miss/1 Q:2 P:3 T:4", "I:miss/-", "I:off/-"):
             self.assertEqual(pc.clean(header + "\n1. a.go:1 X s=1"), "1. a.go:1 X s=1")
         self.assertEqual(pc.clean("!N W0 F0 L3/10\n1. a.go:1 X s=1"), "1. a.go:1 X s=1")
     def test_low_confidence_only_as_column0_metadata(self):
@@ -98,7 +98,7 @@ class T(unittest.TestCase):
         self.assertEqual(a[a.index("--query") + 1], "x" * 160)
         for flag, val in (("--format", "agent"), ("--max-context-bytes", "2048"), ("--profile", "full"), ("--repo", self.d)):
             self.assertEqual(a[a.index(flag) + 1], val)
-        self.assertIn("VERIFY=off", a)
+        self.assertIn("VERIFY=", a)
     def test_once_per_session(self):
         self.assertTrue(self.run_hook(self.ev())[1])
         self.assertEqual(self.run_hook(self.ev(prompt="another request"))[1], "")

@@ -77,7 +77,7 @@ def graph_argv(env):
 # Compact forms the agent renderer degrades to under tight budgets (internal/cli/search.go):
 # the "I:<state>/<ms>[ Q:n][ P:n][ T:n]" header, the "!N|!D W.. F.. L../..[ X..]" coverage diagnostic,
 # and the "!LOW s=.." low-confidence marker. Anchored whole-line matches, so code lines never match.
-COMPACT_HEADER = re.compile(r"^I:[a-z-]+/\d+(?: [QPT]:\d+)*$")
+COMPACT_HEADER = re.compile(r"^I:[a-z-]+/(?:\d+|-)(?: [QPT]:\d+)*$")
 COMPACT_DIAG = re.compile(r"^![ND](?: W\d+ F\d+ L\d+/\d+)?(?: I:[a-z-]+(?:/\d+)?)?(?: X\d+)?$")
 COMPACT_LOW = re.compile(r"^!LOW s=-?\d+(?:\.\d+)?$")
 
@@ -244,7 +244,8 @@ def handle(stdin, stdout, env):
     if not argv:
         write_marker(marker, {"probe": "absent"})
         return 0
-    run_env = dict(env, ENTIRE_GRAPH_VERIFY_BLOCK="off")
+    # The CLI emits VERIFY normally; clean() removes it from injected context.
+    run_env = dict(env)
     state = probe(argv, run_env)
     write_marker(marker, state)
     if state["probe"] != "ok":
