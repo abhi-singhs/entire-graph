@@ -1445,7 +1445,7 @@ func isWritingShellStage(stage string) bool {
 	case "cat":
 		return hasStdoutRedirect(stage) || heredocDelimiter(stage) != ""
 	case "sed":
-		return hasInPlaceFlag(stage)
+		return hasInPlaceFlag(stage) || hasStdoutRedirect(stage)
 	}
 	return false
 }
