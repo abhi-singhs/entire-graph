@@ -141,5 +141,11 @@ func TestPytestIsDetectedFromASectionNotAMention(t *testing.T) {
 		if (got != nil) != tc.want {
 			t.Errorf("%s (%s): got %v, want detected=%v", tc.label, tc.file, got, tc.want)
 		}
+		narrow := deriveSearchVerifyPytest("/r", searchVerifySubject{
+			testPath: "/r/tests/test_example.py", testName: "test_example", testEvidence: "covering test",
+		}, &evidence)
+		if (narrow != nil) != tc.want {
+			t.Errorf("narrow %s (%s): got %v, want detected=%v", tc.label, tc.file, narrow, tc.want)
+		}
 	}
 }

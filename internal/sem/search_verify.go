@@ -1634,6 +1634,15 @@ func searchVerifyHasSection(content, heading string) bool {
 	return false
 }
 
+func searchVerifyIsPytestConfig(name, content string) bool {
+	for _, section := range searchVerifyPytestSections[name] {
+		if searchVerifyHasSection(content, section) {
+			return true
+		}
+	}
+	return false
+}
+
 func deriveSearchVerifySuitePytest(dir string, evidence *searchVerifyEvidence) *SearchVerifyCommand {
 	for _, name := range searchVerifyPytestConfigs {
 		candidate := searchVerifyJoin(dir, name)
@@ -1651,10 +1660,8 @@ func deriveSearchVerifySuitePytest(dir string, evidence *searchVerifyEvidence) *
 		// often still works. Not always: where pytest is merely named and not installed, the
 		// derived VERIFY fails with "No module named pytest", and the agent is told to treat a
 		// failure as its own code's fault.
-		for _, section := range searchVerifyPytestSections[name] {
-			if searchVerifyHasSection(content, section) {
-				return searchVerifySuiteCommand(dir, "python -m pytest", candidate+" pytest config")
-			}
+		if searchVerifyIsPytestConfig(name, content) {
+			return searchVerifySuiteCommand(dir, "python -m pytest", candidate+" pytest config")
 		}
 	}
 	return nil
@@ -2833,7 +2840,7 @@ func deriveSearchVerifyPytest(dir string, subject searchVerifySubject, evidence 
 		if !ok {
 			continue
 		}
-		if !strings.Contains(content, "pytest") {
+		if !searchVerifyIsPytestConfig(name, content) {
 			continue
 		}
 		config = candidate
