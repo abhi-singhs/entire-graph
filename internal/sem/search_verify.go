@@ -2652,10 +2652,14 @@ func searchVerifyShellWords(statement string) ([]string, bool) {
 		c := statement[i]
 		if quote != 0 {
 			if c == quote {
+				// Keep substitutions opaque: `jest` is not a literal command name.
+				if quote == '`' {
+					word.WriteByte(c)
+				}
 				quote = 0
 				continue
 			}
-			if c == '\\' && quote == '"' && i+1 < len(statement) {
+			if c == '\\' && (quote == '"' || quote == '`') && i+1 < len(statement) {
 				next := statement[i+1]
 				if strings.ContainsRune("\\$`\"\n", rune(next)) {
 					i++
@@ -2671,6 +2675,10 @@ func searchVerifyShellWords(statement string) ([]string, bool) {
 		switch c {
 		case ' ', '\t', '\r', '\n':
 			flush()
+		case '`':
+			quote = c
+			word.WriteByte(c)
+			active = true
 		case '\'', '"':
 			quote = c
 			active = true
