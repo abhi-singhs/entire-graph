@@ -1649,6 +1649,7 @@ var searchVerifyINIKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 // Dependency names, descriptions and commands in other sections are not.
 func searchVerifyToxInvokesPytest(content string) bool {
 	inTestenv, inCommands := false, false
+	commandsIndent := 0
 	for _, raw := range strings.Split(content, "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
@@ -1662,27 +1663,27 @@ func searchVerifyToxInvokesPytest(content string) bool {
 		if !inTestenv {
 			continue
 		}
-		if key, value, found := strings.Cut(line, "="); found && searchVerifyINIKey.MatchString(strings.TrimSpace(key)) {
+		indent := len(raw) - len(strings.TrimLeft(raw, " \t"))
+		if inCommands && indent > commandsIndent {
+			// More-indented lines continue the current INI value, including '='.
+		} else if key, value, found := strings.Cut(line, "="); found && searchVerifyINIKey.MatchString(strings.TrimSpace(key)) {
 			inCommands = strings.TrimSpace(key) == "commands"
+			commandsIndent = indent
 			line = strings.TrimSpace(value)
-		} else if len(raw) == len(strings.TrimLeft(raw, " \t")) {
+		} else {
 			inCommands = false
 		}
 		if !inCommands || line == "" {
 			continue
 		}
-		if searchVerifyScriptInvokesRunner(line, "pytest") {
-			return true
-		}
-		statements, valid := searchVerifyShellStatements(line)
-		if !valid {
+		// tox executes argv, not an implicit shell: 'echo x && pytest' and
+		// 'ENV=value pytest' do not invoke pytest. Never apply Node shell rules.
+		words, valid := searchVerifyShellWords(line)
+		if !valid || len(words) == 0 {
 			continue
 		}
-		for _, statement := range statements {
-			words, valid := searchVerifyShellWords(statement)
-			if valid && len(words) >= 3 && (words[0] == "python" || words[0] == "python3") && words[1] == "-m" && words[2] == "pytest" {
-				return true
-			}
+		if words[0] == "pytest" || (len(words) >= 3 && (words[0] == "python" || words[0] == "python3") && words[1] == "-m" && words[2] == "pytest") {
+			return true
 		}
 	}
 	return false
