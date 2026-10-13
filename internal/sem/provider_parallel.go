@@ -360,11 +360,13 @@ func workerStop(ctx context.Context, overBudget func() bool) (canceled error, bu
 // the provider's reducer emits one file record plus that file's entire symbol
 // list into the caller's sink, so a wall-clock budget that only governs the
 // workers can still be overrun by the results already in the pipeline when it
-// expires -- the cancellation branch below deliberately drains and reduces
-// every buffered result, and a clock-triggered expiry is not visible on ctx at
-// all until its timer fires. Polling here keeps a symbol-heavy file, or a slow
-// sink, from carrying the run past the ceiling. Reduction stays atomic per
-// file: the check is between results, never inside one.
+// expires. The generic cancellation branch attempts an ordered buffered drain,
+// but this provider wrapper polls stop before those reductions too: after budget
+// expiry, already-parsed buffered files are deliberately not emitted. Without a
+// stop guard, generic callers can still drain them. A clock-triggered expiry is
+// not visible on ctx until its timer fires. Polling here keeps a symbol-heavy
+// file, or a slow sink, from carrying the run past the ceiling. Reduction stays
+// atomic per file: the check is between results, never inside one.
 func runProviderFilePipeline(
 	ctx context.Context,
 	stop func() error,
