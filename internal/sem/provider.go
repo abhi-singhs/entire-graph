@@ -33,13 +33,14 @@ import (
 )
 
 const (
-	// SchemaVersion 1.3 adds optional source-file health accounting; 1.2 added
+	// SchemaVersion 1.4 adds optional derived relation provenance; 1.3 added
+	// source-file health accounting; 1.2 added
 	// optional parser identity metadata.
 	// Schema 1.1 added the snapshot fields introduced
 	// alongside boundary source locations (the `external` flag on external records
 	// and the per-symbol source-location fields). The shape is backward compatible
 	// for tolerant readers; the bump lets consumers detect the new fields.
-	SchemaVersion         = "1.3"
+	SchemaVersion         = "1.4"
 	ProviderName          = "entire-graph"
 	StableSymbolIDVersion = "compound-v1"
 	// IdentityRevision is a global, opaque revision of parser identity rules across
@@ -224,6 +225,7 @@ var schemaFeatures = []string{
 	"language_versions",
 	"relation_evidence",
 	"relation_evidence_dropped",
+	"relation_provenance",
 	"relation_resolution",
 	"relation_scope",
 	"relation_target_kind",
