@@ -1107,6 +1107,11 @@ func searchLocatorFollowUp(result sem.SearchResult) string {
 	return "  [body: def " + name + "]"
 }
 
+// searchMetadataLine reserves the completeness token for renderer certification.
+func searchMetadataLine(value string) string {
+	return strings.ReplaceAll(termsafe.Line(value), completeMarker, `\x5bcomplete\x5d`)
+}
+
 // searchResultOnOneLine makes one result safe to print into a one-record-per-line payload.
 //
 // It escapes the fields that go into a result's HEADER, where a newline is not layout but
@@ -1129,11 +1134,17 @@ func searchLocatorFollowUp(result sem.SearchResult) string {
 // it changes. Nothing upstream sees the escaped copy, so the JSON encoding of the same response
 // still reports the exact bytes the repository holds.
 func searchResultOnOneLine(result sem.SearchResult) sem.SearchResult {
-	result.FilePath = termsafe.Line(result.FilePath)
-	result.QualifiedName = termsafe.Line(result.QualifiedName)
-	result.SymbolName = termsafe.Line(result.SymbolName)
-	result.Kind = termsafe.Line(result.Kind)
-	result.Snippet, _ = searchQuarantineBody(result.Snippet)
+	result.FilePath = searchMetadataLine(result.FilePath)
+	result.QualifiedName = searchMetadataLine(result.QualifiedName)
+	result.SymbolName = searchMetadataLine(result.SymbolName)
+	result.Kind = searchMetadataLine(result.Kind)
+	snippet, changed := searchQuarantineBody(result.Snippet)
+	result.Snippet = snippet
+	if slices.Contains(result.Signals, sem.CompleteSymbolSignal) && (changed || renderedBodyIsTransformed(snippet)) {
+		// Quarantine and terminal escaping can make displayed source no longer byte-exact.
+		// Clone before removing the certificate so the machine response is untouched.
+		result.Signals = slices.DeleteFunc(slices.Clone(result.Signals), func(signal string) bool { return signal == sem.CompleteSymbolSignal })
+	}
 	for index, passage := range result.Passages {
 		quarantined, changed := searchQuarantineBody(passage.Snippet)
 		if !changed {
@@ -1432,6 +1443,31 @@ func searchResultCarriesCompleteBody(result sem.SearchResult) bool {
 		}
 	}
 	return false
+}
+
+// completeMarker certifies a whole, byte-exact primary symbol body in agent output.
+const completeMarker = "[complete]"
+
+// renderedBodyIsTransformed reports whether terminal-safe output rewrites source
+// bytes. Multiline layout alone does not count as a transformation.
+func renderedBodyIsTransformed(body string) bool {
+	return string(termsafe.Bytes([]byte(body))) != body
+}
+
+// searchResultNeedsNoFollowUpRead requires the producer's complete-symbol signal.
+// A full-unit or head-window signal alone does not certify an unelided body;
+// unit-elided wins if a contradictory complete-symbol signal is also present.
+func searchResultNeedsNoFollowUpRead(result sem.SearchResult) bool {
+	complete := false
+	for _, signal := range result.Signals {
+		switch signal {
+		case sem.FullUnitElidedSignal:
+			return false
+		case sem.CompleteSymbolSignal:
+			complete = true
+		}
+	}
+	return complete
 }
 
 // orderAgentSearchResults groups a payload for `--format agent`: candidate fix sites, then the
@@ -2599,8 +2635,10 @@ func agentSearchLocationCost(result sem.SearchResult) int {
 		lines = lines[:len(lines)-1]
 	}
 	_, focus, _ := agentSearchPrimaryFocus(result, len(lines))
+	// This reserves an unmarked locator, not a certified body. The body fitter
+	// measures the complete candidate, including marker bytes, against its budget.
 	return len(agentSearchLocationHeaders(result.Rank, result.FilePath, focus, focus, focus,
-		searchResultDisplayName(result), agentSearchSectionTag(result), agentSearchScoreTag(result))[0])
+		searchResultDisplayName(result), agentSearchSectionTag(result), agentSearchScoreTag(result), "")[0])
 }
 
 func rankedAgentSearchBudgets(count, budget int) []int {
@@ -2721,12 +2759,31 @@ func agentSearchPrimaryBlockFromTier(result sem.SearchResult, budget, firstTier 
 	name := searchResultDisplayName(result)
 	tag := agentSearchSectionTag(result)
 	scored := agentSearchScoreTag(result)
+	canCertify := searchResultNeedsNoFollowUpRead(result) && !renderedBodyIsTransformed(result.Snippet)
 	lines := strings.Split(result.Snippet, "\n")
-	if len(lines) > 1 && lines[len(lines)-1] == "" {
+	if len(lines) > 1 && lines[len(lines)-1] == "" && (!canCertify || result.SnippetStartLine <= 0 || result.SnippetEndLine-result.SnippetStartLine+1 < len(lines)) {
 		lines = lines[:len(lines)-1]
 	}
 	snippetStart, focusLine, focus := agentSearchPrimaryFocus(result, len(lines))
 	if len(lines) == 0 {
+		return fitAgentSearchLocation(result.Rank, result.FilePath, focusLine, name, tag, scored, budget)
+	}
+
+	// Certified bodies are emitted whole with their marker, or as an unmarked
+	// locator when they cannot fit. Other results retain ordinary excerpt fitting.
+	if canCertify {
+		text := strings.Join(lines, "\n")
+		startLine, endLine := snippetStart, snippetStart+len(lines)-1
+		for _, header := range agentSearchLocationHeaders(result.Rank, result.FilePath, startLine, endLine, focusLine, name, tag, scored, completeMarker) {
+			// The minimal header cannot certify a body; use it only as a locator.
+			if !strings.Contains(header, completeMarker) {
+				break
+			}
+			candidate := []byte(header + text + "\n")
+			if budget <= 0 || len(candidate) <= budget {
+				return candidate
+			}
+		}
 		return fitAgentSearchLocation(result.Rank, result.FilePath, focusLine, name, tag, scored, budget)
 	}
 
@@ -2766,7 +2823,7 @@ func agentSearchPrimaryBlockFromTier(result sem.SearchResult, budget, firstTier 
 				right := left + span - 1
 				text := strings.Join(lines[left:right+1], "\n")
 				startLine, endLine := snippetStart+left, snippetStart+right
-				header := agentSearchLocationHeaders(result.Rank, result.FilePath, startLine, endLine, focusLine, name, tag, scored)[tier]
+				header := agentSearchLocationHeaders(result.Rank, result.FilePath, startLine, endLine, focusLine, name, tag, scored, "")[tier]
 				candidate := []byte(header + text + "\n")
 				if budget <= 0 || len(candidate) <= budget {
 					balance := focus - left - (right - focus)
@@ -2805,7 +2862,7 @@ const (
 // fitAgentSearchRankedLocation is fitAgentSearchLocation without the minimal header: a location
 // line that still carries rank, name and score, or nil when none fits.
 func fitAgentSearchRankedLocation(rank int, path string, focus int, name, tag, scored string, budget int) []byte {
-	for _, header := range agentSearchLocationHeaders(rank, path, focus, focus, focus, name, tag, scored)[:agentSearchMinimalHeaderTier] {
+	for _, header := range agentSearchLocationHeaders(rank, path, focus, focus, focus, name, tag, scored, "")[:agentSearchMinimalHeaderTier] {
 		if budget <= 0 || len(header) <= budget {
 			return []byte(header)
 		}
@@ -2813,7 +2870,10 @@ func fitAgentSearchRankedLocation(rank int, path string, focus int, name, tag, s
 	return nil
 }
 
-func agentSearchLocationHeaders(rank int, path string, start, end, focus int, name, tag, scored string) []string {
+// agentSearchLocationHeaders offers rich, compact, and minimal locator headers.
+// Only the first two can carry a completeness marker. Callers must not seat a
+// certified body under the marker-less minimal header.
+func agentSearchLocationHeaders(rank int, path string, start, end, focus int, name, tag, scored, complete string) []string {
 	location := fmt.Sprintf("%d. %s:%d", rank, path, start)
 	if end != start {
 		location += fmt.Sprintf("-%d", end)
@@ -2825,6 +2885,9 @@ func agentSearchLocationHeaders(rank int, path string, start, end, focus int, na
 	if tag != "" {
 		rich += " " + tag
 	}
+	if complete != "" {
+		rich += " " + complete
+	}
 	rich += scored + fmt.Sprintf(" [focus:%d]\n", focus)
 	compact := location
 	if name != "" {
@@ -2833,13 +2896,17 @@ func agentSearchLocationHeaders(rank int, path string, start, end, focus int, na
 	if tag != "" {
 		compact += " " + tag
 	}
+	if complete != "" {
+		compact += " " + complete
+	}
 	compact += scored + " *\n"
 	minimal := fmt.Sprintf("%s:%d *\n", path, focus)
 	return []string{rich, compact, minimal}
 }
 
+// fitAgentSearchLocation fits a bodyless locator, which never carries a marker.
 func fitAgentSearchLocation(rank int, path string, focus int, name, tag, scored string, budget int) []byte {
-	for _, header := range agentSearchLocationHeaders(rank, path, focus, focus, focus, name, tag, scored) {
+	for _, header := range agentSearchLocationHeaders(rank, path, focus, focus, focus, name, tag, scored, "") {
 		if budget <= 0 || len(header) <= budget {
 			return []byte(header)
 		}

@@ -103,7 +103,7 @@ func TestAgentSearchBlockKeepsIdentityBeforeBodyLines(t *testing.T) {
 	// body (else span-major and tier-major agree) and MUST fit over the first line (else tier-major
 	// has nothing to choose under the rich header).
 	headers := func(end int) []string {
-		return agentSearchLocationHeaders(1, "a.go", 1, end, 1, "Resolve", "", agentSearchScoreTag(result))
+		return agentSearchLocationHeaders(1, "a.go", 1, end, 1, "Resolve", "", agentSearchScoreTag(result), "")
 	}
 	lines := strings.SplitAfter(strings.TrimSuffix(body, "\n"), "\n")
 	if richWhole := len(headers(5)[0]) + len(body); richWhole <= minimalWhole {
