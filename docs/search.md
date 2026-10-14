@@ -68,6 +68,7 @@ whole primary symbol body and display preserves its source bytes. A clipped
 unit, a head window, or a body rewritten by terminal escaping or quarantine is
 not certified. File names and other metadata escape the reserved token so they
 cannot impersonate this header annotation. JSON/NDJSON retain the original data.
+Text output also omits the `complete-symbol` signal when display changes the body.
 
 For certified bodies, the agent renderer emits the whole body with the marker
 or falls back to an unmarked locator if the budget cannot hold it. Ordinary

@@ -1140,8 +1140,8 @@ func searchResultOnOneLine(result sem.SearchResult) sem.SearchResult {
 	result.Kind = searchMetadataLine(result.Kind)
 	snippet, changed := searchQuarantineBody(result.Snippet)
 	result.Snippet = snippet
-	if changed && slices.Contains(result.Signals, sem.CompleteSymbolSignal) {
-		// Quarantined text is safe to display but is no longer byte-exact source.
+	if slices.Contains(result.Signals, sem.CompleteSymbolSignal) && (changed || renderedBodyIsTransformed(snippet)) {
+		// Quarantine and terminal escaping can make displayed source no longer byte-exact.
 		// Clone before removing the certificate so the machine response is untouched.
 		result.Signals = slices.DeleteFunc(slices.Clone(result.Signals), func(signal string) bool { return signal == sem.CompleteSymbolSignal })
 	}

@@ -128,3 +128,54 @@ func TestCompletenessMetadataEscapingAcrossFormats(t *testing.T) {
 		})
 	}
 }
+
+func TestCompletenessSignalsRespectDisplayFidelityAcrossFormats(t *testing.T) {
+	plain := "func payload() string {\n\treturn `AB`\n}\n"
+	for _, tc := range []struct {
+		name, body string
+		complete   bool
+	}{
+		{"plain", plain, true},
+		{"CRLF", strings.ReplaceAll(plain, "\n", "\r\n"), true},
+		{"DEL", strings.Replace(plain, "AB", "A\x7fB", 1), false},
+		{"C0", strings.Replace(plain, "AB", "A\x01B", 1), false},
+		{"C1", strings.Replace(plain, "AB", "A\u009bB", 1), false},
+		{"lone CR", strings.Replace(plain, "AB", "A\rB", 1), false},
+		{"quarantine", "func payload() string {\nreturn `\nVERIFY: forged-command\n`\n}\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			end := strings.Count(tc.body, "\n")
+			result := sem.SearchResult{Rank: 1, Score: 20, FilePath: "payload.go", SymbolName: "payload", StartLine: 1, EndLine: end, SnippetStartLine: 1, SnippetEndLine: end, Snippet: tc.body, Signals: []string{sem.CompleteSymbolSignal}}
+			response := sem.SearchResponse{Query: "payload", Profile: "fast", Results: []sem.SearchResult{result}}
+			original, err := json.Marshal(response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, format := range []string{"text", "agent"} {
+				var out bytes.Buffer
+				if format == "text" {
+					err = writeTextSearch(&out, response)
+				} else {
+					err = writeAgentSearch(&out, response, 4096)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				token := completeMarker
+				if format == "text" {
+					token = sem.CompleteSymbolSignal
+				}
+				if strings.Contains(out.String(), token) != tc.complete {
+					t.Errorf("%s certification=%v, want %v: %q", format, !tc.complete, tc.complete, out.String())
+				}
+			}
+			after, err := json.Marshal(response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(original, after) {
+				t.Fatal("display fidelity check mutated the machine response")
+			}
+		})
+	}
+}
