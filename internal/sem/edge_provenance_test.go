@@ -1,10 +1,13 @@
 package sem
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -46,63 +49,150 @@ func TestEdgeProvenanceNeverPromotesAGuessToAFact(t *testing.T) {
 	}
 }
 
-// The heuristic list here decides whether an edge reads INFERRED. The same list
-// is advertised to callers as HeuristicRelationTypes. If they drift, the label
-// and the documented capability disagree about the same edge — so they are
-// asserted equal rather than maintained in parallel by hand.
-func TestHeuristicListMatchesTheAdvertisedCapability(t *testing.T) {
-	advertised := Capabilities().HeuristicRelationTypes
-	if len(advertised) == 0 {
-		t.Fatal("capabilities advertise no heuristic relation types")
+// Global heuristics must be inferred, but protocol-specific inference must not
+// exempt RPC relations from per-language capability extraction guards.
+func TestProvenancePreservesLanguageSpecificCapabilities(t *testing.T) {
+	for _, relation := range Capabilities().HeuristicRelationTypes {
+		if !heuristicEdgeTypes[relation] {
+			t.Errorf("global heuristic %s is not inferred", relation)
+		}
 	}
-	local := make([]string, 0, len(heuristicEdgeTypes))
-	for name := range heuristicEdgeTypes {
-		local = append(local, name)
-	}
-	sort.Strings(local)
-	shipped := append([]string(nil), advertised...)
-	sort.Strings(shipped)
-	if strings.Join(local, ",") != strings.Join(shipped, ",") {
-		t.Fatalf("provenance heuristics and advertised capability disagree:\n  provenance: %v\n  advertised: %v", local, shipped)
+	for _, relation := range []string{"HANDLES_GRPC", "HANDLES_GRAPHQL", "HANDLES_TRPC"} {
+		if !heuristicEdgeTypes[relation] {
+			t.Errorf("protocol relation %s is not inferred", relation)
+		}
+		if contains(Capabilities().HeuristicRelationTypes, relation) {
+			t.Errorf("%s must remain governed by per-language capability declarations", relation)
+		}
 	}
 }
 
-// A resolution value added to any language backend must be classified here
-// deliberately. Without this test a new value inherits AMBIGUOUS by falling off
-// the end of a lookup, which is how a trust label stops being trustworthy: it
-// would keep answering, and keep being wrong, with nothing failing.
-func TestEveryResolutionValueInTheTreeIsClassified(t *testing.T) {
-	pattern := regexp.MustCompile(`Resolution:\s*"([a-z_]+)"`)
-	found := map[string]bool{}
+// This is a constant-site lint, not a proof of all dynamically computed values.
+// It covers keyed literals, post-construction writes, and local resolution
+// initializers, including constant aliases and concatenations. Unknown runtime
+// values still fail closed to AMBIGUOUS in EdgeProvenance.
+func TestLiteralResolutionValuesInProductionAreClassified(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("read package dir: %v", err)
+		t.Fatal(err)
 	}
+	found := map[string]bool{}
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(".", entry.Name()))
+		file, err := parser.ParseFile(token.NewFileSet(), filepath.Join(".", entry.Name()), nil, 0)
 		if err != nil {
-			t.Fatalf("read %s: %v", entry.Name(), err)
+			t.Fatal(err)
 		}
-		for _, match := range pattern.FindAllStringSubmatch(string(data), -1) {
-			found[match[1]] = true
+		for value := range literalResolutionValues(file) {
+			found[value] = true
 		}
 	}
 	if len(found) == 0 {
-		t.Fatal("found no Resolution values at all; this test has stopped testing anything")
+		t.Fatal("found no resolution constants")
 	}
-	var unclassified []string
+	var missing []string
 	for value := range found {
-		if _, ok := knownResolutions[value]; !ok {
-			unclassified = append(unclassified, value)
+		if _, ok := knownResolutions[value]; !ok && value != "" {
+			missing = append(missing, value)
 		}
 	}
-	sort.Strings(unclassified)
-	if len(unclassified) > 0 {
-		t.Fatalf("resolution values emitted but not classified in knownResolutions: %v\n"+
-			"Classify each deliberately — inheriting AMBIGUOUS by default is how this label goes stale.", unclassified)
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Fatalf("unclassified resolution constants: %v", missing)
+	}
+}
+
+func literalResolutionValues(file *ast.File) map[string]bool {
+	found := map[string]bool{}
+	var constantString func(ast.Expr, map[ast.Expr]bool) (string, bool)
+	constantString = func(expr ast.Expr, seen map[ast.Expr]bool) (string, bool) {
+		if expr == nil || seen[expr] {
+			return "", false
+		}
+		seen[expr] = true
+		switch x := expr.(type) {
+		case *ast.BasicLit:
+			if x.Kind == token.STRING {
+				value, err := strconv.Unquote(x.Value)
+				return value, err == nil
+			}
+		case *ast.ParenExpr:
+			return constantString(x.X, seen)
+		case *ast.BinaryExpr:
+			if x.Op == token.ADD {
+				left, lok := constantString(x.X, seen)
+				right, rok := constantString(x.Y, seen)
+				return left + right, lok && rok
+			}
+		case *ast.Ident:
+			if x.Obj != nil {
+				switch decl := x.Obj.Decl.(type) {
+				case *ast.ValueSpec:
+					for i, name := range decl.Names {
+						if name.Name == x.Name && i < len(decl.Values) {
+							return constantString(decl.Values[i], seen)
+						}
+					}
+				case *ast.AssignStmt:
+					for i, lhs := range decl.Lhs {
+						if id, ok := lhs.(*ast.Ident); ok && id.Name == x.Name && i < len(decl.Rhs) {
+							return constantString(decl.Rhs[i], seen)
+						}
+					}
+				}
+			}
+		}
+		return "", false
+	}
+	add := func(expr ast.Expr) {
+		if value, ok := constantString(expr, map[ast.Expr]bool{}); ok {
+			found[value] = true
+		}
+	}
+	isResolution := func(expr ast.Expr) bool {
+		switch x := expr.(type) {
+		case *ast.Ident:
+			return strings.EqualFold(x.Name, "resolution")
+		case *ast.SelectorExpr:
+			return x.Sel.Name == "Resolution"
+		}
+		return false
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch x := node.(type) {
+		case *ast.KeyValueExpr:
+			if isResolution(x.Key) {
+				add(x.Value)
+			}
+		case *ast.AssignStmt:
+			for i, lhs := range x.Lhs {
+				if isResolution(lhs) && i < len(x.Rhs) {
+					add(x.Rhs[i])
+				}
+			}
+		case *ast.ValueSpec:
+			for i, name := range x.Names {
+				if isResolution(name) && i < len(x.Values) {
+					add(x.Values[i])
+				}
+			}
+		}
+		return true
+	})
+	return found
+}
+
+func TestResolutionConstantGuardSeesAssignmentsAndAliases(t *testing.T) {
+	source := "package fixture\nconst inferred = `type_` + \"inferred\"\nfunc f() {\n resolution := \"exact\"\n r := RelationRecord{Resolution: resolution}\n r.Resolution = inferred\n r.Resolution = `new_value`\n _ = \"Resolution: \\\"comment_only\\\"\"\n}"
+	file, err := parser.ParseFile(token.NewFileSet(), "fixture.go", source, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := literalResolutionValues(file)
+	if len(found) != 3 || !found["exact"] || !found["type_inferred"] || !found["new_value"] {
+		t.Fatalf("resolution constants = %v", found)
 	}
 }
 

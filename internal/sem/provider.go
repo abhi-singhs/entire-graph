@@ -33,13 +33,14 @@ import (
 )
 
 const (
-	// SchemaVersion 1.3 adds optional source-file health accounting; 1.2 added
+	// SchemaVersion 1.4 adds optional derived relation provenance; 1.3 added
+	// source-file health accounting; 1.2 added
 	// optional parser identity metadata.
 	// Schema 1.1 added the snapshot fields introduced
 	// alongside boundary source locations (the `external` flag on external records
 	// and the per-symbol source-location fields). The shape is backward compatible
 	// for tolerant readers; the bump lets consumers detect the new fields.
-	SchemaVersion         = "1.3"
+	SchemaVersion         = "1.4"
 	ProviderName          = "entire-graph"
 	StableSymbolIDVersion = "compound-v1"
 	// IdentityRevision is a global, opaque revision of parser identity rules across
@@ -678,7 +679,7 @@ func Capabilities() CapabilityReport {
 		SupportedRelationTypes:          append([]string(nil), relationTypes...),
 		RelationSupportByLanguage:       relationSupportByLanguage(),
 		RelationSupportByProfile:        relationSupportByProfile(),
-		HeuristicRelationTypes:          []string{"HANDLES_ROUTE", "HANDLES_GRPC", "HANDLES_GRAPHQL", "HANDLES_TRPC", "HTTP_CALLS", "EMITS", "LISTENS_ON", "HANDLES_TOOL", "SIMILAR_TO", "TESTS"},
+		HeuristicRelationTypes:          []string{"HANDLES_ROUTE", "HTTP_CALLS", "EMITS", "LISTENS_ON", "HANDLES_TOOL", "SIMILAR_TO", "TESTS"},
 		OptionalLocalOnlyFeatures: map[string]bool{
 			"stable_symbol_ids":          true,
 			"semantic_diff":              true,

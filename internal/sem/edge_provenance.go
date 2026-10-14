@@ -37,10 +37,10 @@ const (
 	ProvenanceAmbiguous = "AMBIGUOUS"
 )
 
-// heuristicEdgeTypes are the relation types that exist by pattern rather than
-// by resolution. It mirrors the list reported in capabilities as
-// HeuristicRelationTypes; the two are asserted equal by test, so the provenance
-// label and the advertised capability can never drift apart.
+// heuristicEdgeTypes marks relations whose existence is pattern-derived, even
+// when their target is resolved. This is broader than the global, language-
+// independent HeuristicRelationTypes capability: protocol-specific RPC handlers
+// remain attributed to the languages that extract them in the capability matrix.
 var heuristicEdgeTypes = map[string]bool{
 	"HANDLES_ROUTE":   true,
 	"HANDLES_GRPC":    true,
@@ -54,11 +54,9 @@ var heuristicEdgeTypes = map[string]bool{
 	"TESTS":           true,
 }
 
-// knownResolutions classifies every Resolution value the providers emit. It is
-// exhaustive on purpose and asserted exhaustive by test: a new resolution added
-// to a language backend must be classified deliberately here, not inherit
-// AMBIGUOUS by falling off the end of a lookup. Silently defaulting is how a
-// trust label stops being trustworthy.
+// knownResolutions classifies the resolution vocabulary emitted by the provider.
+// A source-level guard checks constant construction and assignment sites; fixture
+// and serialization tests cover runtime paths. Unknown values remain ambiguous.
 //
 // The bias throughout is conservative. Under-claiming costs a caller some
 // filtering; over-claiming tells them a guess was a fact.
@@ -118,19 +116,13 @@ func EdgeProvenance(relationType, resolution string) string {
 	return ProvenanceAmbiguous
 }
 
-// MarshalJSON adds provenance to every serialised relation.
-//
-// It is computed here rather than stored on the struct, and that is the whole
-// point. An earlier version stamped the label when the relation was emitted,
-// which looked equivalent and was not: later stages refine Resolution, so a
-// stamped label described the edge as it was at emit while the fields beside it
-// described the edge as it ended up. The compact snapshot, which recomputed
-// from the final values, then disagreed with the native stream about the same
-// edge — caught by the canonical-hash comparison in graph-bench.
-//
-// Deriving at serialisation makes that class of bug unreachable. There is
-// nothing to keep in sync, nothing to forget at a new construction site, and no
-// window in which the label and its inputs can disagree.
+// MarshalJSON adds the optional schema-1.4 provenance field to native JSON.
+// Deriving it from final Type/Resolution values avoids a stale stored label after
+// resolution refinement. The compact format stores those inputs unchanged and
+// recovers the same label when decoded relations are serialized as native JSON.
+// SCIP is a lossy navigation projection and does not carry this annotation.
+// See docs/snapshot-format.md and the serialized contract tests in
+// edge_provenance_serialization_test.go. Go callers use EdgeProvenance directly.
 func (r RelationRecord) MarshalJSON() ([]byte, error) {
 	// The alias sheds the method set, so marshalling the embedded value does
 	// not recurse back into this function.
