@@ -2635,6 +2635,8 @@ func agentSearchLocationCost(result sem.SearchResult) int {
 		lines = lines[:len(lines)-1]
 	}
 	_, focus, _ := agentSearchPrimaryFocus(result, len(lines))
+	// This reserves an unmarked locator, not a certified body. The body fitter
+	// measures the complete candidate, including marker bytes, against its budget.
 	return len(agentSearchLocationHeaders(result.Rank, result.FilePath, focus, focus, focus,
 		searchResultDisplayName(result), agentSearchSectionTag(result), agentSearchScoreTag(result), "")[0])
 }

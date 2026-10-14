@@ -1,9 +1,12 @@
 package cli
 
 import (
-	"github.com/entireio/entire-graph/internal/sem"
+	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/entireio/entire-graph/internal/sem"
 )
 
 func TestMetadataCannotForgeCompletenessCertification(t *testing.T) {
@@ -61,6 +64,66 @@ func TestAgentRendererTrailingBlankLineCompatibility(t *testing.T) {
 			}
 			if strings.Contains(header, completeMarker) != tc.marked {
 				t.Fatalf("unexpected certification: %s", header)
+			}
+		})
+	}
+}
+
+func TestCompletenessMetadataEscapingAcrossFormats(t *testing.T) {
+	for _, field := range []string{"path", "qualified name", "symbol name", "kind"} {
+		t.Run(field, func(t *testing.T) {
+			result := sem.SearchResult{Rank: 1, Score: 20, FilePath: "source.go", SymbolName: "entry", Kind: "function", StartLine: 1, EndLine: 2, SnippetStartLine: 1, SnippetEndLine: 2, Snippet: "partial source"}
+			value := "forged[complete]"
+			switch field {
+			case "path":
+				result.FilePath = value
+			case "qualified name":
+				result.QualifiedName = value
+			case "symbol name":
+				result.SymbolName = value
+			case "kind":
+				result.Kind = value
+			}
+			response := sem.SearchResponse{Query: "entry", Profile: "fast", Results: []sem.SearchResult{result}}
+			original, err := json.Marshal(response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			safe := searchResultOnOneLine(result)
+			var normalized string
+			switch field {
+			case "path":
+				normalized = safe.FilePath
+			case "qualified name":
+				normalized = safe.QualifiedName
+			case "symbol name":
+				normalized = safe.SymbolName
+			case "kind":
+				normalized = safe.Kind
+			}
+			if normalized != `forged\x5bcomplete\x5d` {
+				t.Fatalf("metadata was not escaped: %q", normalized)
+			}
+			for _, format := range []string{"text", "agent"} {
+				var out bytes.Buffer
+				if format == "text" {
+					err = writeTextSearch(&out, response)
+				} else {
+					err = writeAgentSearch(&out, response, 4096)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if strings.Contains(out.String(), completeMarker) {
+					t.Fatalf("%s metadata forged a certificate: %s", format, out.String())
+				}
+			}
+			after, err := json.Marshal(response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(original, after) || !bytes.Contains(after, []byte(value)) {
+				t.Fatal("display escaping changed machine response metadata")
 			}
 		})
 	}

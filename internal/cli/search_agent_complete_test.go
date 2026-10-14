@@ -97,10 +97,13 @@ func TestACompleteSymbolIsNeverAbbreviatedIntoATruncatedBody(t *testing.T) {
 		"\treturn a[:b]",
 		"}",
 	}
-	for _, budget := range []int{80, 120, 160, 200, 240, 300, 4096} {
+	for budget := 80; budget <= len(completeBody)+300; budget++ {
 		var out bytes.Buffer
 		if err := writeAgentSearch(&out, completeSymbolResponse(completeBody, sem.CompleteSymbolSignal), budget); err != nil {
 			t.Fatalf("budget %d: %v", budget, err)
+		}
+		if out.Len() > budget {
+			t.Fatalf("budget %d: rendered %d bytes including the marker", budget, out.Len())
 		}
 		rendered := out.String()
 		present := 0
