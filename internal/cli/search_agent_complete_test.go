@@ -27,8 +27,8 @@ func completeSymbolResponse(snippet string, signals ...string) sem.SearchRespons
 		Profile: "fast",
 		Results: []sem.SearchResult{
 			{
-				Rank: 1, Score: 20, FilePath: "budget.go", StartLine: 10, EndLine: 14, FocusLine: 10,
-				SnippetStartLine: 10, SnippetEndLine: 14, SymbolName: "FitToBudget",
+				Rank: 1, Score: 20, FilePath: "budget.go", StartLine: 10, EndLine: 15, FocusLine: 10,
+				SnippetStartLine: 10, SnippetEndLine: 15, SymbolName: "FitToBudget",
 				Signals: signals, Snippet: snippet,
 			},
 		},

@@ -1107,6 +1107,11 @@ func searchLocatorFollowUp(result sem.SearchResult) string {
 	return "  [body: def " + name + "]"
 }
 
+// searchMetadataLine reserves the completeness token for renderer certification.
+func searchMetadataLine(value string) string {
+	return strings.ReplaceAll(termsafe.Line(value), completeMarker, `\x5bcomplete\x5d`)
+}
+
 // searchResultOnOneLine makes one result safe to print into a one-record-per-line payload.
 //
 // It escapes the fields that go into a result's HEADER, where a newline is not layout but
@@ -1128,17 +1133,18 @@ func searchLocatorFollowUp(result sem.SearchResult) string {
 // The result is taken and returned BY VALUE, and a passage slice is copied before any element of
 // it changes. Nothing upstream sees the escaped copy, so the JSON encoding of the same response
 // still reports the exact bytes the repository holds.
-// Reserve the completeness token for renderer certification, never source metadata.
-func searchMetadataLine(value string) string {
-	return strings.ReplaceAll(termsafe.Line(value), completeMarker, `\x5bcomplete\x5d`)
-}
-
 func searchResultOnOneLine(result sem.SearchResult) sem.SearchResult {
 	result.FilePath = searchMetadataLine(result.FilePath)
 	result.QualifiedName = searchMetadataLine(result.QualifiedName)
 	result.SymbolName = searchMetadataLine(result.SymbolName)
 	result.Kind = searchMetadataLine(result.Kind)
-	result.Snippet, _ = searchQuarantineBody(result.Snippet)
+	snippet, changed := searchQuarantineBody(result.Snippet)
+	result.Snippet = snippet
+	if changed && slices.Contains(result.Signals, sem.CompleteSymbolSignal) {
+		// Quarantined text is safe to display but is no longer byte-exact source.
+		// Clone before removing the certificate so the machine response is untouched.
+		result.Signals = slices.DeleteFunc(slices.Clone(result.Signals), func(signal string) bool { return signal == sem.CompleteSymbolSignal })
+	}
 	for index, passage := range result.Passages {
 		quarantined, changed := searchQuarantineBody(passage.Snippet)
 		if !changed {
@@ -1439,75 +1445,18 @@ func searchResultCarriesCompleteBody(result sem.SearchResult) bool {
 	return false
 }
 
-// completeMarker rides the agent header for a body that is the whole symbol. It is the
-// only per-result token that can remove a follow-up read, which is the only way this
-// tool saves anything: a graph call that routes the agent to a file it then opens is
-// additive, and measured that way it loses. The tool makes +19.6% MORE Read calls than
-// the no-tool baseline while total tool calls fall 14.5% (search_span_merge.go:20-23,
-// n=55 paired), and re-reading a file the payload already printed is 10.1% of
-// post-payload tool calls (search.go:1245). Bodies removed greps and added reads.
-//
-// ~11 bytes per marked result against a follow-up read the engine prices at a whole
-// turn (search_enclosure.go:10-27: 95.9% of billed tokens are context re-read, a mean
-// turn re-reads ~47.5k tokens to deliver ~390 tokens of new information).
+// completeMarker certifies a whole, byte-exact primary symbol body in agent output.
 const completeMarker = "[complete]"
 
-// searchResultNeedsNoFollowUpRead is deliberately NARROWER than
-// searchResultCarriesCompleteBody, and the difference is the whole point.
-//
-// complete-symbol and full-unit both "assert that the reader is looking at the whole
-// unit and needs no follow-up read" (search_enclosure.go:779-781). head-window does
-// NOT: the allocator spent budget widening it, but ":774-776" is explicit that a window
-// "deliberately does NOT get complete-symbol: that signal is the promise 'you need no
-// follow-up read', and a window cannot make it." callee-hop is a separate promise again.
-//
-// So the broad predicate is right for "did we spend bytes on source here" (its job: the
-// body diet) and wrong for "may the agent skip the file". Marking a window complete
-// would send the agent away holding a fragment it believes is whole, which is worse
-// than not marking anything at all.
-// searchResultNeedsNoFollowUpRead reports whether a result may be rendered with the
-// no-follow-up promise. It accepts complete-symbol ONLY, and rejects an elided unit outright.
-//
-// An earlier revision of this function also accepted full-unit, on the strength of
-// search_enclosure.go:779-781 ("full-unit and complete-symbol both assert that the reader is
-// looking at the whole unit"). That sentence describes the unclipped case. The producer at
-// search_enclosure.go:792-803 emits full-unit AND unit-elided, and deliberately WITHHOLDS
-// complete-symbol, for a forced unit the safety cap clipped -- "for the same reason a window
-// does". search_editability_test.go:274-292 pins it.
-//
-// So full-unit alone stamped [complete] onto a fragment, and the conditional-read guidance then
-// told the agent not to open the file: it would have edited against source it believed was whole.
-// Caught in peer review, not by the tests here, which were formatter-level and could not see a
-// producer contract. The producer-driven case is now covered.
-//
-// Rejecting unit-elided is redundant against today's producer, which never pairs it with
-// complete-symbol. It is kept because the failure is silent and reaches users: if the two ever do
-// co-occur, the safe reading is the pessimistic one.
-// renderedBodyIsTransformed reports whether terminal-safe escaping will rewrite this body on
-// the way out, which makes the no-follow-up promise false even when the RANGE is whole.
-//
-// Found by a peer reviewer, not by me, on a body holding a DEL byte: the structural range was
-// the entire symbol and [complete] was printed, while the rendered text carried a literal
-// backslash-x7f where the source has 0x7f. An agent that trusts the marker and reuses those
-// bytes has changed the program. Structural completeness and byte fidelity are two different
-// promises and the marker was only ever checking the first.
-//
-// The escaping STAYS -- emitting raw control bytes to a terminal is the thing termsafe exists
-// to prevent, and a correctness marker must not be fixed by weakening a security boundary.
-// Withholding the promise is the right direction: the agent reads the file, which is exactly
-// what it would have done without the marker.
-//
-// This is the same rule the VERIFY deriver already applies, for the same reason -- termsafe's
-// own EscapesLine doc records that a command "must be runnable exactly as printed and so must
-// not be emitted at all when display would rewrite it". A body promised as reusable is under
-// that identical obligation. termsafe.Bytes is the right probe rather than EscapesLine: a
-// snippet is rendered through keepLayout, where a body's own line structure is legitimate and
-// is deliberately NOT escaped, so the line-mode predicate would withhold the marker on
-// ordinary multi-line source.
+// renderedBodyIsTransformed reports whether terminal-safe output rewrites source
+// bytes. Multiline layout alone does not count as a transformation.
 func renderedBodyIsTransformed(body string) bool {
 	return string(termsafe.Bytes([]byte(body))) != body
 }
 
+// searchResultNeedsNoFollowUpRead requires the producer's complete-symbol signal.
+// A full-unit or head-window signal alone does not certify an unelided body;
+// unit-elided wins if a contradictory complete-symbol signal is also present.
 func searchResultNeedsNoFollowUpRead(result sem.SearchResult) bool {
 	complete := false
 	for _, signal := range result.Signals {
@@ -2808,8 +2757,9 @@ func agentSearchPrimaryBlockFromTier(result sem.SearchResult, budget, firstTier 
 	name := searchResultDisplayName(result)
 	tag := agentSearchSectionTag(result)
 	scored := agentSearchScoreTag(result)
+	canCertify := searchResultNeedsNoFollowUpRead(result) && !renderedBodyIsTransformed(result.Snippet)
 	lines := strings.Split(result.Snippet, "\n")
-	if len(lines) > 1 && lines[len(lines)-1] == "" && (result.SnippetStartLine <= 0 || result.SnippetEndLine-result.SnippetStartLine+1 < len(lines)) {
+	if len(lines) > 1 && lines[len(lines)-1] == "" && (!canCertify || result.SnippetStartLine <= 0 || result.SnippetEndLine-result.SnippetStartLine+1 < len(lines)) {
 		lines = lines[:len(lines)-1]
 	}
 	snippetStart, focusLine, focus := agentSearchPrimaryFocus(result, len(lines))
@@ -2817,27 +2767,13 @@ func agentSearchPrimaryBlockFromTier(result sem.SearchResult, budget, firstTier 
 		return fitAgentSearchLocation(result.Rank, result.FilePath, focusLine, name, tag, scored, budget)
 	}
 
-	// A result that promises no follow-up read is BINARY: the whole symbol, or a locator.
-	// CompleteSymbolSignal's exported contract says a result carrying it "must never be
-	// abbreviated on the way out" (search_enclosure.go:342-344), and the span loop below
-	// abbreviates: it walks the body down line by line until some prefix fits. On a
-	// promise-carrying result that is the worst of both worlds -- the bytes are spent AND
-	// the agent still opens the file -- and it turns a truthful marker into a false one,
-	// because the header would then vouch for a body that is missing its tail.
-	//
-	// So: offer the complete body once. If it does not fit, fall through to a locator with
-	// no marker, which costs ~40 bytes and tells the truth. Dropping to a locator is not a
-	// loss here: an abbreviated complete symbol was never going to remove the read that
-	// justifies its cost.
-	if searchResultNeedsNoFollowUpRead(result) && !renderedBodyIsTransformed(result.Snippet) {
+	// Certified bodies are emitted whole with their marker, or as an unmarked
+	// locator when they cannot fit. Other results retain ordinary excerpt fitting.
+	if canCertify {
 		text := strings.Join(lines, "\n")
 		startLine, endLine := snippetStart, snippetStart+len(lines)-1
 		for _, header := range agentSearchLocationHeaders(result.Rank, result.FilePath, startLine, endLine, focusLine, name, tag, scored, completeMarker) {
-			// The minimal rung drops the marker, so it must not be used to seat a body:
-			// measured at a 200-byte cap it printed the whole symbol under `budget.go:10 *`,
-			// handing the agent a complete answer with nothing saying so -- which buys the
-			// bytes and none of the saved read. Body present implies marker present; if only
-			// the marker-less rung fits, this is a locator instead.
+			// The minimal header cannot certify a body; use it only as a locator.
 			if !strings.Contains(header, completeMarker) {
 				break
 			}
@@ -2932,15 +2868,9 @@ func fitAgentSearchRankedLocation(rank int, path string, focus int, name, tag, s
 	return nil
 }
 
-// `complete` is completeMarker when the body below the header is the whole symbol, and
-// empty otherwise. It rides the two roomier variants beside `tag`; the minimal rung
-// drops it along with rank and name.
-//
-// That makes the minimal rung unusable for seating a complete body, and the caller
-// enforces it rather than this function: agentSearchPrimaryBlock stops at the first
-// marker-less rung and emits a locator instead. Measured before that guard existed, a
-// 200-byte cap printed the whole symbol under `budget.go:10 *` -- a complete answer
-// with nothing saying it was complete, which costs the bytes and saves no read.
+// agentSearchLocationHeaders offers rich, compact, and minimal locator headers.
+// Only the first two can carry a completeness marker. Callers must not seat a
+// certified body under the marker-less minimal header.
 func agentSearchLocationHeaders(rank int, path string, start, end, focus int, name, tag, scored, complete string) []string {
 	location := fmt.Sprintf("%d. %s:%d", rank, path, start)
 	if end != start {
@@ -2972,10 +2902,7 @@ func agentSearchLocationHeaders(rank int, path string, start, end, focus int, na
 	return []string{rich, compact, minimal}
 }
 
-// A locator carries no body, so it never carries completeMarker: the marker vouches for
-// source printed beneath it, and there is none here. This is the landing place for a
-// complete symbol that could not fit its budget, which is exactly the case where
-// claiming completeness would be worst.
+// fitAgentSearchLocation fits a bodyless locator, which never carries a marker.
 func fitAgentSearchLocation(rank int, path string, focus int, name, tag, scored string, budget int) []byte {
 	for _, header := range agentSearchLocationHeaders(rank, path, focus, focus, focus, name, tag, scored, "") {
 		if budget <= 0 || len(header) <= budget {
