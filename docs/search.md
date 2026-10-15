@@ -44,6 +44,12 @@ The default format is JSON, one object per query:
   formats render it as a `VERIFY:` line. It is a suggestion constructed from
   repository contents; read it before running it (see
   [trust and security](trust-and-security.md)).
+  Language-specific suite fallbacks require a matching source or covering test;
+  a neighboring manifest alone does not assign an unrelated language's runner.
+  Native Go inputs require bounded, same-package evidence (and a real `import
+  "C"` for cgo inputs). This does not evaluate platform/build constraints or
+  infer SWIG-generated sources. The `targets` description distinguishes a whole
+  suite from an identified narrow command.
 - `stats`: counts, byte accounting, latency, and `index_cache_hit`.
 - `warnings`, `partial_failures`, `completeness`: machine-readable coverage:
   which languages and how many files/symbols/relations backed this answer, and
