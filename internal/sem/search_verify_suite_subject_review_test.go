@@ -51,7 +51,7 @@ func TestSuiteSubjectCannotBeCapturedByUnrelatedManifest(t *testing.T) {
 }
 
 func TestCargoSuiteRecognizesNativeBridgeHeaders(t *testing.T) {
-	for _, extension := range []string{".hh", ".hpp", ".hxx"} {
+	for _, extension := range []string{".hh", ".hpp", ".hxx", ".cxx", ".m", ".mm"} {
 		t.Run(extension, func(t *testing.T) {
 			evidence := searchVerifyTestEvidenceWithout(map[string]string{
 				"Cargo.toml": "[package]\nname = \"native_bridge\"\nversion = \"0.1.0\"\n",
@@ -61,5 +61,15 @@ func TestCargoSuiteRecognizesNativeBridgeHeaders(t *testing.T) {
 				t.Fatalf("Cargo-only native bridge header: command = %+v, want cargo test", command)
 			}
 		})
+	}
+}
+
+func TestRubySuiteRecognizesBuildAndPackageInputs(t *testing.T) {
+	for _, subject := range []string{"tasks/check.rake", "widget.gemspec", "Rakefile"} {
+		evidence := searchVerifyTestEvidenceWithout(map[string]string{"Rakefile": "task :test do\nend\n"})
+		got := deriveSearchVerifySuiteCommand(searchVerifySubject{sourcePath: subject}, &evidence)
+		if got == nil || got.Command != "rake test" {
+			t.Fatalf("%s: got %+v, want rake test", subject, got)
+		}
 	}
 }

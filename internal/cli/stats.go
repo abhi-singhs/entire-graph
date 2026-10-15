@@ -1329,7 +1329,7 @@ func stripHeredocBodies(command string) string {
 		kept = append(kept, lines[index])
 		openers := heredocOpeners(lines[index])
 		cursor, closed := index+1, len(openers) > 0
-		for _, opener := range openers {
+		for openerIndex, opener := range openers {
 			terminator := -1
 			for ; cursor < len(lines); cursor++ {
 				line := strings.TrimSuffix(lines[cursor], "\r")
@@ -1343,6 +1343,12 @@ func stripHeredocBodies(command string) string {
 				}
 			}
 			if terminator < 0 {
+				// A completed earlier body establishes this as a heredoc command.
+				// Shells consume the unfinished subsequent body through EOF; those
+				// bytes cannot become commands merely because its closer is absent.
+				if openerIndex > 0 {
+					return strings.Join(kept, "\n")
+				}
 				closed = false
 				break
 			}
@@ -1359,7 +1365,8 @@ func stripHeredocBodies(command string) string {
 //
 // It is deliberately conservative, because a false positive costs real commands: stripHeredocBodies
 // would discard the lines that follow. Three guards here, and stripHeredocBodies adds a fourth by
-// refusing to strip an unterminated body:
+// refusing to strip an unterminated first body. Once an earlier body closes,
+// unfinished subsequent bodies are unambiguous data through EOF:
 //
 //   - the `<<` must be OUTSIDE quotes, so `echo "count << 2"` opens nothing;
 //   - `<<<` is a here-STRING, whose data is on the same line;
