@@ -31,6 +31,7 @@ auto-generated notes on
 
 ### Fixed
 
+- Corrected transcript exploration classification for quoted commands, pipeline tails and writes; added signed stats model totals while retaining legacy JSON fields. Search `stats.context_block_bytes` now includes file outlines, correcting the reported total without increasing payload size.
 - Preserved validated nested repository boundaries in working-tree fallback scans, avoiding duplicate source and search results from untracked nested clones, linked worktrees, and submodules while retaining outer-repository tracked source.
 - Classified ambiguous same-file nearest-declaration call guesses as `name_only` with reduced confidence, preserving the ambiguity through C++ out-of-line mapping. This corrects false certainty, not semantic overload selection; fast-profile and argument-forwarding filters now omit these uncertain edges.
 - Fixed seven wrong-answer defects in the provider and type scanners and stopped bare type names resolving across language boundaries.
