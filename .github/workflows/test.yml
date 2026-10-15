@@ -320,6 +320,8 @@ jobs:
   # No windows-latest: the script targets /bin/sh.
   statusline:
     strategy:
+      # Let both platforms finish so a failure preserves independent diagnostics.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
