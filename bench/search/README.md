@@ -54,3 +54,8 @@ show that only `internal/sem/search.go` differs between the compared builds.
 
 `git-preselection-probe.json` records the separate baseline Git timeout and its
 corpus pin. It is excluded from these scoring aggregates, not counted as a pass.
+
+The baseline production-source fingerprint matches core candidate commit
+`5f9f6cfba223ceb64b8bcd404891df7fef818554`, merged into main as
+`ba38a3e94e08cc9afaefeed3f7d01c6d0e8a572e`. The result file also records the
+candidate search-source Git blob for reproduction independently of merge metadata.

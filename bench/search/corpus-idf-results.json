@@ -5189,5 +5189,10 @@
   "changed_production_source_files": [
     "internal/sem/search.go"
   ],
-  "run_date": "2026-10-15"
+  "run_date": "2026-10-15",
+  "source_refs": {
+    "baseline_core_head": "5f9f6cfba223ceb64b8bcd404891df7fef818554",
+    "baseline_main_merge": "ba38a3e94e08cc9afaefeed3f7d01c6d0e8a572e",
+    "candidate_search_blob": "ce78d14ac7212edc4fa7e5e49fad433e06341448"
+  }
 }
