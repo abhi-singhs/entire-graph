@@ -22,7 +22,8 @@ import (
 func TestTightAgentBudgetKeepsSourceAcrossHeaderWidths(t *testing.T) {
 	t.Parallel()
 	repo := t.TempDir()
-	write(t, repo, "a.py", "def target():\n    return True\n")
+	// A top-level assignment exercises ordinary source fitting, not callable certification.
+	write(t, repo, "a.py", "target = True\n")
 	for _, budget := range []string{"64", "60", "56", "52", "48"} {
 		var out bytes.Buffer
 		err := Run(t.Context(), Options{Version: "0.1.0", Env: EntireEnv{RepoRoot: repo}, Stdout: &out}, []string{
@@ -89,7 +90,7 @@ func TestAgentSearchBlockKeepsIdentityBeforeBodyLines(t *testing.T) {
 		StartLine: 1, EndLine: 5, SnippetStartLine: 1, FocusLine: 1, Snippet: body,
 	}
 	minimalWhole := len("a.go:1 *\n") + len(body)
-	got := string(agentSearchPrimaryBlock(result, minimalWhole, false))
+	got := string(agentSearchPrimaryBlock(result, minimalWhole))
 	if len(got) > minimalWhole {
 		t.Fatalf("block used %d bytes, budget %d: %q", len(got), minimalWhole, got)
 	}
