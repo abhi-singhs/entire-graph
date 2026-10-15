@@ -86,6 +86,14 @@ without adding signals after the producer's byte budget has been finalized.
 
 ## Profiles
 
+Term-rarity weights use repository-wide content frequencies when the search can
+establish exact counts. Bounded or unread-file cases that cannot establish them
+fall back to statistics from the inspected sample. This corrects a bias from
+counting only files preselected for matching the query, and can change result
+order. Other ranking inputs, such as average candidate length, can still vary
+between backends. The [pinned scoring comparison](../bench/search/README.md)
+records a limited before/after cohort and its coverage boundaries.
+
 `query` defaults to `--profile fast` (shallow, high-precision call
 resolution). The installed agent guide asks for `--profile full`, which
 enables the complete relation set and deeper graph expansion. Profile is part

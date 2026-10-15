@@ -31,6 +31,7 @@ auto-generated notes on
 
 ### Fixed
 
+- Corrected search term-rarity weighting to use repository-wide content frequencies when exact counts are available, with inspected-sample fallback when they are not. This can change result ordering without changing symbols or the output schema.
 - Corrected transcript exploration classification for quoted commands, pipeline tails and writes; added signed stats model totals while retaining legacy JSON fields. Search `stats.context_block_bytes` now includes file outlines and validates their measured cost and independent cap.
 - Scoped generated agent guidance to the observed source view: a complete body does not certify later freshness or dependencies, and unmarked source no longer mandates a duplicate read. Follow-up reads target missing or possibly changed source.
 - Certified already-whole search bodies against their exact source without changing the selected JSON spans, and retained the whole-certified-body-or-locator rendering contract under tight budgets.
