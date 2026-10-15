@@ -2,12 +2,7 @@
 """Claude Code UserPromptSubmit hook: put the code graph's answer for the user's request into the session context,
 once per session, with no tool call.
 
-Why this shape (pilot8 evidence, entirehq/graphmark pilot8-prep, CHANGES-fairness §11/§12):
-  - A graph SEARCH TOOL call costs a whole agent turn (~20K cached tokens on Claude Code), so making the agent call the
-    graph cost +26% tokens (Stage L) without improving resolution.
-  - The same answer injected into the prompt (Stages P and A) was token-neutral (A: +0.7%, CI ±11%) and resolved more
-    tasks in both stages (P 25 vs 23, A 26 vs 23 of 35 known pairs; b/c = 2/0 and 4/1). Not statistically significant.
-    That is why this hook is OPT-IN and labelled experimental.
+This experimental hook is opt-in. See README.md for the evaluation rationale.
 
 Opt in:  ENTIRE_GRAPH_PROMPT_CONTEXT=1   (in the environment Claude Code is started from, or settings.json "env").
 Tuning:  ENTIRE_GRAPH_PROMPT_CONTEXT_BYTES (default 2048, the measured setting), ENTIRE_GRAPH_BIN (default: `entire`

@@ -215,22 +215,6 @@ context in combined mode; Graph handles further discovery and structural analysi
 Sufficient task or brief locations permit direct source inspection. Ground claims
 in inspected source and executed verification.
 
-## What to ask
-
-Prompts are the interface. The commands are what the agent runs underneath;
-you can also invoke them directly for manual inspection, debugging, or
-automation. See the [command reference](docs/commands.md).
-
-| Goal | Example prompt | Graph command |
-| --- | --- | --- |
-| Find the implementation | Find where request routing is implemented. | `query` |
-| Read one definition | Show the definition of `ResolveRoute`. | `def` |
-| Trace callers or callees | What calls `ResolveRoute`? | `neighbors` |
-| Check the blast radius | What would changing `ResolveRoute` affect? | `impact` |
-| Review a branch | Summarize the semantic changes from `main` to `HEAD`. | `diff` |
-| Export the full graph | Export the repository graph as NDJSON. | `snapshot` |
-| Inspect indexing health | Show parser coverage and affected files, including healthy results. | `health` |
-
 ## Benchmarks
 
 To put entire-graph to the test, we ran it through

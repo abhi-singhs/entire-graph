@@ -61,6 +61,28 @@ The default format is JSON, one object per query:
   (`Index: cache-hit (…ms) | Query: …ms | …`), degrading gracefully under
   tight byte budgets.
 
+## Complete bodies in agent output
+
+An agent result header may carry `[complete]` when the producer certified the
+whole primary symbol body and display preserves its source bytes. A clipped
+unit, a head window, or a body rewritten by terminal escaping or quarantine is
+not certified. File names and other metadata escape the reserved token so they
+cannot impersonate this header annotation. JSON/NDJSON retain the original data.
+Text output also omits the `complete-symbol` signal when display changes the body.
+
+For certified bodies, the agent renderer emits the whole body with the marker
+or falls back to an unmarked locator if the budget cannot hold it. Ordinary
+uncertified results retain excerpt fitting and trailing-line behavior. A genuine
+final source blank line is preserved only on the certified path; an ordinary
+line terminator does not become an extra source line.
+
+Marker absence is conservative: it does not prove that a body is incomplete.
+The producer may leave an already-visible small callable uncertified when no
+enclosure upgrade occurred. `--full-unit-top` requests explicit unit expansion;
+a safety-clipped forced unit still cannot claim completeness. Renderer tests
+cover certification through both opportunistic enclosure and forced-unit paths
+without adding signals after the producer's byte budget has been finalized.
+
 ## Profiles
 
 `query` defaults to `--profile fast` (shallow, high-precision call
