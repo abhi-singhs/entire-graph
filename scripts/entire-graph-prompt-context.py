@@ -23,6 +23,8 @@ import time
 
 HEADING = "Code locations for this request (prompt input from the local code graph, entire-graph):"
 QUERY_CHARS = 160
+DEFAULT_CONTEXT_BYTES = 2048
+MAX_CONTEXT_BYTES = 16384
 # Search budget. The hook runs before the prompt reaches the model, so it must never noticeably delay it: past this
 # the search is abandoned and nothing is injected (fail open). hooks/hooks.json's timeout must stay above it.
 TIMEOUT_S = 8
@@ -227,6 +229,13 @@ def handle(stdin, stdout, env):
     query = first_line(prompt)
     if not query or query.startswith("/") or not session:
         return 0
+    try:
+        budget = min(int(env.get("ENTIRE_GRAPH_PROMPT_CONTEXT_BYTES", str(DEFAULT_CONTEXT_BYTES))), MAX_CONTEXT_BYTES)
+    except ValueError:
+        budget = DEFAULT_CONTEXT_BYTES
+    # The Go renderer interprets nonpositive budgets as unbounded; never forward them.
+    if budget <= 0:
+        return 0
     marker = once_marker(env, session)
     try:
         descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -247,11 +256,7 @@ def handle(stdin, stdout, env):
     if state["probe"] != "ok":
         return 0
     try:
-        budget = str(int(env.get("ENTIRE_GRAPH_PROMPT_CONTEXT_BYTES", "2048")))
-    except ValueError:
-        budget = "2048"
-    try:
-        r = search(argv, query, repo, budget, run_env, TIMEOUT_S)
+        r = search(argv, query, repo, str(budget), run_env, TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return 0
     if r is None or r.returncode != 0:

@@ -115,6 +115,10 @@ export ENTIRE_GRAPH_PROMPT_CONTEXT=1          # off unless set
 # optional: ENTIRE_GRAPH_BIN=/path/to/entire  # run as `<path> graph search`; any other command as `<cmd> search`
 ```
 
+The graph-output budget defaults to 2048 bytes. Zero or negative values disable
+injection before any probe or search; invalid integers use the default. Positive
+values are capped at 16384 bytes. The untrusted-data frame adds a small wrapper.
+
 Project settings may enable the hook and select `ENTIRE_GRAPH_BIN` after workspace
 trust is granted. Enable it only in trusted workspaces. Paths containing spaces
 are supported as whole paths or quoted tokens. Without opt-in the shell guard

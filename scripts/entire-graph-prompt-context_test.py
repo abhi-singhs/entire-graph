@@ -76,6 +76,18 @@ class T(unittest.TestCase):
     def test_off_by_default(self):
         env = dict(self.env); env.pop("ENTIRE_GRAPH_PROMPT_CONTEXT")
         self.assertEqual(self.run_hook(self.ev(), env), (0, ""))
+
+    def test_nonpositive_context_budget_disables_before_running_a_binary(self):
+        for value in ("0", "-1", "-999"):
+            env = dict(self.env, ENTIRE_GRAPH_PROMPT_CONTEXT_BYTES=value)
+            self.assertEqual(self.run_hook(self.ev(session="disabled-" + value), env), (0, ""))
+            self.assertFalse(os.path.exists(self.args + ".calls"))
+
+    def test_large_context_budget_has_a_finite_cap(self):
+        env = dict(self.env, ENTIRE_GRAPH_PROMPT_CONTEXT_BYTES="999999999")
+        self.run_hook(self.ev(), env)
+        args = open(self.args).read().splitlines()
+        self.assertEqual(args[args.index("--max-context-bytes") + 1], "16384")
     def test_diagnostic_only_answers_add_no_locations(self):
         for marker in ("!N I:miss X5", "!N X5", "!D", "!D W1 F2 L3/4 I:hit X5"):
             self.assertEqual(pc.clean(marker), "")
