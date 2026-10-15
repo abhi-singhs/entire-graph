@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -30,6 +31,9 @@ type Options struct {
 	// piped input, because it is the only one whose question ("what are these names the build is
 	// complaining about") is asked by composing with another command rather than by naming a symbol.
 	Stdin io.Reader
+	// buildInfo overrides how the session replay reads this binary's build metadata. Unexported and
+	// nil in production (debug.ReadBuildInfo); tests set it to exercise specific producer identities.
+	buildInfo func() (*debug.BuildInfo, bool)
 }
 
 func Execute(version string, args []string) error {

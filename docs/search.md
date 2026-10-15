@@ -115,3 +115,8 @@ fixed diagnostic floor (`repo_ignored`, `warnings`, `completeness`,
 agent renderer is the only one whose ceiling binds the whole payload rather than
 `results` alone. Profile is not where the cost is: `full` versus `fast` differed
 by 42 bytes on the same query.
+
+Session replay requires a clean VCS revision stamped into the producing binary.
+Unstamped or modified builds always search again; a changed producer invalidates
+the stored answer. This identifies a source revision, not the toolchain or build
+flags. Binaries installed without VCS metadata trade replay reuse for freshness.
