@@ -32,6 +32,7 @@ auto-generated notes on
 
 ### Fixed
 
+- Preserved editing-tool read prerequisites and unknown-freshness fallback in every generated guide, with a guard keeping the checked-in activation artifact synchronized with the installer.
 - The normal agent guide no longer caps graph use at ONE query: it asks for a Graph call on each locate or relationship question, names `def`, `neighbors` and `impact` for follow-ups, and gives every command with `--head` and a 4 KiB budget. Agents following the old wording ran one uncached query, then switched to grep.
 - Corrected search term-rarity weighting to use repository-wide content frequencies when exact counts are available, with inspected-sample fallback when they are not. This can change result ordering without changing symbols or the output schema.
 - Corrected transcript exploration classification for quoted commands, pipeline tails and writes; added signed stats model totals while retaining legacy JSON fields. Search `stats.context_block_bytes` now includes file outlines and validates their measured cost and independent cap.
