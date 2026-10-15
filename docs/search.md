@@ -22,7 +22,10 @@ a surprising hit can be audited instead of trusted.
 
 Results are byte-budgeted to drop into an agent's context: top hits carry full
 snippets, later hits shrink to locators, and `--max-context-bytes` bounds the
-total (`0` removes the bound). `--top-k` sets the result count.
+total (`0` removes the bound). `--top-k` caps normal results, including automatic
+related sites and covering tests. Explicit `--callee-hop` is an exception: it may
+add called-helper results beyond that cap, under its existing byte-budget and
+ranked-source protections.
 
 ## What a response contains
 
@@ -58,6 +61,28 @@ The default format is JSON, one object per query:
   (`Index: cache-hit (…ms) | Query: …ms | …`), degrading gracefully under
   tight byte budgets.
 
+## Complete bodies in agent output
+
+An agent result header may carry `[complete]` when the producer certified the
+whole primary symbol body and display preserves its source bytes. A clipped
+unit, a head window, or a body rewritten by terminal escaping or quarantine is
+not certified. File names and other metadata escape the reserved token so they
+cannot impersonate this header annotation. JSON/NDJSON retain the original data.
+Text output also omits the `complete-symbol` signal when display changes the body.
+
+For certified bodies, the agent renderer emits the whole body with the marker
+or falls back to an unmarked locator if the budget cannot hold it. Ordinary
+uncertified results retain excerpt fitting and trailing-line behavior. A genuine
+final source blank line is preserved only on the certified path; an ordinary
+line terminator does not become an extra source line.
+
+Marker absence is conservative: it does not prove that a body is incomplete.
+The producer may leave an already-visible small callable uncertified when no
+enclosure upgrade occurred. `--full-unit-top` requests explicit unit expansion;
+a safety-clipped forced unit still cannot claim completeness. Renderer tests
+cover certification through both opportunistic enclosure and forced-unit paths
+without adding signals after the producer's byte budget has been finalized.
+
 ## Profiles
 
 `query` defaults to `--profile fast` (shallow, high-precision call
@@ -65,3 +90,13 @@ resolution). The installed agent guide asks for `--profile full`, which
 enables the complete relation set and deeper graph expansion. Profile is part
 of the cache key, so mixing profiles across runs builds separate cache
 entries. See the [operations cache guide](operations.md#cache).
+
+The guide also asks for `--format agent`, which is a cost choice rather than a
+depth one. Measured on one query against this repository, `--profile full` with
+the default json rendering came to 17595 bytes and the same query with
+`--format agent` to 6011 -- 2.93x cheaper for the same results. json carries a
+fixed diagnostic floor (`repo_ignored`, `warnings`, `completeness`,
+`partial_failures`, `stats`) that `--max-context-bytes` does not bound, and the
+agent renderer is the only one whose ceiling binds the whole payload rather than
+`results` alone. Profile is not where the cost is: `full` versus `fast` differed
+by 42 bytes on the same query.

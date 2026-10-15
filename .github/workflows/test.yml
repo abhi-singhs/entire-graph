@@ -13,10 +13,10 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7.0.0
         with: { go-version: "1.27.x" }
       - run: go vet ./...
       - run: |
@@ -34,10 +34,10 @@ jobs:
   notices:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7.0.0
         with: { go-version: "1.27.x" }
       - run: sh scripts/gen-notices.sh --check
 
@@ -47,10 +47,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7.0.0
         with: { go-version: "1.27.x" }
       - run: go build ./...
 
@@ -60,10 +60,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7.0.0
         with: { go-version: "1.27.x" }
       # Keep the named package budget consistent with the Windows shard policy.
       - run: go test -timeout 30m ./...
@@ -75,10 +75,10 @@ jobs:
     outputs:
       shard-matrix: ${{ steps.shard-matrix.outputs.value }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version: "1.27.x"
           cache-dependency-path: go.sum
@@ -115,7 +115,7 @@ jobs:
           "value=$matrix" | Out-File -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - name: Upload immutable Windows test bundle
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-test-bundle
           path: ${{ runner.temp }}/windows-test-bundle
@@ -134,17 +134,17 @@ jobs:
       matrix:
         shard: ${{ fromJSON(needs.windows-test-prepare.outputs.shard-matrix) }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version: "1.27.x"
           cache-dependency-path: go.sum
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           name: windows-test-bundle
           path: ${{ runner.temp }}/windows-test-bundle
@@ -164,7 +164,7 @@ jobs:
           exit $LASTEXITCODE
       - name: Upload shard evidence
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-test-shard-${{ matrix.shard }}
           path: ${{ runner.temp }}/windows-test-shard-${{ matrix.shard }}
@@ -177,17 +177,17 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version: "1.27.x"
           cache-dependency-path: go.sum
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           name: windows-test-bundle
           path: ${{ runner.temp }}/windows-test-bundle
@@ -206,7 +206,7 @@ jobs:
           exit $LASTEXITCODE
       - name: Upload non-heavy package evidence
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-test-other
           path: ${{ runner.temp }}/windows-test-other
@@ -218,10 +218,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version: "1.27.x"
           cache-dependency-path: go.sum
@@ -234,21 +234,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           name: windows-test-bundle
           path: ${{ runner.temp }}/windows-test-bundle
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           pattern: windows-test-shard-*
           path: ${{ runner.temp }}/windows-test-shards
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           name: windows-test-other
           path: ${{ runner.temp }}/windows-test-other
@@ -261,7 +261,7 @@ jobs:
             --output "${{ runner.temp }}/windows-test-verification.json"
       - name: Upload verification report
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-test-verification
           path: ${{ runner.temp }}/windows-test-verification.json
@@ -294,7 +294,7 @@ jobs:
   bm25-adapter:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-python@v7.0.0
@@ -308,7 +308,7 @@ jobs:
   locomo-summary-gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-python@v7.0.0
@@ -324,10 +324,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7.0.0
         with: { go-version: "1.27.x" }
       - run: go build -o entire-graph ./cmd/entire-graph
       - run: sh scripts/entire-graph-statusline_test.sh

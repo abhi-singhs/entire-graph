@@ -25,7 +25,7 @@ default**; `--head` switches to the committed tree.
 
 | Command | What it does |
 | --- | --- |
-| `query` | Ranked source regions for a plain-language query. Defaults: `--format json`, `--profile fast` (the installed agent guide asks for `--profile full`). Formats: `json`, `ndjson`, `text`, `agent`. See [search results](search.md). |
+| `query` | Ranked source regions for a plain-language query. Defaults: `--format json`, `--profile fast` (the installed agent guide asks for `--profile full --format agent`, which is ~2.9x cheaper than the json default for the same results). Formats: `json`, `ndjson`, `text`, `agent`. See [search results](search.md). |
 | `def` | One name's declaration, fields, and method surface. Default format is text. |
 | `explain` | Resolves symbols named by a failing build or test into definitions and context. |
 | `neighbors` | Direct relations of one symbol (`--relation`, `--direction`, `--depth 1\|2`). Ambiguous names return a definition list; disambiguate with `--file`. |
@@ -71,3 +71,15 @@ Stream and record formats are specified in
 local coding-agent transcripts, with an explicitly modeled (not measured)
 token-savings estimate. It is not part of the agent workflow; see
 [trust and security](trust-and-security.md) for what it reads.
+
+The shell classifier is a heuristic over transcript text, not a shell interpreter.
+It recognizes quoted operators, pipeline heads, redirects and here-documents;
+commands nested in substitutions, subshells or compound shell syntax are not a
+complete inventory of executed reads. No transcript commands are executed.
+
+`stats.context_block_bytes` in search responses now includes `file_outline_bytes`.
+Existing responses with outlines can therefore report larger totals without a
+larger payload. The field totals the costed context blocks, not all response
+metadata. Stats reports retain the legacy positive-only savings fields and add
+signed `estimated_savings_bytes_unfloored` and
+`estimated_savings_est_tokens_unfloored` fields that keep modeled losses.
