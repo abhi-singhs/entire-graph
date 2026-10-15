@@ -26,12 +26,14 @@ auto-generated notes on
 - Under a binding budget, agent-format search now keeps every ranked location with its rank, name and score, and shares the remaining bytes towards the head of the ranking, passing any share a result cannot use on to the others. The top hit no longer degrades to a bare `path:line *` to fit one more body line.
 - Upgraded the Go toolchain to 1.27.
 - Improved snapshot, search, and analyze performance and substantially reduced memory allocation, and made `stats` return a fast, single-line answer instead of a full rescan.
-- Statusline now shows only the savings estimate by default and labels it clearly as an estimate rather than an exact count.
+- Stats and statusline now show a signed, explicitly unvalidated 1:1 context model, retaining losses and distinguishing unavailable comparisons from zero; legacy JSON fields remain compatible.
 - Aligned Graph's trail runners with Brain's and hardened CI with Windows test sharding and safer nightly prerelease publishing.
 
 ### Fixed
 
-- Corrected transcript exploration classification for quoted commands, pipeline tails and writes; added signed stats model totals while retaining legacy JSON fields. Search `stats.context_block_bytes` now includes file outlines, correcting the reported total without increasing payload size.
+- Corrected transcript exploration classification for quoted commands, pipeline tails and writes; added signed stats model totals while retaining legacy JSON fields. Search `stats.context_block_bytes` now includes file outlines and validates their measured cost and independent cap.
+- Scoped generated agent guidance to the observed source view: a complete body does not certify later freshness or dependencies, and unmarked source no longer mandates a duplicate read. Follow-up reads target missing or possibly changed source.
+- Certified already-whole search bodies against their exact source without changing the selected JSON spans, and retained the whole-certified-body-or-locator rendering contract under tight budgets.
 - Preserved validated nested repository boundaries in working-tree fallback scans, avoiding duplicate source and search results from untracked nested clones, linked worktrees, and submodules while retaining outer-repository tracked source.
 - Classified ambiguous same-file nearest-declaration call guesses as `name_only` with reduced confidence, preserving the ambiguity through C++ out-of-line mapping. This corrects false certainty, not semantic overload selection; fast-profile and argument-forwarding filters now omit these uncertain edges.
 - Fixed seven wrong-answer defects in the provider and type scanners and stopped bare type names resolving across language boundaries.

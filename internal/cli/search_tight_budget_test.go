@@ -22,7 +22,8 @@ import (
 func TestTightAgentBudgetKeepsSourceAcrossHeaderWidths(t *testing.T) {
 	t.Parallel()
 	repo := t.TempDir()
-	write(t, repo, "a.py", "def target():\n    return True\n")
+	// A top-level assignment exercises ordinary source fitting, not callable certification.
+	write(t, repo, "a.py", "target = True\n")
 	for _, budget := range []string{"64", "60", "56", "52", "48"} {
 		var out bytes.Buffer
 		err := Run(t.Context(), Options{Version: "0.1.0", Env: EntireEnv{RepoRoot: repo}, Stdout: &out}, []string{

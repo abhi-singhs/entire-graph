@@ -617,13 +617,12 @@ func TestStatsTextOutputCarriesRatioAndCaveat(t *testing.T) {
 	for _, want := range []string{
 		"graph calls: 1",
 		"exploration calls: 1",
-		"graph-first rate: 100%",
 		"graph calls by verb",
-		"exploration calls (what the graph is meant to replace)",
-		"session tokens (billed",
-		"ESTIMATED SAVINGS",
+		"observed exploration calls",
+		"session usage tokens (reported by transcripts)",
+		"1:1 context model:",
 		"assumption, not a measurement",
-		"measured per-call cost",
+		"observed bytes per result",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("text output missing %q:\n%s", want, text)
@@ -952,9 +951,9 @@ func TestStatsDefaultOutputIsOneHeadlineLine(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("default output must be exactly one line, got %d:\n%s", len(lines), text)
 	}
-	// (840-40) bytes saved -> 200 tokens
-	if lines[0] != "[entire-graph] ~200 tokens saved" {
-		t.Fatalf("headline = %q, want %q", lines[0], "[entire-graph] ~200 tokens saved")
+	// (840-40) modeled bytes -> +200 estimated tokens; not measured savings.
+	if lines[0] != "[entire-graph] 1:1 context model: +200 est. tokens; not measured savings" {
+		t.Fatalf("unexpected model headline = %q", lines[0])
 	}
 	for _, unwanted := range []string{"graph calls by verb", "session tokens (billed", "ESTIMATED SAVINGS", "assumption"} {
 		if strings.Contains(text, unwanted) {
@@ -967,27 +966,20 @@ func TestStatsDefaultOutputIsOneHeadlineLine(t *testing.T) {
 		[]string{"stats", "--repo", repo, "--sessions-dir", sessions, "--since", "all", "--verbose"}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(verbose.String(), "ESTIMATED SAVINGS  ~200 tokens") {
+	if !strings.Contains(verbose.String(), "1:1 context model: +200 est. tokens; not measured savings") {
 		t.Fatalf("--verbose must restore the full report:\n%s", verbose.String())
 	}
 }
 
-// TestStatsHeadlineIsPlainTextWhenOutputIsNotATerminal keeps ANSI bytes out of pipes and files.
+// Summary output remains plain text when terminal color settings are present.
 func TestStatsHeadlineIsPlainTextWhenOutputIsNotATerminal(t *testing.T) {
-	t.Setenv("NO_COLOR", "")
-	t.Setenv("FORCE_COLOR", "")
-	t.Setenv("ENTIRE_GRAPH_FORCE_COLOR", "")
-	var out bytes.Buffer
-	if got := statsGreen(&out, "[entire-graph] ~1 tokens saved"); strings.Contains(got, "\x1b[") {
-		t.Fatalf("a non-terminal writer must not receive escapes, got %q", got)
-	}
-	t.Setenv("FORCE_COLOR", "1")
-	if got := statsGreen(&out, "x"); got != "\x1b[32mx\x1b[0m" {
-		t.Fatalf("forced colour = %q, want a green wrap", got)
-	}
-	t.Setenv("NO_COLOR", "1")
-	if got := statsGreen(&out, "x"); got != "x" {
-		t.Fatalf("NO_COLOR must win, got %q", got)
+	for _, force := range []string{"", "1"} {
+		t.Setenv("FORCE_COLOR", force)
+		var out bytes.Buffer
+		writeStatsSummary(&out, statsResponse{Sessions: 1, SessionsDirFound: true, SessionsWithSavingsComparison: 1, EstimatedSavingsTokensUnfloored: 4})
+		if strings.Contains(out.String(), "\x1b[") || !strings.Contains(out.String(), "1:1 context model: +4 est. tokens") {
+			t.Fatalf("unexpected summary: %q", out.String())
+		}
 	}
 }
 

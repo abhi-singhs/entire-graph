@@ -854,7 +854,7 @@ func TestSearchCommandAgentFormatDoesNotTreatHeaderSizedBudgetAsUnbounded(t *tes
 
 func TestSearchCommandAgentFormatKeepsTopLocationUnderTightBudget(t *testing.T) {
 	repo := t.TempDir()
-	write(t, repo, "a.py", "def target():\n    return True\n")
+	write(t, repo, "a.py", "target = True\n")
 
 	var out bytes.Buffer
 	err := Run(t.Context(), Options{Version: "0.1.0", Env: EntireEnv{RepoRoot: repo}, Stdout: &out}, []string{

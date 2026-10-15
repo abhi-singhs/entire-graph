@@ -80,7 +80,7 @@ func TestAgentSearchAdditionalPassageCannotSpendPrimaryLocationFloor(t *testing.
 // not a name match, while exercising the same small-budget command boundary.
 func TestSearchTightBudgetPreservesActualSource(t *testing.T) {
 	repo := t.TempDir()
-	write(t, repo, "a.py", "def target():\n    return True\n")
+	write(t, repo, "a.py", "target = True\n")
 	for _, budget := range []int{64, 60, 56, 52, 48} {
 		t.Run(strconv.Itoa(budget), func(t *testing.T) {
 			var out bytes.Buffer
@@ -94,7 +94,7 @@ func TestSearchTightBudgetPreservesActualSource(t *testing.T) {
 			if out.Len() > budget {
 				t.Fatalf("used %d bytes for budget %d: %q", out.Len(), budget, out.String())
 			}
-			if !strings.Contains(out.String(), "def target():") && !strings.Contains(out.String(), "    return True") {
+			if !strings.Contains(out.String(), "target = True") {
 				t.Fatalf("locator name is not source; actual body absent at budget %d: %q", budget, out.String())
 			}
 		})
@@ -103,7 +103,7 @@ func TestSearchTightBudgetPreservesActualSource(t *testing.T) {
 
 func TestSearchTightBudgetPreservesSourceForSpacedPath(t *testing.T) {
 	repo := t.TempDir()
-	write(t, repo, "my file.py", "def target():\n    return True\n")
+	write(t, repo, "my file.py", "target = True\n")
 	var out bytes.Buffer
 	if err := Run(t.Context(), Options{Version: "0.1.0", Env: EntireEnv{RepoRoot: repo}, Stdout: &out}, []string{
 		"search", "--repo", repo, "--query", "target", "--format", "agent",
@@ -112,7 +112,7 @@ func TestSearchTightBudgetPreservesSourceForSpacedPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	if out.Len() > 64 || !strings.Contains(out.String(), "my file.py:1") ||
-		!strings.Contains(out.String(), "def target():") {
+		!strings.Contains(out.String(), "target = True") {
 		t.Fatalf("spaced path hid source loss under the budget: %q", out.String())
 	}
 }

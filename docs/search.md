@@ -77,8 +77,9 @@ final source blank line is preserved only on the certified path; an ordinary
 line terminator does not become an extra source line.
 
 Marker absence is conservative: it does not prove that a body is incomplete.
-The producer may leave an already-visible small callable uncertified when no
-enclosure upgrade occurred. `--full-unit-top` requests explicit unit expansion;
+After allocation, selected primary results can also receive certification when
+identity, symbol bounds and exact source bytes agree and the signal fits the
+remaining serialized budget. Other already-visible callables may stay uncertified. `--full-unit-top` requests explicit unit expansion;
 a safety-clipped forced unit still cannot claim completeness. Renderer tests
 cover certification through both opportunistic enclosure and forced-unit paths
 without adding signals after the producer's byte budget has been finalized.

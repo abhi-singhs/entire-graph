@@ -58,11 +58,12 @@ var brainReference string
 // BenchmarkNeutralGraphCapability states what Graph can do without telling the agent
 // what to do first. It exists so an A/B harness that must avoid arm-asymmetric
 // instructions has somewhere to take its wording FROM, instead of editing the guides
-// below. It is never part of GraphGuide, CombinedGuide, or BrainGuide. The
-// benchmark harness selects its output format explicitly for each experiment.
+// below. It is never part of GraphGuide, CombinedGuide, or BrainGuide. It names
+// --format agent for the cost reason above, not as an instruction: a capability
+// statement may say how the tool is invoked without telling an arm what to do.
 const BenchmarkNeutralGraphCapability = `Graph answers code-discovery, structural, and semantic-change questions:
 
-    entire graph query --repo . --profile full --query "<task>"
+    entire graph query --repo . --profile full --format agent --query "<task>"
 
 query, def, neighbors, and impact locate code and report structure. diff, commit, and
 checkpoint compare revisions. Graph interactive queries normally inspect the working
@@ -80,7 +81,22 @@ inspection FOR THAT QUERY ONLY. One failure does not retire the tool: ask the ne
 question through it. Do not automatically install, configure, or repair tools.
 `
 
-const verificationGuide = `Read focused source around useful locations before editing. Check related contracts
+// Completeness is a one-way certificate for displayed source, not a freshness or
+// dependency guarantee. An unmarked result may retain a whole body the producer
+// did not certify. Target follow-up reads at missing or possibly changed source; this does
+// not relax the separate initial-query obligation. Rendered-guide tests check these
+// instructions, not consuming-agent behavior or savings.
+const verificationGuide = `Inspect the source Graph displays at useful locations before editing. A result marked [complete]
+certifies a structurally whole displayed body, unchanged by rendering, for the source
+view observed by that query. It does not certify dependencies, later source freshness,
+or task resolution. Do not reread the same unchanged span merely to duplicate it.
+An unmarked result is not certified: it may be a locator, a partial window, or a whole
+body the producer did not certify. A certified body that cannot fit with its marker
+becomes an unmarked locator. Retrieve only the specific additional span, surrounding context,
+caller, contract, or second site required for the task. If edits, formatting, generation,
+checkout, or another writer may have changed the relevant source, verify that current
+span before reusing remembered output. A --head result does not cover working-tree
+changes absent from that snapshot. Check related contracts
 and make the smallest complete change. VERIFY before stopping: execute focused tests,
 a reproduction, or the most relevant build. If execution is unavailable, disclose
 that limit and perform a bounded source check. Prefer precise queries and line ranges,
