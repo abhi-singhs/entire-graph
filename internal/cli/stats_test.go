@@ -13,6 +13,24 @@ import (
 	"time"
 )
 
+// Quoted argument contents cannot create shell operators or change the command's purpose.
+func FuzzExplorationQuotedArguments(f *testing.F) {
+	for _, payload := range []string{"file.go", "a; grep b", "$(cat secret)", "`rg needle`", "x | tail -1", "'quoted'", "x\ncat y", "a>&b"} {
+		f.Add(payload)
+	}
+	f.Fuzz(func(t *testing.T, payload string) {
+		quoted := "'" + strings.ReplaceAll(payload, "'", "'\\''") + "'"
+		for _, command := range []struct {
+			prefix string
+			want   bool
+		}{{"cat ", true}, {"git commit -m ", false}} {
+			if got := isExploringShellCommand(command.prefix + quoted); got != command.want {
+				t.Fatalf("classification of %q = %v, want %v", command.prefix+quoted, got, command.want)
+			}
+		}
+	})
+}
+
 // --- fixture helpers ---------------------------------------------------------------------
 
 func statsTime(offset time.Duration) string {
