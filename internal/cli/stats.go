@@ -1463,7 +1463,7 @@ func isWritingShellStage(stage string) bool {
 	case "cat":
 		return hasStdoutRedirect(stage) || heredocDelimiter(stage) != ""
 	case "sed":
-		return hasInPlaceFlag(stage)
+		return hasInPlaceFlag(stage) || hasStdoutRedirect(stage)
 	}
 	return false
 }
@@ -1747,17 +1747,6 @@ func statsModelSummary(report statsResponse) string {
 	return "1:1 context model: " + signed + " est. tokens; not measured savings"
 }
 
-// statsGreen styles the headline for a terminal and degrades to plain text everywhere else,
-// using the same NO_COLOR / FORCE_COLOR / TERM / character-device rules as the rest of the
-// binary, so a pipe or a redirect never receives raw escape bytes.
-func statsGreen(out io.Writer, value string) string {
-	value = termsafe.Line(value)
-	if value == "" || !sem.ShouldUseColor(out) {
-		return value
-	}
-	return "\x1b[32m" + value + "\x1b[0m"
-}
-
 func writeStatsText(out io.Writer, report statsResponse) {
 	fmt.Fprintln(out, "entire graph stats")
 	fmt.Fprintf(out, "  repo:     %s\n", valueOrUnset(report.RepoRoot))
@@ -1827,10 +1816,6 @@ func writeStatsText(out io.Writer, report statsResponse) {
 	for _, line := range wrapText(savingsModelText, 88) {
 		fmt.Fprintf(out, "  %s\n", line)
 	}
-}
-
-func percent(rate float64) string {
-	return fmt.Sprintf("%.0f%%", rate*100)
 }
 
 func humanInt(value int64) string {
