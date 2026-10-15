@@ -22,7 +22,10 @@ a surprising hit can be audited instead of trusted.
 
 Results are byte-budgeted to drop into an agent's context: top hits carry full
 snippets, later hits shrink to locators, and `--max-context-bytes` bounds the
-total (`0` removes the bound). `--top-k` sets the result count.
+total (`0` removes the bound). `--top-k` caps normal results, including automatic
+related sites and covering tests. Explicit `--callee-hop` is an exception: it may
+add called-helper results beyond that cap, under its existing byte-budget and
+ranked-source protections.
 
 ## What a response contains
 
@@ -41,6 +44,12 @@ The default format is JSON, one object per query:
   formats render it as a `VERIFY:` line. It is a suggestion constructed from
   repository contents; read it before running it (see
   [trust and security](trust-and-security.md)).
+  Language-specific suite fallbacks require a matching source or covering test;
+  a neighboring manifest alone does not assign an unrelated language's runner.
+  Native Go inputs require bounded, same-package evidence (and a real `import
+  "C"` for cgo inputs). This does not evaluate platform/build constraints or
+  infer SWIG-generated sources. The `targets` description distinguishes a whole
+  suite from an identified narrow command.
 - `stats`: counts, byte accounting, latency, and `index_cache_hit`.
 - `warnings`, `partial_failures`, `completeness`: machine-readable coverage:
   which languages and how many files/symbols/relations backed this answer, and
@@ -58,7 +67,38 @@ The default format is JSON, one object per query:
   (`Index: cache-hit (…ms) | Query: …ms | …`), degrading gracefully under
   tight byte budgets.
 
+## Complete bodies in agent output
+
+An agent result header may carry `[complete]` when the producer certified the
+whole primary symbol body and display preserves its source bytes. A clipped
+unit, a head window, or a body rewritten by terminal escaping or quarantine is
+not certified. File names and other metadata escape the reserved token so they
+cannot impersonate this header annotation. JSON/NDJSON retain the original data.
+Text output also omits the `complete-symbol` signal when display changes the body.
+
+For certified bodies, the agent renderer emits the whole body with the marker
+or falls back to an unmarked locator if the budget cannot hold it. Ordinary
+uncertified results retain excerpt fitting and trailing-line behavior. A genuine
+final source blank line is preserved only on the certified path; an ordinary
+line terminator does not become an extra source line.
+
+Marker absence is conservative: it does not prove that a body is incomplete.
+After allocation, selected primary results can also receive certification when
+identity, symbol bounds and exact source bytes agree and the signal fits the
+remaining serialized budget. Other already-visible callables may stay uncertified. `--full-unit-top` requests explicit unit expansion;
+a safety-clipped forced unit still cannot claim completeness. Renderer tests
+cover certification through both opportunistic enclosure and forced-unit paths
+without adding signals after the producer's byte budget has been finalized.
+
 ## Profiles
+
+Term-rarity weights use repository-wide content frequencies when the search can
+establish exact counts. Bounded or unread-file cases that cannot establish them
+fall back to statistics from the inspected sample. This corrects a bias from
+counting only files preselected for matching the query, and can change result
+order. Other ranking inputs, such as average candidate length, can still vary
+between backends. The [pinned scoring comparison](../bench/search/README.md)
+records a limited before/after cohort and its coverage boundaries.
 
 `query` defaults to `--profile fast` (shallow, high-precision call
 resolution). The installed agent guide asks for `--profile full`, which
