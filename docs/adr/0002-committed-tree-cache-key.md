@@ -249,3 +249,10 @@ they retain the newer main-branch route and diagnostic invalidations alongside
 path-free, scope-aware sharing. Parser identities and the public schema are
 unchanged. Cross-checkout sharing still depends on all keyed inputs agreeing;
 it is not a promise that every pair of clones shares every cache entry.
+
+Full-profile search cache hits deliberately refresh at most 256 local commits.
+They reuse parsing and static relations, not an immutable history view. If that
+refresh fails or is canceled, the load is a miss rather than a reported hit with
+history edges removed. A hit alone is not a performance guarantee; the current
+repository canary verifies reuse and answer parity, without claiming a latency
+improvement from its timings under concurrent test load.

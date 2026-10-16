@@ -120,6 +120,11 @@ unavailable history view remains private to that checkout. The transaction uses
 the same captured evidence for its key and build, so a history change during
 construction cannot poison another history view.
 
+A cache hit is a reuse signal, not a latency guarantee. Full-profile search
+hits refresh co-change relations from at most 256 local commits so a different
+available history cannot supply stale edges. A failed or canceled refresh is a
+miss, rather than a reported hit with silently removed history relations.
+
 ### Working-tree queries
 
 Interactive queries default to the working tree and always build a fresh

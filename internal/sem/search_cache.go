@@ -1330,13 +1330,19 @@ func loadCachedSearchSnapshot(
 		if len(contexts) > 0 && contexts[0] != nil {
 			ctx = contexts[0]
 		}
+		cochanges, historyErr := gitutil.FileCochanges(ctx, absRepo, commit, 256)
+		if historyErr != nil || ctx.Err() != nil {
+			// An unavailable refresh must not be presented as a hit whose
+			// history edges disappeared. Fall back through the ordinary build.
+			return cachedSearchSnapshot{}, false
+		}
 		refreshed := make([]RelationRecord, 0, len(cached.Snapshot.Relations))
 		for _, relation := range cached.Snapshot.Relations {
 			if relation.Type != "FILE_CHANGES_WITH" {
 				refreshed = append(refreshed, relation)
 			}
 		}
-		history := fileChangesWithRelations(ctx, absRepo, commit, repositoryKey, cached.Snapshot.Files)
+		history := fileChangesWithRelations(ctx, absRepo, commit, repositoryKey, cached.Snapshot.Files, &capturedFileCochanges{pairs: cochanges})
 		refreshed = append(refreshed, history...)
 		sort.Slice(refreshed, func(i, j int) bool {
 			left, right := refreshed[i], refreshed[j]

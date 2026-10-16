@@ -1,11 +1,58 @@
 package sem
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 )
+
+func TestSearchCacheRejectsFailedOrCanceledHistoryRefresh(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX failing Git stub")
+	}
+	repo := t.TempDir()
+	sharedCacheFixture(t, repo)
+	validated, err := WithGitMetadataValidationForSetup(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := t.TempDir()
+	options := ProviderSnapshotOptions{Profile: ProfileFull}
+	snapshot, _, err := PreindexProviderSnapshot(validated, repo, "history-test", options, cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, tree, err := resolveCommittedHEAD(validated, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := searchSnapshotKey(repo, snapshot.Header.RepoKey, "history-test", tree, options, validated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := newCacheEntry(cache, "search", searchSnapshotCacheVersion, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, hit := loadCachedSearchSnapshot(entry, repo, commit, snapshot.Header.RepoKey, "history-test", tree, options, validated); !hit {
+		t.Fatal("control: history-capable cached snapshot must be a hit")
+	}
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte("#!/bin/sh\nexit 37\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	canceled, cancel := context.WithCancel(validated)
+	cancel()
+	for _, ctx := range []context.Context{validated, canceled} {
+		if _, hit := loadCachedSearchSnapshot(entry, repo, commit, snapshot.Header.RepoKey, "history-test", tree, options, ctx); hit {
+			t.Fatal("unavailable history was silently dropped while reporting a cache hit")
+		}
+	}
+}
 
 func TestSearchCacheRefreshesHistoryAtTheSameTree(t *testing.T) {
 	repo := t.TempDir()
