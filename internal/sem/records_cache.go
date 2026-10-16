@@ -196,11 +196,9 @@ func BeginProviderRecordsCache(ctx context.Context, repo, providerVersion, commi
 		return nil, err
 	}
 	transaction.absRepo = absRepo
-	// Keep the operation-scoped safety receipt with the caller's cancellation.
-	// Load can then check scope without repeating setup under a new deadline.
-	validated, safe := newGitMetadataValidation(ctx, absRepo)
-	ctx = validated
-	transaction.ctx = ctx
+	// Preserve the caller's validation scope. A transaction may outlive setup,
+	// so it must not mint a safety receipt that later Load/Store calls reuse.
+	safe := gitMetadataSafeForSubprocessContext(ctx, absRepo)
 	transaction.options, err = CaptureProviderCachePolicy(absRepo, options)
 	if err != nil {
 		return nil, err

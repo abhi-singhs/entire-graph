@@ -58,7 +58,11 @@ func TestRecordsCacheLoadHonorsCallerCancellation(t *testing.T) {
 	first, second := scopeWorktrees(t)
 	cacheDir := t.TempDir()
 	header := storeScopeRecords(t, first, cacheDir)
-	ctx, cancel := context.WithCancel(t.Context())
+	validated, err := WithGitMetadataValidationForSetup(t.Context(), second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(validated)
 	defer cancel()
 	replay, err := BeginProviderRecordsCache(ctx, second, "test-v1", header.Commit, header.Tree, "snapshot", cacheDir, ProviderSnapshotOptions{Profile: ProfileFull})
 	if err != nil {
@@ -85,6 +89,41 @@ func TestRecordsCacheLoadHonorsCallerCancellation(t *testing.T) {
 	}
 	if elapsed := time.Since(<-canceledAt); elapsed > time.Second {
 		t.Fatalf("record cache load ignored caller cancellation: %v", elapsed)
+	}
+}
+
+func TestRecordsCacheLoadRevalidatesChangedGitMetadata(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX Git stub")
+	}
+	first, second := scopeWorktrees(t)
+	cache := t.TempDir()
+	header := storeScopeRecords(t, first, cache)
+	replay, err := BeginProviderRecordsCache(t.Context(), second, "test-v1", header.Commit, header.Tree, "snapshot", cache, ProviderSnapshotOptions{Profile: ProfileFull})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, hit := replay.Load(); !hit {
+		t.Fatal("control: cross-checkout cache must be available")
+	}
+	git(t, second, "config", "remote.origin.promisor", "true")
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	marker := filepath.Join(bin, "prefix-called")
+	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
+	stub := "#!/bin/sh\nfor arg in \"$@\"; do\nif [ \"$arg\" = --show-prefix ]; then\nprintf reached > " + quote(marker) + "\nexit 0\nfi\ndone\nexec " + quote(realGit) + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(stub), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if _, _, hit := replay.Load(); hit {
+		t.Error("metadata refused after setup still supplied a cross-checkout hit")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("scope Git subprocess ran after metadata became unsafe")
 	}
 }
 
