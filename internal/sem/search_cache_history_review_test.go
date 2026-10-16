@@ -3,11 +3,58 @@ package sem
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 )
+
+func TestSearchCacheRefusesHistoryRefreshAfterMetadataChanges(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX Git stub")
+	}
+	repo := t.TempDir()
+	sharedCacheFixture(t, repo)
+	options := ProviderSnapshotOptions{Profile: ProfileFull}
+	cache := t.TempDir()
+	snapshot, _, err := PreindexProviderSnapshot(t.Context(), repo, "history-test", options, cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, tree := snapshot.Header.Commit, snapshot.Header.Tree
+	key, err := searchSnapshotKey(repo, snapshot.Header.RepoKey, "history-test", tree, options, t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := newCacheEntry(cache, "search", searchSnapshotCacheVersion, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, hit := loadCachedSearchSnapshot(entry, repo, commit, snapshot.Header.RepoKey, "history-test", tree, options, t.Context()); !hit {
+		t.Fatal("control: cached snapshot must be available")
+	}
+	git(t, repo, "config", "remote.origin.promisor", "true")
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	marker := filepath.Join(bin, "history-called")
+	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
+	stub := "#!/bin/sh\nfor arg in \"$@\"; do\nif [ \"$arg\" = log ]; then\nprintf reached > " + quote(marker) + "\nexit 37\nfi\ndone\nexec " + quote(realGit) + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(stub), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if _, hit := loadCachedSearchSnapshot(entry, repo, commit, snapshot.Header.RepoKey, "history-test", tree, options, t.Context()); hit {
+		t.Error("unsafe metadata must prevent the history refresh and cache hit")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("history Git subprocess ran after metadata became unsafe")
+	}
+}
 
 func TestSearchCacheRejectsFailedOrCanceledHistoryRefresh(t *testing.T) {
 	if runtime.GOOS == "windows" {

@@ -1328,6 +1328,9 @@ func loadCachedSearchSnapshot(
 		if len(contexts) > 0 && contexts[0] != nil {
 			ctx = contexts[0]
 		}
+		if !gitMetadataSafeForSubprocessContext(ctx, absRepo) {
+			return cachedSearchSnapshot{}, false
+		}
 		cochanges, historyErr := gitutil.FileCochanges(ctx, absRepo, commit, 256)
 		if historyErr != nil || ctx.Err() != nil {
 			// An unavailable refresh must not be presented as a hit whose

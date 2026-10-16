@@ -111,29 +111,33 @@ func TestSearchCacheIsSharedAcrossRemotelessClonesUnderTheirOwnNamespace(t *test
 		t.Fatalf("premise lost: want two different local/ keys, got %q and %q", sourceKey, cloneKey)
 	}
 
-	cacheDir := t.TempDir()
-	options := ProviderSnapshotOptions{Profile: ProfileFull}
-	if _, hit, err := PreindexProviderSnapshot(t.Context(), source, "test-version", options, cacheDir); err != nil || hit {
-		t.Fatalf("first preindex: hit=%v err=%v", hit, err)
-	}
-	served, hit, err := PreindexProviderSnapshot(t.Context(), clone, "test-version", options, cacheDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !hit {
-		t.Fatal("a remote-less clone of the same tree under another name missed the shared entry")
-	}
-	cold, err := BuildProviderSnapshotWithOptions(t.Context(), clone, "test-version", options)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cold.Relations) == 0 || len(cold.Externals) == 0 || len(cold.Header.PartialFailures) == 0 || len(cold.unmergedDataFlowEdges) == 0 {
-		t.Fatalf("fixture too thin to audit the rebind: %d relations, %d externals, %d failures, %d unmerged flows",
-			len(cold.Relations), len(cold.Externals), len(cold.Header.PartialFailures), len(cold.unmergedDataFlowEdges))
-	}
-	if !reflect.DeepEqual(served, cold) {
-		t.Fatalf("shared entry differs from a cold build in the clone:\nserved header=%#v\ncold header=%#v\nfirst differing relation: %s",
-			served.Header, cold.Header, firstRelationDifference(served.Relations, cold.Relations))
+	for _, profile := range []Profile{ProfileSyntaxOnly, ProfileFast, ProfileFull} {
+		t.Run(string(profile), func(t *testing.T) {
+			cacheDir := t.TempDir()
+			options := ProviderSnapshotOptions{Profile: profile}
+			if _, hit, err := PreindexProviderSnapshot(t.Context(), source, "test-version", options, cacheDir); err != nil || hit {
+				t.Fatalf("first preindex: hit=%v err=%v", hit, err)
+			}
+			served, hit, err := PreindexProviderSnapshot(t.Context(), clone, "test-version", options, cacheDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !hit {
+				t.Fatal("a remote-less clone of the same tree under another name missed the shared entry")
+			}
+			cold, err := BuildProviderSnapshotWithOptions(t.Context(), clone, "test-version", options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if profile == ProfileFull && (len(cold.Relations) == 0 || len(cold.Externals) == 0 || len(cold.Header.PartialFailures) == 0 || len(cold.unmergedDataFlowEdges) == 0) {
+				t.Fatalf("fixture too thin to audit the rebind: %d relations, %d externals, %d failures, %d unmerged flows",
+					len(cold.Relations), len(cold.Externals), len(cold.Header.PartialFailures), len(cold.unmergedDataFlowEdges))
+			}
+			if !reflect.DeepEqual(served, cold) {
+				t.Fatalf("shared entry differs from a cold build in the clone:\nserved header=%#v\ncold header=%#v\nfirst differing relation: %s",
+					served.Header, cold.Header, firstRelationDifference(served.Relations, cold.Relations))
+			}
+		})
 	}
 }
 
