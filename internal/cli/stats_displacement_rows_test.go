@@ -40,12 +40,21 @@ func TestGraphOutputPathsReadsOnlyResultRows(t *testing.T) {
 			"VERIFY: go test ./internal/a\n  targets internal/a/a_test.go:12 tier=narrow\n" +
 			"LOW CONFIDENCE: top score 3.1 (weak, below 12) and only internal/z/y.go:9 matched.\n" +
 			"1. internal/a/a.go:6 Foo\n", []string{a}},
-		// The sentinel wins even over a located token outside every skipped block.
+		// Empty-response trailing text is not a new result row.
 		{"no-search-results-sentinel", "No search results.\nTests:\n  internal/a/a_test.go:5\n", nil},
+		{"chained-hit-then-empty", "1. internal/a/a.go:6 Foo\n" + zeroResultAgentQuery, []string{a}},
+		{"chained-empty-then-hit", zeroResultAgentQuery + "1. internal/a/a.go:6 Foo\n", []string{a}},
+		{"chained-empty-queries", zeroResultAgentQuery + zeroResultAgentQuery, nil},
+		{"clipped-match-bodies", `{"match_bodies":[{"file_path":"internal/a/a.go","source":"`, []string{a}},
+		{"clipped-definitions", `{"definitions":[{"file_path":"internal/a/a.go","name":"`, []string{a}},
 		// A path in prose with no location is mentioned, not located.
 		{"prose-path-without-location", "Callees: not queried; see docs/graph.md for details\n", nil},
 		{"query-text-zero-results-is-verify-only", "VERIFY: none derivable (no build manifest found) - syntax-check the file you edited and stop.\n" +
 			"  targets the file you edited (from no manifest, no test file, no single-file checker for this language) tier=none\n", nil},
+		{"query-source-quoted-location-is-not-a-row", "1. internal/a/a.go:6 Foo\nfunc Foo() {\nlog.Printf(\"see docs/readme.md:12\")\n}\n", []string{a}},
+		{"source-location-without-row-is-ineligible", "log.Printf(\"see docs/readme.md:12\")\n", nil},
+		{"source-label-is-not-focus-record", "1. internal/a/a.go:6 Foo\nFocus: log.Printf(\"docs/readme.md:12\")\n", []string{a}},
+		{"query-source-json-is-not-another-payload", "1. internal/a/a.go:6 Foo\n{\"results\":[{\"file_path\":\"docs/readme.md\"}]}\n", []string{a}},
 		{"query-agent-hits", "Index: cache-miss (143ms) | Query: 69ms | Preselect: 81ms | Total: 295ms\n" +
 			"Coverage: degraded (2 languages/3 files; 1 warning; 2 partial failures)\n" +
 			"- warning W_WORKTREE_SNAPSHOT\n- partial E_MINIFIED: web/app.min.js\n" +
@@ -204,4 +213,12 @@ func TestGraphVerbFromCommandSeesThroughWrappers(t *testing.T) {
 			t.Errorf("%q: verb = %q (%v), want %q", tc.command, verb, ok, tc.verb)
 		}
 	}
+}
+
+func TestFollowUpReadOfQuotedSourcePathIsNotAReadOfLocatedFile(t *testing.T) {
+	t.Parallel()
+	body := "1. internal/a.go:10-20 Foo\nlog.Printf(\"see docs/readme.md:12\")\n"
+	calls := []dispCall{graphSearch(body), readFile("/r/docs/readme.md", "x")}
+	calls = append(calls, fillers(5)...)
+	assertFollowUp(t, sessionOf(t, calls...), map[string]int64{"none": 1})
 }

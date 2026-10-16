@@ -596,10 +596,13 @@ func TestGraphDeliveredSpans(t *testing.T) {
 func TestPathsOverlapIsWholeComponentSuffix(t *testing.T) {
 	t.Parallel()
 	named := graphOutputPaths("1. internal/cli/stats.go:770-790 F [complete]\ncalls fmt.Errorf and store.List at ./main.go:3\n")
-	for _, want := range []string{"internal/cli/stats.go", "main.go"} {
+	for _, want := range []string{"internal/cli/stats.go"} {
 		if !pathsOverlap(named, []string{want}) {
 			t.Errorf("named %v should contain %q", named, want)
 		}
+	}
+	if pathsOverlap(named, []string{"main.go"}) {
+		t.Fatalf("a source-body mention must not become a result-row path: %v", named)
 	}
 	for _, path := range named {
 		if strings.Contains(path, "Errorf") || strings.Contains(path, "List") {
@@ -815,5 +818,25 @@ func TestFollowUpDeliveredTrailingBlankLines(t *testing.T) {
 	}
 	if got := graphDeliveredSpans(`{"results":[{"file_path":"a.go","snippet_start_line":10,"snippet_end_line":30,"snippet":"x\ny"}]}`)["a.go"]; got[0] != (lineSpan{10, 11}) {
 		t.Fatalf("end line beyond the text trusted: %v", got)
+	}
+}
+
+func TestFollowUpClassifiesFirstMatchingReadEvenWhenLaterReadIsUnclaimed(t *testing.T) {
+	t.Parallel()
+	timeline := []timelineEntry{
+		{paths: []string{"a.go"}, deliveredAt: 1},
+		{kind: timelineRead, paths: []string{"a.go"}},
+		{kind: timelineRead, paths: []string{"a.go"}},
+	}
+	claimed := map[int]bool{1: true}
+	if got := classifyFollowUp(timeline, 0, 5, claimed); got != followUpReadShared {
+		t.Fatalf("first read is shared; a later read cannot change this result's class: %s", got)
+	}
+	if claimed[2] {
+		t.Fatal("a result must not claim a later read after its first matching event")
+	}
+	claimed = map[int]bool{2: true}
+	if got := classifyFollowUp(timeline, 0, 5, claimed); got != followUpReadUnknownSpan || !claimed[1] {
+		t.Fatalf("an unclaimed first read must still be attributed normally: %s, %v", got, claimed)
 	}
 }

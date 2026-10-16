@@ -640,7 +640,37 @@ func searchVerifySuiteCommandLiteral(command, derived string) *SearchVerifyComma
 	}
 }
 
-func deriveSearchVerifySuiteCargo(dir string, _ searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+// searchVerifySuiteApplies keeps a neighboring ecosystem manifest from selecting an unrelated suite.
+// A covering test can establish the ecosystem for native or generated sources.
+func searchVerifySuiteApplies(subject searchVerifySubject, ecosystem string) bool {
+	extensions := map[string]string{
+		"Cargo": ".rs .c .cc .cpp .cxx .h .hh .hpp .hxx .m .mm", "Maven": ".java .kt .scala .groovy", "Gradle": ".java .kt .kts .scala .groovy",
+		"Node": ".js .jsx .mjs .cjs .ts .tsx .mts .cts .vue .svelte", "Composer": ".php", "Pytest": ".py .pyw",
+		"Ruby": ".rb .rake .gemspec", "CMake": ".c .cc .cpp .cxx .h .hh .hpp .hxx .m .mm",
+	}
+	manifests := map[string]string{"Cargo": "Cargo.toml Cargo.lock build.rs", "Maven": "pom.xml", "Gradle": "build.gradle build.gradle.kts settings.gradle settings.gradle.kts", "Node": "package.json package-lock.json yarn.lock pnpm-lock.yaml bun.lock bun.lockb", "Composer": "composer.json composer.lock phpunit.xml phpunit.xml.dist", "Pytest": "pytest.ini tox.ini setup.cfg pyproject.toml", "Ruby": "Gemfile Gemfile.lock .rspec Rakefile", "CMake": "CMakeLists.txt"}
+	for _, file := range []string{subject.sourcePath, subject.testPath} {
+		if file == "" {
+			continue
+		}
+		for _, ext := range strings.Fields(extensions[ecosystem]) {
+			if strings.EqualFold(path.Ext(file), ext) {
+				return true
+			}
+		}
+		for _, manifest := range strings.Fields(manifests[ecosystem]) {
+			if path.Base(file) == manifest {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func deriveSearchVerifySuiteCargo(dir string, subject searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+	if !searchVerifySuiteApplies(subject, "Cargo") {
+		return nil
+	}
 	manifest := searchVerifyJoin(dir, "Cargo.toml")
 	content, ok := evidence.file(manifest)
 	if !ok || (!strings.Contains(content, "[package]") && !strings.Contains(content, "[workspace]")) {
@@ -662,7 +692,10 @@ func deriveSearchVerifySuiteGo(dir string, subject searchVerifySubject, evidence
 	return searchVerifySuiteCommand(dir, "go test ./...", manifest+" module")
 }
 
-func deriveSearchVerifySuiteMaven(dir string, _ searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+func deriveSearchVerifySuiteMaven(dir string, subject searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+	if !searchVerifySuiteApplies(subject, "Maven") {
+		return nil
+	}
 	manifest := searchVerifyJoin(dir, "pom.xml")
 	if !evidence.exists(manifest) {
 		return nil
@@ -670,7 +703,10 @@ func deriveSearchVerifySuiteMaven(dir string, _ searchVerifySubject, evidence *s
 	return searchVerifySuiteCommandLiteral(searchVerifyMavenCommand(dir, "test", evidence), manifest)
 }
 
-func deriveSearchVerifySuiteGradle(dir string, _ searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+func deriveSearchVerifySuiteGradle(dir string, subject searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+	if !searchVerifySuiteApplies(subject, "Gradle") {
+		return nil
+	}
 	manifest := ""
 	for _, name := range []string{"build.gradle", "build.gradle.kts"} {
 		if evidence.exists(searchVerifyJoin(dir, name)) {
@@ -1175,7 +1211,10 @@ func searchVerifyScriptIdentifierByte(character byte) bool {
 		(character >= '0' && character <= '9')
 }
 
-func deriveSearchVerifySuiteNode(dir string, _ searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+func deriveSearchVerifySuiteNode(dir string, subject searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+	if !searchVerifySuiteApplies(subject, "Node") {
+		return nil
+	}
 	manifest := searchVerifyJoin(dir, "package.json")
 	content, ok := evidence.file(manifest)
 	if !ok {
@@ -1645,7 +1684,10 @@ func searchVerifyHasUnescapedBrace(pattern string) bool {
 	return false
 }
 
-func deriveSearchVerifySuiteComposer(dir string, _ searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+func deriveSearchVerifySuiteComposer(dir string, subject searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+	if !searchVerifySuiteApplies(subject, "Composer") {
+		return nil
+	}
 	if !evidence.exists(searchVerifyJoin(dir, "composer.json")) {
 		return nil
 	}
@@ -1743,7 +1785,10 @@ func searchVerifyToxInvokesPytest(content string) bool {
 	return false
 }
 
-func deriveSearchVerifySuitePytest(dir string, _ searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+func deriveSearchVerifySuitePytest(dir string, subject searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+	if !searchVerifySuiteApplies(subject, "Pytest") {
+		return nil
+	}
 	for _, name := range searchVerifyPytestConfigs {
 		candidate := searchVerifyJoin(dir, name)
 		content, ok := evidence.file(candidate)
@@ -1770,7 +1815,10 @@ func deriveSearchVerifySuitePytest(dir string, _ searchVerifySubject, evidence *
 // deriveSearchVerifySuiteRuby prefers RSpec when the tree is configured for it (`.rspec`), otherwise
 // falls to `rake test` when the Rakefile names a test task — the same order the narrow Ruby
 // derivation uses, decided by the repository's own layout.
-func deriveSearchVerifySuiteRuby(dir string, _ searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+func deriveSearchVerifySuiteRuby(dir string, subject searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+	if !searchVerifySuiteApplies(subject, "Ruby") {
+		return nil
+	}
 	hasGemfile := evidence.exists(searchVerifyJoin(dir, "Gemfile"))
 	hasRakefile := evidence.exists(searchVerifyJoin(dir, "Rakefile"))
 	if !hasGemfile && !hasRakefile {
@@ -2326,12 +2374,14 @@ func searchVerifyTomlPackageName(content string) (string, bool) {
 // the covering test when there is one. The `-run` pattern is anchored: an unanchored name also runs
 // every test whose name contains it.
 func deriveSearchVerifyGo(dir string, subject searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
-	// The selected covering test determines the narrow command's language. A
-	// Python integration test of Go code is not a Go package; let its own runner
-	// handle it, or let the suite tier fall back to the Go source's module.
-	targetPath := subject.testPath
-	if targetPath == "" {
-		targetPath = subject.sourcePath
+	// A covering test determines the language only when this module can target it.
+	// An outside test is ignored by the package selector below, so it must not
+	// suppress a narrow command for the edited Go package.
+	targetPath := subject.sourcePath
+	if subject.testPath != "" {
+		if _, inside := searchVerifyRelative(dir, subject.testPath); inside {
+			targetPath = subject.testPath
+		}
 	}
 	if !searchVerifyGoApplies(targetPath, evidence) {
 		return nil
@@ -3584,7 +3634,10 @@ func searchVerifyLaunchedTool(command, runner string) string {
 //
 // Gated on the project's own `enable_testing()` / `include(CTest)` exactly like the narrow twin — that
 // declaration is what makes `ctest` mean something here rather than a command invented for the reader.
-func deriveSearchVerifySuiteCMake(dir string, _ searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+func deriveSearchVerifySuiteCMake(dir string, subject searchVerifySubject, evidence *searchVerifyEvidence) *SearchVerifyCommand {
+	if !searchVerifySuiteApplies(subject, "CMake") {
+		return nil
+	}
 	manifest := searchVerifyJoin(dir, "CMakeLists.txt")
 	content, ok := evidence.file(manifest)
 	if !ok {

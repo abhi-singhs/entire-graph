@@ -152,6 +152,13 @@ func runDef(ctx context.Context, opts Options, args []string) error {
 	if err != nil {
 		return err
 	}
+	symbols := flags.Symbols
+	if len(symbols) == 0 {
+		symbols = []string{flags.Symbol}
+	}
+	if flags.MaxContextBytes > 0 && flags.MaxContextBytes < len(symbols) {
+		return fmt.Errorf("def --max-context-bytes %d cannot allocate one byte to each of %d names", flags.MaxContextBytes, len(symbols))
+	}
 	repo, err := resolveRepo(ctx, opts.Env, flags.Repo)
 	if err != nil {
 		return err
@@ -189,10 +196,6 @@ func runDef(ctx context.Context, opts Options, args []string) error {
 		if closeSource != nil {
 			defer closeSource()
 		}
-	}
-	symbols := flags.Symbols
-	if len(symbols) == 0 {
-		symbols = []string{flags.Symbol}
 	}
 	// One index build, N answers. The whole point of the multi-query form is that the second and third
 	// name cost a map lookup rather than another 10-second snapshot load.
@@ -253,7 +256,7 @@ func runDef(ctx context.Context, opts Options, args []string) error {
 				}
 				continue
 			}
-			section.Write(renderDefAnswerText(response, readSource, query.From, answerBudget, flags.MaxContextBytes))
+			section.Write(renderDefAnswerText(response, readSource, query.From, answerBudget, flags.MaxContextBytes, flags.Worktree))
 			if _, err := termsafe.NewWriter(opts.Stdout).Write(section.Bytes()); err != nil {
 				return err
 			}
@@ -310,7 +313,7 @@ func defBodyRecords(declarations []defDeclaration, from int) []sem.SymbolRecord 
 // the cli repo for `def State`). Now the card is fitted first with room reserved for the omission note,
 // bodies are added whole while they fit, the first one that does not is clipped at a line with a resume
 // note, and every body left out is counted.
-func renderDefAnswerText(response defResponse, read lineReader, from, budget, flagBudget int) []byte {
+func renderDefAnswerText(response defResponse, read lineReader, from, budget, flagBudget int, worktree bool) []byte {
 	reserve := 0
 	if budget > 0 && read != nil && len(response.Declarations) > 0 {
 		reserve = len(defBodiesOmittedNote(len(response.Declarations), flagBudget))
@@ -338,7 +341,7 @@ func renderDefAnswerText(response defResponse, read lineReader, from, budget, fl
 			output = append(output, full...)
 			continue
 		}
-		if clipped := clipDefBody(body, budget-len(output)-len(note), flagBudget); clipped != nil {
+		if clipped := clipDefBody(body, budget-len(output)-len(note), flagBudget, response.RepoRoot, worktree); clipped != nil {
 			output = append(output, clipped...)
 			omitted = rest
 		} else {
@@ -360,7 +363,11 @@ func renderDefBody(body symbolMatchBody) []byte {
 
 // clipDefBody returns the longest whole-line prefix of body that fits `room` bytes together with a
 // resume note naming the exact rerun, or nil when not even one line fits.
-func clipDefBody(body symbolMatchBody, room, budget int) []byte {
+func clipDefBody(body symbolMatchBody, room, budget int, repo string, worktree bool) []byte {
+	view := "--head"
+	if worktree {
+		view = "--worktree"
+	}
 	lines := strings.Split(body.Source, "\n")
 	trueEnd := body.EndLine
 	if body.Elided && body.UnitEndLine > trueEnd {
@@ -372,8 +379,8 @@ func clipDefBody(body symbolMatchBody, room, budget int) []byte {
 		clipped.EndLine = body.StartLine + count - 1
 		clipped.Elided, clipped.UnitEndLine = false, 0
 		rendered := renderDefBody(clipped)
-		note := fmt.Sprintf("  …continues to line %d — rerun with --file %s --from %d, or raise --max-context-bytes (%d)\n",
-			trueEnd, termsafe.Line(body.FilePath), clipped.EndLine+1, budget)
+		note := fmt.Sprintf("  …continues to line %d — rerun with entire graph def --symbol %s --file %s --from %d --repo %s %s, or raise --max-context-bytes (%d)\n",
+			trueEnd, defResumeArgument(body.Name), defResumeArgument(body.FilePath), clipped.EndLine+1, defResumeArgument(repo), view, budget)
 		return append(rendered, termsafe.Bytes([]byte(note))...)
 	}
 	// Rendered length grows with the line count, so the largest fitting prefix is a binary search.
@@ -390,6 +397,12 @@ func clipDefBody(body symbolMatchBody, room, budget int) []byte {
 		return nil
 	}
 	return render(low)
+}
+
+// defResumeArgument keeps one name/path a literal POSIX shell argument, including
+// whitespace, apostrophes and shell expansion characters in source names.
+func defResumeArgument(value string) string {
+	return "'" + strings.ReplaceAll(termsafe.Line(value), "'", "'\"'\"'") + "'"
 }
 
 // defBodiesOmittedNote counts the bodies a budget left out; empty when none were.

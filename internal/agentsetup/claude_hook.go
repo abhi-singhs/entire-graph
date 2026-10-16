@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -34,15 +35,24 @@ const SubagentHookCommand = "entire graph hook claude-subagent-start"
 // subagentHookShellCommand is what lands in settings. The redirect and `|| true` make the hook
 // fail open even for a binary older than this command ("unknown command"): SubagentStart cannot
 // block, but a non-zero exit is still reported to the user as a hook error on every subagent.
-const subagentHookShellCommand = SubagentHookCommand + " 2>/dev/null || true"
+var subagentHookShellCommand = subagentShellCommand(runtime.GOOS)
+
+func subagentShellCommand(goos string) string {
+	if goos == "windows" {
+		// Explicit PowerShell works with or without Git Bash, including Windows
+		// PowerShell 5.1, which has no || operator. Keep external exit codes silent.
+		return "try { & " + SubagentHookCommand + " 2>$null } catch {}; exit 0"
+	}
+	return SubagentHookCommand + " 2>/dev/null || true"
+}
 
 // subagentHookTimeoutSeconds bounds the hook. It reads stdin and stats a few directories; it never
 // builds an index, so anything near this bound is already a failure.
 const subagentHookTimeoutSeconds = 10
 
 // ClaudeLocalSettings is where init-agents registers the hook. settings.local.json, not
-// settings.json: it is per-user and untracked, so installing the graph for yourself does not
-// commit a hook that runs on every collaborator's machine.
+// settings.json: it is intended to stay per-user and untracked. The installer
+// does not change gitignore policy; docs/agents.md explains how to ignore it.
 const ClaudeLocalSettings = ".claude/settings.local.json"
 
 // maxClaudeSettingsBytes bounds the settings read. A settings file is a few KiB.
@@ -65,14 +75,15 @@ const subagentDirectiveMaxBytes = 820
 // subagentHookGroup is the SubagentStart matcher group init-agents adds. "*" matches every agent
 // type, which is the point: the agents that need it are the ones CLAUDE.md does not reach.
 func subagentHookGroup() map[string]any {
-	return map[string]any{
-		"matcher": "*",
-		"hooks": []any{map[string]any{
-			"type":    "command",
-			"command": subagentHookShellCommand,
-			"timeout": subagentHookTimeoutSeconds,
-		}},
+	hook := map[string]any{
+		"type":    "command",
+		"command": subagentHookShellCommand,
+		"timeout": subagentHookTimeoutSeconds,
 	}
+	if runtime.GOOS == "windows" {
+		hook["shell"] = "powershell"
+	}
+	return map[string]any{"matcher": "*", "hooks": []any{hook}}
 }
 
 // mergeSubagentHook adds the SubagentStart hook to a settings document and reports whether it
@@ -226,7 +237,8 @@ func planClaudeSubagentHook(repo *os.Root) (claudeSettingsState, []byte, bool, e
 }
 
 // CheckClaudeSubagentHook is the preflight for InstallClaudeSubagentHook. init-agents runs it
-// before writing the guide, so settings it would refuse fail the command with nothing written.
+// before writing the guide, so malformed or unsafe input is rejected without writes.
+// It does not reserve future write access or promise a multi-file transaction.
 func CheckClaudeSubagentHook(root string) error {
 	repo, err := os.OpenRoot(root)
 	if err != nil {

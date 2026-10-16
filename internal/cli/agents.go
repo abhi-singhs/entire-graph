@@ -37,8 +37,9 @@ func graphAgentCommand(opts Options, args []string, install bool) error {
 		if root == "" {
 			return fmt.Errorf("outside a repository; supply --repo")
 		}
-		// The hook preflight runs before Install writes anything, so settings it would refuse fail
-		// the command with no partial installation, like every other init-agents preflight.
+		// Reject malformed or unsafe settings before writing the guides. This is
+		// input preflight, not a multi-file transaction: a later I/O failure or
+		// concurrent settings change can leave installed guides without the hook.
 		if !*noClaudeHook {
 			if err := agentsetup.CheckClaudeSubagentHook(root); err != nil {
 				return err

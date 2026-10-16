@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -64,7 +65,7 @@ func TestMergeSubagentHookIntoEmptySettings(t *testing.T) {
 			t.Errorf("hook entry = %v", hook)
 		}
 		// The command must stay readable in the file a user opens.
-		if bytes.Contains(rendered, []byte("\\u003e")) || !bytes.Contains(rendered, []byte("2>/dev/null || true")) {
+		if bytes.Contains(rendered, []byte("\\u003e")) || (runtime.GOOS != "windows" && !bytes.Contains(rendered, []byte("2>/dev/null || true"))) {
 			t.Errorf("hook command was HTML-escaped or lost its fail-open suffix:\n%s", rendered)
 		}
 	}
@@ -365,4 +366,60 @@ func TestClaudeSettingsGuardsHoldIndividually(t *testing.T) {
 			t.Fatal("writeClaudeSettings replaced a settings file it did not read")
 		}
 	})
+}
+
+func TestSubagentHookShellWrapperFailsSilently(t *testing.T) {
+	var shell string
+	var args []string
+	var definitions []string
+	if runtime.GOOS == "windows" {
+		shell, _ = exec.LookPath("pwsh")
+		if shell == "" {
+			shell, _ = exec.LookPath("powershell")
+		}
+		args = []string{"-NoProfile", "-NonInteractive", "-Command"}
+		definitions = []string{
+			"function entire { Write-Output 'hook-context' }; ",
+			"function entire { Write-Error 'unknown command'; $global:LASTEXITCODE=1 }; ",
+			"",
+		}
+	} else {
+		shell, _ = exec.LookPath("sh")
+		args = []string{"-c"}
+		definitions = []string{
+			"entire() { printf 'hook-context\\n'; }; ",
+			"entire() { printf 'unknown command\\n' >&2; return 1; }; ",
+			"",
+		}
+	}
+	if shell == "" {
+		t.Fatal("hook's platform shell is unavailable")
+	}
+	for i, name := range []string{"current binary", "old binary", "missing binary"} {
+		t.Run(name, func(t *testing.T) {
+			command := subagentHookShellCommand
+			if i == 2 {
+				command = strings.Replace(command, SubagentHookCommand, "entire-hook-missing-binary-for-test", 1)
+			}
+			cmd := exec.Command(shell, append(append([]string(nil), args...), definitions[i]+command)...)
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("wrapper failed: %v stderr=%q", err, stderr.String())
+			}
+			want := ""
+			if i == 0 {
+				want = "hook-context"
+			}
+			if strings.TrimSpace(stdout.String()) != want || stderr.Len() != 0 {
+				t.Fatalf("stdout=%q stderr=%q, want %q and no errors", stdout.String(), stderr.String(), want)
+			}
+		})
+	}
+	if runtime.GOOS == "windows" {
+		entry := subagentHookGroup()["hooks"].([]any)[0].(map[string]any)
+		if entry["shell"] != "powershell" {
+			t.Fatal("Windows wrapper did not select PowerShell")
+		}
+	}
 }

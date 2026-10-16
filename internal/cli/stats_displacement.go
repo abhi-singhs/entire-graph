@@ -72,7 +72,8 @@ var followUpReadClasses = []string{followUpReadOverlapping, followUpReadDifferen
 // delivered locate result is a re-query. Meta verbs (stats, index, doctor, help, ...) are not.
 var graphLookupVerbs = map[string]bool{
 	"query": true, "search": true, "neighbors": true, "impact": true, "def": true, "explain": true,
-	"symbols": true, "edges": true, "snapshot-query": true,
+	"symbols": true, "edges": true,
+	"snapshot": true, "snapshot-query": true,
 }
 
 // shellSearchCommands / shellReadCommands split bashExploreCommands into "asks again" and "opens a
@@ -283,8 +284,11 @@ var (
 	// graphLocatedPathPattern: a path token followed by ":<digit>", not glued to a preceding
 	// path character (RE2 has no lookbehind, so the boundary is consumed as group 0's prefix).
 	graphLocatedPathPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9_@+~./-])(` + graphPathToken + `):[0-9]`)
+	// Located tokens count only in renderer record rows, never ordinary source text.
+	graphLocatedRowPattern = regexp.MustCompile(`^(?:[ \t]*(?:[0-9]+\. )?` + graphPathToken + `:[0-9]|(?:Focus|Impact): .* \(` + graphPathToken + `:[0-9]|[-<>] .* \(` + graphPathToken + `:[0-9]|[ \t]+(?:owner|also declared|supertypes|implemented by|fields|nested|impl [^:]+): .*` + graphPathToken + `:[0-9])`)
 	// graphLinelessRowPattern: the two result-row forms that name a file without a line.
 	graphLinelessRowPattern = regexp.MustCompile(`^(?:- |CONTAINER MAP )(` + graphPathToken + `) \[`)
+	graphRankedRowPattern   = regexp.MustCompile(`^[0-9]+\. ` + graphPathToken + `:[0-9]`)
 	// graphSnippetLinePattern: a numbered source line inside a delivered window ("  4 | code",
 	// "   6→ code"). Its text is repository content, not a row.
 	graphSnippetLinePattern = regexp.MustCompile(`^\s*[0-9]+\s*(?:\||→)`)
@@ -447,6 +451,8 @@ func graphTextOutputPaths(text string) []string {
 	)
 	block := blockNone
 	var paths []string
+	seenSearchRow := false
+	emptySearchResponse := false
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimRight(line, "\r")
 		switch block {
@@ -460,7 +466,23 @@ func graphTextOutputPaths(text string) []string {
 			}
 		}
 		block = blockNone
+		if graphRankedRowPattern.MatchString(line) {
+			seenSearchRow = true
+			emptySearchResponse = false
+		} else if strings.HasPrefix(line, "Index:") || strings.HasPrefix(line, "Index not cached") {
+			// A chained invocation starts a new response; source-body text remains
+			// subject to the renderer's record quarantine.
+			seenSearchRow = false
+			emptySearchResponse = false
+		}
+		if emptySearchResponse {
+			continue
+		}
 		if strings.HasPrefix(strings.TrimSpace(line), "{") {
+			if seenSearchRow {
+				// A JSON-looking line in a search body is source, not another response.
+				continue
+			}
 			// A JSON response printed after other text (an echo header, a persisted-output
 			// preview) is one line: it gets the JSON rules, parsed or clipped.
 			linePaths, _ := graphJSONOutputPaths(line)
@@ -469,7 +491,10 @@ func graphTextOutputPaths(text string) []string {
 		}
 		switch {
 		case strings.TrimSpace(line) == graphNoResultsLine:
-			return nil
+			// This response located nothing, but an earlier chained response may
+			// already have named real hits. Keep those paths.
+			emptySearchResponse = true
+			continue
 		case strings.HasPrefix(line, "Coverage:") || strings.HasPrefix(line, "Completeness:"):
 			block = blockDiagnostics
 			continue
@@ -481,6 +506,9 @@ func graphTextOutputPaths(text string) []string {
 		}
 		if match := graphLinelessRowPattern.FindStringSubmatch(line); match != nil {
 			paths = append(paths, match[1])
+		}
+		if !graphLocatedRowPattern.MatchString(line) {
+			continue
 		}
 		for _, match := range graphLocatedPathPattern.FindAllStringSubmatch(line, -1) {
 			paths = append(paths, match[1])
@@ -620,7 +648,8 @@ func readSubclass(locate, read timelineEntry, edited []string) string {
 // that starts at its DELIVERY — calls issued before the result arrived (a parallel batch, or calls
 // made while it was outstanding) are not reactions to it. claimed keeps the SPAN sub-buckets
 // exclusive: a read already span-attributed to a later-delivered result makes this one a SHARED
-// READ. It must not be skipped: two parallel answers naming the same file and one read of it are
+// READ. The class describes the first matching follow-up event, not every read
+// in the window; a later unclaimed read cannot replace that event. It must not be skipped: two parallel answers naming the same file and one read of it are
 // two answers the agent followed up, and skipping the read let the second one run out its window
 // and be credited as NO FOLLOW-UP.
 func classifyFollowUp(timeline []timelineEntry, index, window int, claimed map[int]bool) string {

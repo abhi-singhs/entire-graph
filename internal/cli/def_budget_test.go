@@ -67,7 +67,7 @@ func TestDefHonoursTheByteBudgetOnEveryOutputPath(t *testing.T) {
 		{"text ambiguous", 2048, []string{"Run"}, []string{"p1/run.go:3", "not shown within --max-context-bytes 2048"}},
 		// `run_` misses exactly and lands on the fuzzy ladder (separator-insensitive), which returns bodies.
 		{"text fuzzy", 2048, []string{"run_"}, []string{`No exact match for "run_"`, "p1/run.go:3"}},
-		{"text single long body", 2048, []string{"Run", "--file", "p1/run.go"}, []string{"p1/run.go:3", "rerun with --file p1/run.go --from"}},
+		{"text single long body", 2048, []string{"Run", "--file", "p1/run.go"}, []string{"p1/run.go:3", "rerun with entire graph def --symbol 'Run' --file 'p1/run.go' --from"}},
 		{"text multi-name", 2048, []string{"Run", "Widget", "run_"}, []string{"== Run ==", "== Widget ==", "== run_ =="}},
 		{"json ambiguous", 1200, []string{"Run", "--format", "json"}, []string{`"budget_omitted"`, `"declarations_total":5`}},
 		{"json fuzzy", 1200, []string{"run_", "--format", "json"}, []string{`"budget_omitted"`, `"fuzzy_match_kind"`}},
@@ -217,6 +217,20 @@ func TestDefJSONMultiNameDegradesPerName(t *testing.T) {
 		mentioned := err != nil && strings.Contains(err.Error(), name)
 		if written[name] == mentioned {
 			t.Fatalf("%s: written=%v, named in error=%v; each name must be exactly one of the two (err %v)", name, written[name], mentioned, err)
+		}
+	}
+}
+
+func TestDefRejectsMoreNamesThanTotalBytesBeforeWriting(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init")
+	write(t, repo, "names.go", "package p\nfunc A() {}\nfunc B() {}\nfunc C() {}\n")
+	for _, format := range []string{"text", "agent", "json"} {
+		var out bytes.Buffer
+		err := Run(t.Context(), Options{Env: EntireEnv{RepoRoot: repo}, Stdout: &out, Stderr: io.Discard},
+			[]string{"def", "--repo", repo, "--worktree", "--format", format, "--max-context-bytes", "2", "A", "B", "C"})
+		if err == nil || !strings.Contains(err.Error(), "cannot allocate") || out.Len() != 0 {
+			t.Fatalf("%s: error=%v, output=%q; want a budget error before any output", format, err, out.String())
 		}
 	}
 }

@@ -1661,25 +1661,35 @@ func stripHeredocBodies(command string) string {
 	kept := make([]string, 0, len(lines))
 	for index := 0; index < len(lines); index++ {
 		kept = append(kept, lines[index])
-		delimiter := heredocDelimiter(lines[index])
-		if delimiter == "" {
-			continue
-		}
-		// Strip only a body that is actually CLOSED. An unterminated here-document is far more
-		// likely to be a misread `<<` than a real one, and swallowing the rest of the command
-		// would silently drop whatever locate calls its later lines make — the failure mode this
-		// whole function exists to prevent, pointed the other way.
-		terminator := -1
-		for cursor := index + 1; cursor < len(lines); cursor++ {
-			if strings.TrimSpace(lines[cursor]) == delimiter {
-				terminator = cursor
+		openers := heredocOpeners(lines[index])
+		cursor, closed := index+1, len(openers) > 0
+		for openerIndex, opener := range openers {
+			terminator := -1
+			for ; cursor < len(lines); cursor++ {
+				line := strings.TrimSuffix(lines[cursor], "\r")
+				if opener.stripTabs {
+					line = strings.TrimLeft(line, "\t")
+				}
+				if line == opener.word {
+					terminator = cursor
+					cursor++
+					break
+				}
+			}
+			if terminator < 0 {
+				// A completed earlier body establishes this as a heredoc command.
+				// Shells consume the unfinished subsequent body through EOF; those
+				// bytes cannot become commands merely because its closer is absent.
+				if openerIndex > 0 {
+					return strings.Join(kept, "\n")
+				}
+				closed = false
 				break
 			}
 		}
-		if terminator < 0 {
-			continue
+		if closed {
+			index = cursor - 1
 		}
-		index = terminator
 	}
 	return strings.Join(kept, "\n")
 }
@@ -1689,7 +1699,8 @@ func stripHeredocBodies(command string) string {
 //
 // It is deliberately conservative, because a false positive costs real commands: stripHeredocBodies
 // would discard the lines that follow. Three guards here, and stripHeredocBodies adds a fourth by
-// refusing to strip an unterminated body:
+// refusing to strip an unterminated first body. Once an earlier body closes,
+// unfinished subsequent bodies are unambiguous data through EOF:
 //
 //   - the `<<` must be OUTSIDE quotes, so `echo "count << 2"` opens nothing;
 //   - `<<<` is a here-STRING, whose data is on the same line;
@@ -1700,7 +1711,20 @@ func stripHeredocBodies(command string) string {
 // A lowercase unquoted delimiter (`<<eof`) is therefore missed, and the command falls back to
 // being classified line by line — the behaviour that predates this function, so the failure is
 // bounded rather than destructive.
+type heredocOpener struct {
+	word      string
+	stripTabs bool
+}
+
 func heredocDelimiter(line string) string {
+	openers := heredocOpeners(line)
+	if len(openers) > 0 {
+		return openers[0].word
+	}
+	return ""
+}
+func heredocOpeners(line string) []heredocOpener {
+	var openers []heredocOpener
 	runes := []rune(line)
 	literal := shellQuoteMask(runes)
 	for index := 0; index < len(runes); index++ {
@@ -1715,7 +1739,8 @@ func heredocDelimiter(line string) string {
 			index = position // here-string
 			continue
 		}
-		if position < len(runes) && runes[position] == '-' {
+		stripTabs := position < len(runes) && runes[position] == '-'
+		if stripTabs {
 			position++
 		}
 		for position < len(runes) && (runes[position] == ' ' || runes[position] == '\t') {
@@ -1723,11 +1748,11 @@ func heredocDelimiter(line string) string {
 		}
 		word, quoted := heredocWord(runes[position:])
 		if word != "" && (quoted || isShoutingWord(word)) {
-			return word
+			openers = append(openers, heredocOpener{word, stripTabs})
 		}
 		index = position - 1
 	}
-	return ""
+	return openers
 }
 
 // heredocWord reads the delimiter token after a `<<`, reporting whether it was quoted. A quoted
@@ -1779,7 +1804,7 @@ func isWritingShellStage(stage string) bool {
 	case "cat":
 		return hasStdoutRedirect(stage) || heredocDelimiter(stage) != ""
 	case "sed":
-		return hasInPlaceFlag(stage)
+		return hasInPlaceFlag(stage) || hasStdoutRedirect(stage)
 	}
 	return false
 }
@@ -2119,17 +2144,6 @@ func statsModelSummary(report statsResponse) string {
 		signed = "+" + signed
 	}
 	return "1:1 context model: " + signed + " est. tokens; not measured savings; assumes 100% displaced"
-}
-
-// statsGreen styles the headline for a terminal and degrades to plain text everywhere else,
-// using the same NO_COLOR / FORCE_COLOR / TERM / character-device rules as the rest of the
-// binary, so a pipe or a redirect never receives raw escape bytes.
-func statsGreen(out io.Writer, value string) string {
-	value = termsafe.Line(value)
-	if value == "" || !sem.ShouldUseColor(out) {
-		return value
-	}
-	return "\x1b[32m" + value + "\x1b[0m"
 }
 
 func writeStatsText(out io.Writer, report statsResponse) {

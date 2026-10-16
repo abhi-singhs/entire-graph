@@ -883,9 +883,10 @@ func mergeSearchRelatedSites(
 	floor := minInt(len(results), searchEnclosureHeadRanks)
 	order := searchRelatedDisplacementOrder(results, floor)
 	for count := len(entries); count >= 1; count-- {
-		// A ranking already past topK (normal rows only; callee-hop rows are exempt) may displace
-		// that overflow too, so a related site can still be funded by legal tail exchanges.
 		for drop := 0; drop <= minInt(count+maxInt(0, searchTopKResultCount(results)-topK), len(order)); drop++ {
+			if searchTopKResultCount(results)-drop+count > topK {
+				continue
+			}
 			merged := searchRelatedMergedPlan(results, entries[:count], order[:drop])
 			if searchTopKResultCount(merged) > topK {
 				continue
