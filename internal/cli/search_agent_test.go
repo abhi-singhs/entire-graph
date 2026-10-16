@@ -74,12 +74,31 @@ func TestAgentSearchReportsDisplayedSpanAndFocusAfterCompaction(t *testing.T) {
 	if !strings.Contains(text, "FOCUS103") {
 		t.Fatalf("tight block lost the focus line: %q", text)
 	}
-	// The minimal rung names the first PRINTED line, so each printed line's number is recoverable
-	// by counting down from it (the focus line is printed; its number is header + offset).
+	// The header ladder is tier-major: where a ranked header with source fits, the block keeps its
+	// rank, name and score and names exactly the lines it prints.
+	if !strings.HasPrefix(text, "1. src/worker.go:103 Work ") {
+		t.Fatalf("tight block dropped its rank and name although a ranked header fits: %q", text)
+	}
+	if strings.Contains(text, ":10-200") || strings.Contains(text, ":100-106") {
+		t.Fatalf("header reported stale undisplayed span: %q", text)
+	}
+
+	// Where no ranked location fits, the minimal rung names the first PRINTED line, so each printed
+	// line's number is recoverable by counting down from it (the focus line is printed; its number
+	// is header + offset).
+	result.SymbolName = strings.Repeat("W", 80)
+	block = agentSearchBlock(result, 64)
+	text = string(block)
+	if len(block) > 64 || !strings.Contains(text, "FOCUS103") {
+		t.Fatalf("tight block over cap or lost the focus line: %q", text)
+	}
 	parts := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
 	var first int
 	if _, err := fmt.Sscanf(parts[0], "src/worker.go:%d *", &first); err != nil {
 		t.Fatalf("header %q is not the minimal rung: %v", parts[0], err)
+	}
+	if len(parts) < 3 {
+		t.Fatalf("fixture: the minimal rung must print several lines to test numbering: %q", text)
 	}
 	for k, line := range parts[1:] {
 		if want := first + k; !strings.HasSuffix(line, fmt.Sprint(want)) {

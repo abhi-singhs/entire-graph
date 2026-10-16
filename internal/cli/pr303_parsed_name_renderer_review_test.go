@@ -24,15 +24,18 @@ func TestReview303ParsedNameEscapedDeclarationPreservesOtherRow(t *testing.T) {
 		{name: "escaped_declaration", comment: strings.Repeat("\x1b", 100)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			const budget = 600
+			// 1100, not 600: under the head-weighted split (agentSearchResultBudgets, #295) row 2's
+			// share reaches its whole declaration only from about 1100 bytes; at 600 the premise
+			// below fails before the renderer is asked anything.
+			const budget = 1100
 			results := review303RankedDeclarationFixture(tc.comment)
 			results[0].SymbolNameLine = 1
 			results[1].SymbolNameLine = 1
 			secondDeclaration := "func second() {} // " + strings.Repeat("x", 180)
 
-			// Use the actual old focus-window helper at the actual ranked
+			// Use the actual old focus-window helper at the actual live ranked
 			// shares to establish the visible-source premise independently.
-			shares := rankedAgentSearchBudgets(len(results), budget-1)
+			shares := agentSearchResultBudgets(results, budget-1)
 			var blocks [][]byte
 			for i, result := range results {
 				view := agentSearchBlockViewOf(searchResultOnOneLine(result))
@@ -44,8 +47,11 @@ func TestReview303ParsedNameEscapedDeclarationPreservesOtherRow(t *testing.T) {
 			}
 			previous := termsafe.Bytes(bytes.Join(blocks, []byte("\n")))
 			t.Logf("old windows, actual ranked shares %v: %d/%d escaped bytes\n%s", shares, len(previous), budget, previous)
-			if len(previous) > budget || !bytes.Contains(previous, []byte("\n"+secondDeclaration+"\n")) {
-				t.Fatalf("premise failed: old windows must show row 2's declaration within %d bytes:\n%s", budget, previous)
+			// Row 2's own old window, at its own live share, must show its declaration. The joined
+			// total is only logged: row 1's raw window escapes past its share in the escaped case,
+			// which is the expansion the renderer must charge to row 1 alone.
+			if !bytes.Contains(termsafe.Bytes(blocks[1]), []byte("\n"+secondDeclaration+"\n")) {
+				t.Fatalf("premise failed: row 2's old window at %d bytes must show its declaration:\n%s", shares[1], blocks[1])
 			}
 
 			got := fitAgentSearchResults(results, budget)

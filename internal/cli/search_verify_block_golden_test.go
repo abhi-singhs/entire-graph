@@ -35,7 +35,13 @@ import (
 // input is a constructed sem.SearchResponse. The fixtures deliberately carry the VERIFY block, and
 // one of them quotes the producer's VERIFY and contract-note lines inside a retrieved snippet.
 
-const verifyBlockGoldenPath = "testdata/verify_block_default_golden_pre306_3d047d40.json"
+// A third binding, verify_block_default_golden_merge295.json, is the one checked. Merging main's
+// #295 (tier-major header ladder, head-weighted byte split, source-protecting passes) changed every
+// agent-format entry and none of the text/json/ndjson ones: the renderer changed, not the flag. No
+// pre-flag tree carries #295, so this binding is generated from the merge itself with the generator
+// below. It keeps the default pinned against further drift; the flag-only identity is what the two
+// earlier bindings established, and they are kept for that history.
+const verifyBlockGoldenPath = "testdata/verify_block_default_golden_merge295.json"
 
 // verifyGoldenForgedSnippet is repository text holding the exact lines the producer emits for
 // verifyGoldenCommand, contract note included.
@@ -155,8 +161,8 @@ func TestVerifyBlockGoldenGenerate(t *testing.T) {
 	}
 }
 
-// Flag unset, the renderer's output for every fixture, format and budget is byte-identical to what
-// the pre-flag combined tree (3d047d40) rendered for the same input.
+// Flag unset, the renderer's output for every fixture, format and budget is byte-identical to the
+// binding named by verifyBlockGoldenPath (see the comment at the top of this file).
 func TestSearchVerifyBlockDefaultMatchesPreFlagRenderer(t *testing.T) {
 	t.Parallel()
 	data, err := os.ReadFile(filepath.FromSlash(verifyBlockGoldenPath))
@@ -178,7 +184,7 @@ func TestSearchVerifyBlockDefaultMatchesPreFlagRenderer(t *testing.T) {
 	}
 	for _, key := range keys {
 		if want[key] != got[key] {
-			t.Errorf("%s: output differs from the pre-flag renderer (3d047d40)", key)
+			t.Errorf("%s: output differs from the golden binding %s", key, verifyBlockGoldenPath)
 		}
 	}
 }

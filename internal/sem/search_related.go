@@ -834,7 +834,8 @@ func searchRelatedSiteAlreadySurfaced(results []SearchResult, site searchRelated
 //   - The payload never grows: the merged result is at most as large, serialized, as the ranking
 //     it replaces (and never past hardBudget). Related-site entries are cheap enough that a tail
 //     locator normally funds one outright.
-//   - A related site costs at most ONE ranked hit. Without that cap a block of four could pay for
+//   - Existing callee-hop overflow may first be trimmed from legal redundant tail locators.
+//   - Beyond that overflow, a related site costs at most ONE ranked hit. Without that cap a block of four could pay for
 //     itself by dropping five or six tail hits, which trades away recall the ranking had already
 //     earned; with it, the block can only ever be an exchange of like for like.
 //   - The head is never displaced. searchEnclosureHeadRanks is where the allocator already stops
@@ -882,7 +883,9 @@ func mergeSearchRelatedSites(
 	floor := minInt(len(results), searchEnclosureHeadRanks)
 	order := searchRelatedDisplacementOrder(results, floor)
 	for count := len(entries); count >= 1; count-- {
-		for drop := 0; drop <= minInt(count, len(order)); drop++ {
+		// A ranking already past topK (normal rows only; callee-hop rows are exempt) may displace
+		// that overflow too, so a related site can still be funded by legal tail exchanges.
+		for drop := 0; drop <= minInt(count+maxInt(0, searchTopKResultCount(results)-topK), len(order)); drop++ {
 			merged := searchRelatedMergedPlan(results, entries[:count], order[:drop])
 			if searchTopKResultCount(merged) > topK {
 				continue
