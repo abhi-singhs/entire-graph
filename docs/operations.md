@@ -343,3 +343,15 @@ newer-minor warning; do not suppress that warning without consumer-side evidence
 Brain also has a separately computed completeness/freshness axis: its legacy
 10% parse-error rule is not changed by this Graph release. Consumers requiring
 the same policy on that axis need a separate coordinated update.
+
+### Selective views derived from a complete cache
+
+A derived view retains the selected files and symbols, and filters the complete
+graph's resolved relations to selected endpoints (or external targets). It does
+not repeat name resolution against only the selection. An uncached selection
+may guess a same-named target or externalize an edge whose real target is not
+selected; the filtered view can omit those edges. Consequently, whole-snapshot
+parity with an uncached selection is not the contract. The tests bound dropped
+edge classes and check exact ranking on fixture queries, without proving
+universal ranking equality. This semantic choice accompanies the cache-sharing
+change and is part of its manual review.

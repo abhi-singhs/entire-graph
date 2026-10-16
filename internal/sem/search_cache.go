@@ -355,7 +355,8 @@ func loadOrBuildSearchSnapshotPersisting(
 	}
 	// A complete committed-tree snapshot is query independent and can serve a
 	// selective search without rebuilding the same tree for every query. Keep
-	// the selective view so cache presence cannot change retrieval semantics.
+	// the selected file/symbol scope; relation resolution uses the complete graph
+	// and may omit guesses from a selection-only build, as documented below.
 	if len(options.OnlyFiles) > 0 {
 		deriveFromFull := func(full ProviderSnapshot) (ProviderSnapshot, bool) {
 			selective, deriveErr := selectiveSearchSnapshotFromFull(ctx, absRepo, providerVersion, options, full)
@@ -864,10 +865,9 @@ func restoreCachedSearchInternals(cache *cachedSearchSnapshot) {
 // snapshot: the selected files, their symbols, and the complete graph's
 // relations FILTERED to those that start at a selected file or symbol and end at
 // a selected one or at an `external:` target. It reuses the complete snapshot's
-// relation resolution instead of rerunning it, which was the whole cost of a
-// warm query: re-extracting relations for the 600-800 files a git-grep
-// preselection admits took as long as the cold build the preindex exists to
-// avoid (16s on this repository, against 2.3s for the filter).
+// relation resolution instead of rerunning it. This avoids re-extracting the
+// selected files' relations. Performance depends on the repository, profile and
+// selected scope; the historical prototype timings are not a latency guarantee.
 //
 // The result is a subset of what a fresh OnlyFiles build of the same selection
 // produces, and the difference is deliberate. A fresh selective build resolves
@@ -878,12 +878,10 @@ func restoreCachedSearchInternals(cache *cachedSearchSnapshot) {
 // among the selected bodies only, a name_only type edge where the complete graph
 // resolved it by package). The complete graph resolved every one of those against
 // the whole tree, so the filtered view keeps the complete graph's answer and
-// drops the edge whose answer lies outside the selection. Measured on this
-// repository across three queries, capped and uncapped selections: the filter
-// added no relation a fresh build lacks, and dropped 0.1-2.6% of relations, all
-// in the classes above. Ranking consumers only follow relations whose endpoints
-// are both selected symbols, so the externalized half never reached a ranked
-// result; TestSelectiveDerivationFiltersCompleteGraph pins both directions.
+// drops the edge whose answer lies outside the selection. This is not whole-
+// snapshot equality with an uncached OnlyFiles build. Tests pin both retained
+// and dropped relation classes and exact ranked results for selected fixtures;
+// they do not establish universal ranking parity across arbitrary queries.
 func selectiveSearchSnapshotFromFull(
 	ctx context.Context,
 	repo, providerVersion string,
