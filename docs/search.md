@@ -120,3 +120,11 @@ Session replay requires a clean VCS revision stamped into the producing binary.
 Unstamped or modified builds always search again; a changed producer invalidates
 the stored answer. This identifies a source revision, not the toolchain or build
 flags. Binaries installed without VCS metadata trade replay reuse for freshness.
+
+Declaration rendering preserves the parser’s name line when an uncertified source
+window would otherwise omit it. Exact-identifier answers retain every matching
+definition or fall back to the ordinary ranking. Certified source keeps its whole
+body and completeness marker, including in exact-name answers; when that body
+cannot fit, the ordinary renderer uses an unmarked locator. Additional passages
+cannot spend the primary location’s reserved space. Declaration floors are used
+only when they collectively fit, preserving the bounded rank-weighted allocator.

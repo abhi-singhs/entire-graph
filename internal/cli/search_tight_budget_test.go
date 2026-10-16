@@ -90,7 +90,7 @@ func TestAgentSearchBlockKeepsIdentityBeforeBodyLines(t *testing.T) {
 		StartLine: 1, EndLine: 5, SnippetStartLine: 1, FocusLine: 1, Snippet: body,
 	}
 	minimalWhole := len("a.go:1 *\n") + len(body)
-	got := string(agentSearchPrimaryBlock(result, minimalWhole))
+	got := string(agentSearchPrimaryBlock(result, minimalWhole, false))
 	if len(got) > minimalWhole {
 		t.Fatalf("block used %d bytes, budget %d: %q", len(got), minimalWhole, got)
 	}

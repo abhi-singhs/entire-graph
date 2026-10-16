@@ -275,6 +275,7 @@ func mergedSearchSpanResult(results []SearchResult, run []int, lines []string) (
 		span.Signals = removeSearchSignal(span.Signals, searchCalleeHopSignal)
 	}
 	span.MergedRanks = ranks
+	span.MergedDeclLines, span.MergedDeclStarts = searchMergedDeclarations(results, run, survivor, lines, start, end)
 	return survivor, span, true
 }
 

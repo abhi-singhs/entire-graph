@@ -98,7 +98,7 @@ func TestSearchEchoReplaysForTheSameProducer(t *testing.T) {
 	}
 }
 
-func TestSearchEchoChecksProducerAtEveryReplayScope(t *testing.T) {
+func TestSearchEchoCapturesOneProducerForEveryReplayScope(t *testing.T) {
 	t.Parallel()
 	for _, changeAt := range []int{0, 2, 3} {
 		t.Run(fmt.Sprint(changeAt), func(t *testing.T) {
@@ -120,12 +120,8 @@ func TestSearchEchoChecksProducerAtEveryReplayScope(t *testing.T) {
 			if err := Run(t.Context(), opts, []string{"search", "--repo", repo, "--query", "producer_beta_item", "--format", "text", "--profile", "syntax-only", "--head"}); err != nil {
 				t.Fatal(err)
 			}
-			if changeAt == 0 {
-				if reads != 3 || !replayed(out.String()) {
-					t.Fatalf("stable producer: reads=%d, output=%s", reads, out.String())
-				}
-			} else if reads < changeAt || replayed(out.String()) || !strings.Contains(out.String(), "beta.py") {
-				t.Fatalf("producer changed at scope %d: reads=%d, output=%s", changeAt, reads, out.String())
+			if reads != 1 || !replayed(out.String()) {
+				t.Fatalf("producer should be captured once and shared by every scope: changeAt=%d reads=%d output=%s", changeAt, reads, out.String())
 			}
 		})
 	}
@@ -189,7 +185,7 @@ func TestSearchEchoProducerRecordsAreInvisibleToLegacyReaders(t *testing.T) {
 	if persisted.Producer == "" {
 		t.Fatalf("fixture drift: no producer persisted: %s", raw)
 	}
-	for _, legacy := range []int{2, 3} {
+	for _, legacy := range []int{0, 1, 2, 3, 4, 5} {
 		if persisted.ReplaySchema == legacy {
 			t.Fatalf("producer-bound record uses legacy schema %d, which a producer-unaware reader accepts", legacy)
 		}
@@ -202,7 +198,7 @@ func TestSearchEchoProducerRecordsAreInvisibleToLegacyReaders(t *testing.T) {
 	if !state.matches(live) {
 		t.Fatal("fixture drift: the persisted record does not match its own scope")
 	}
-	for _, legacy := range []int{2, 3} {
+	for _, legacy := range []int{0, 1, 2, 3, 4, 5} {
 		old := state
 		old.ReplaySchema = legacy
 		if old.matches(live) {
