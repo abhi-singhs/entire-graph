@@ -108,6 +108,11 @@ type SearchOptions struct {
 	// with, so a test can check the call-site wiring rather than only the helper. Per search, so
 	// concurrent tests cannot capture each other's calls. Unexported and nil in production.
 	idfObserver func(df map[string]int, files int, exact bool)
+	// defaultIndexedFilesForTest replaces the DEFAULT preselection pool (the one
+	// used when MaxIndexedFiles is unset), so a few-file fixture can exercise a
+	// selective query that is not an explicit --max-indexed-files bound.
+	// Unexported and zero in production.
+	defaultIndexedFilesForTest int
 	// BodyHeadRanks caps how deep the COMPLETE-BODY upgrade reaches, independently of the
 	// locator head. 0 means the built-in depth (searchEnclosureHeadRanks). It may only narrow
 	// the head, never widen it, so the growth allowance stays sized for the bodies it funds.
@@ -1138,8 +1143,14 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 	if options.MaxRegionsPerFile <= 0 {
 		options.MaxRegionsPerFile = defaultSearchMaxRegionsPerFile
 	}
+	// An explicit --max-indexed-files bounds cold parsing, so it also rules out
+	// building the complete snapshot on a cold miss (see coldCompletePolicy).
+	explicitIndexedFileBound := options.MaxIndexedFiles > 0
 	if options.MaxIndexedFiles <= 0 {
 		options.MaxIndexedFiles = defaultSearchIndexedFiles(options.TopK)
+		if options.defaultIndexedFilesForTest > 0 {
+			options.MaxIndexedFiles = options.defaultIndexedFilesForTest
+		}
 		options.progressivePreselection = options.MaxIndexedFiles == defaultSearchMaxIndexedFiles
 	} else {
 		options.progressivePreselection = false
@@ -1345,6 +1356,10 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 	}
 	snapshotOptions := baseSnapshotOptions
 	snapshotOptions.OnlyFiles = onlyFiles
+	snapshotOptions.coldComplete = coldCompletePolicy{
+		disabled:    explicitIndexedFileBound,
+		sourceFiles: selection.filesScanned,
+	}
 	snapshot, cacheHit := preindexedSnapshot, preindexCacheHit
 	indexLatency := preindexLoadLatency
 	if cacheHit && len(snapshotOptions.OnlyFiles) > 0 {

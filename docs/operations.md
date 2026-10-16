@@ -88,8 +88,8 @@ through the same writable namespace.
 ### What a cache entry is keyed on
 
 A search-snapshot entry is a function of: the cache format version, the
-checkout path, the repository identity (derived from the Git remote), the
-provider version, the committed `HEAD` tree hash, the profile, the parse-size
+repository identity (derived from the Git remote; every remote-less
+`local/<name>` checkout shares one identity term), the provider version, the committed `HEAD` tree hash, the profile, the parse-size
 and file-count limits, any file-subset selection, the paths **and contents** of
 `--ignore-file`/`--include-file` inputs in caller order, and the contents of
 `.graphignore`. Change any of these and the next query builds a new entry;
@@ -99,10 +99,26 @@ term because working-tree snapshots cannot receive persistent keys.
 [ADR 0002](adr/0002-committed-tree-cache-key.md) records why the key is total
 over graph-shaping inputs.
 
+The checkout path is not a key term, so every worktree and clone at the same
+tree shares one entry. The checkout-relative scope is: a `--repo <subdir>` run
+indexes only that subtree, so it is keyed on Git's prefix for that directory
+and never shares an entry with the repository root, or with another
+subdirectory. On a hit the loader rewrites what is specific to the
+checkout serving it: `repo_root` (which `def`, `neighbors`, and `impact` read
+source through), the commit, and, for a remote-less checkout, the
+`local/<name>` namespace in every symbol and file ID.
+
 A provider-record entry binds the same graph-shaping inputs plus the exact
-commit and output mode. Exact commit identity is required because the cached
+commit and output mode, keyed on the full repository key; its header line's
+`repo_root` is restamped for the checkout replaying it. Exact commit identity is required because the cached
 opaque NDJSON header records it; unlike a structured search snapshot, that
 stream cannot be safely restamped on a same-tree cache hit.
+Full-profile record entries also bind the captured co-change evidence from the
+available local history. Full and shallow clones at one commit can expose
+different history; deepening a clone must not replay its earlier history. An
+unavailable history view remains private to that checkout. The transaction uses
+the same captured evidence for its key and build, so a history change during
+construction cannot poison another history view.
 
 ### Working-tree queries
 
