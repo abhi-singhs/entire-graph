@@ -18,6 +18,29 @@ func routes() {
  r.Get("/health", health)
 }`, target)
 			regs := goRouteRegistrations(source, nil)
+			repo := t.TempDir()
+			writeFile(t, repo, "routes.go", source+"\nfunc users() {}\nfunc health() {}\n")
+			snapshot, err := BuildProviderSnapshot(t.Context(), repo, "mount-review")
+			if err != nil {
+				t.Fatal(err)
+			}
+			routes := map[string]int{}
+			for _, relation := range snapshot.Relations {
+				if relation.Type == "HANDLES_ROUTE" {
+					routes[relation.ToID]++
+				}
+			}
+			if routes[externalID("route", "/users")] != 0 || routes[externalID("route", "/health")] != 1 {
+				t.Fatalf("snapshot invented a route or lost root control: %v", routes)
+			}
+			wantMounted := 0
+			if target == "api" {
+				wantMounted = 1
+			}
+			if routes[externalID("route", "/v1/users")] != wantMounted {
+				t.Fatalf("snapshot mount evidence: %v", routes)
+			}
+
 			seen := map[string]bool{}
 			for _, reg := range regs {
 				seen[reg.Route] = true
