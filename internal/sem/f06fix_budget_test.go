@@ -124,6 +124,18 @@ func f06fixCacheFileCount(t *testing.T, dir string) int {
 			count += f06fixCacheFileCount(t, dir+"/"+entry.Name())
 			continue
 		}
+		// Advisory lock files are intentionally permanent; they contain no
+		// graph data and must not be unlinked while another process may use them.
+		if strings.HasSuffix(entry.Name(), ".build.lock") {
+			info, err := entry.Info()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Size() != 0 {
+				t.Fatalf("lock file contains unexpected data: %s", entry.Name())
+			}
+			continue
+		}
 		count++
 	}
 	return count

@@ -508,6 +508,11 @@ following bounds are enforced:
     persist that graph under a budget-independent tree key and serve the gap to
     every later unbudgeted query. A context *cancellation* (Ctrl-C) likewise
     still aborts with an error.
+  - **Runs do not resume.** Repeating a budget below the time needed to finish
+    starts from the beginning again and cannot guarantee a complete replacement.
+    Consumers such as Brain that require a complete index must leave the budget
+    disabled or arrange a separate complete run; partial output is not a
+    resumable indexing protocol.
   - **A truncated snapshot is never cached.** Both writers refuse it: the record
     cache (`StoreProviderRecords`) and the search/preindex snapshot cache
     (`writeSearchSnapshot`, which returns `ErrTruncatedSnapshotNotCacheable`).
