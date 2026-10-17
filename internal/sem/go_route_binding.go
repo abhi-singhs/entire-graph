@@ -3309,7 +3309,9 @@ func (r *goRouteResolver) packageStrings() map[string]string {
 		}
 	}
 	if len(vars) > 0 {
-		for name := range r.writtenNames(r.file) {
+		// This is a whole-file scan: package declarations are inside the
+		// subtree too. The closure-capture filter would exclude every write.
+		for name := range r.collectWrittenNames(r.file, true) {
 			if vars[name] {
 				skip[name] = true
 			}

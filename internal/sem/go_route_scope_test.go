@@ -137,3 +137,22 @@ func other(r *gin.Engine) { r.GET(p, pkgH) }
 		},
 	})
 }
+
+func TestGoRoutePackageStringWritesCannotInventRoutes(t *testing.T) {
+	for _, write := range []string{
+		`p = "/b"`, `p += "/b"`, `sink(&p)`,
+		`for p = range paths {}`, `f := func() { p = "/b" }; f()`,
+	} {
+		t.Run(write, func(t *testing.T) {
+			runGoRouteCasesWithFileConstants(t, []goRouteAccuracyCase{{
+				name: "package write",
+				content: `package main
+import "github.com/gin-gonic/gin"
+var p = "/a"
+func init() { ` + write + ` }
+func reg(r *gin.Engine) { r.GET(p, h); r.GET("/health", health) }
+`, want: []string{"/health -> health"},
+			}})
+		})
+	}
+}
