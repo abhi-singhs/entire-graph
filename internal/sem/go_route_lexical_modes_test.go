@@ -61,3 +61,44 @@ func TestGoRouteLexicalScopeDepthFallbackKeepsBudget(t *testing.T) {
 		}
 	}
 }
+
+func TestGoRouteLexicalShadowsPreserveSnapshotRoutes(t *testing.T) {
+	for _, body := range []string{
+		`go func(g int) { _ = &g }(1)`,
+		`defer func() { g := 1; _ = &g }()`,
+		`if g := root.Group("/inner"); ok { g = root.Group("/changed"); _ = &g }`,
+		`for g := root.Group("/inner"); ok; { g = root.Group("/changed"); _ = &g }`,
+		`select { case g := <-ch: g = root.Group("/changed"); _ = &g; default: }`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			source := `package routes
+import "github.com/gin-gonic/gin"
+func beforeHandler() {}
+func afterHandler() {}
+func register() {
+ root := gin.Default()
+ g := root.Group("/outer")
+ g.GET("/before", beforeHandler)
+ ` + body + `
+ g.GET("/after", afterHandler)
+}`
+			assertGoRouteSet(t, goRouteRegistrationsWithin(t, source),
+				"/outer/before -> beforeHandler", "/outer/after -> afterHandler")
+			repo := t.TempDir()
+			writeFile(t, repo, "routes.go", source)
+			snapshot, err := BuildProviderSnapshot(t.Context(), repo, "lexical-routes")
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := map[string]bool{}
+			for _, relation := range snapshot.Relations {
+				if relation.Type == "HANDLES_ROUTE" {
+					found[relation.ToID] = true
+				}
+			}
+			if len(found) != 2 || !found["external:route:/outer/before"] || !found["external:route:/outer/after"] {
+				t.Fatalf("snapshot lost or fabricated routes: %v", found)
+			}
+		})
+	}
+}
