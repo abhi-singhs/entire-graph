@@ -85,6 +85,12 @@ through the same writable namespace.
   `symbols`, `edges`). It is committed-tree only; `--worktree` streams always
   bypass it.
 
+Targeted `edges --to/--from/--relation` requests honor `--cache-dir` and reuse the
+same unfiltered `edges` entry. A hit filters its records without changing the
+matching output bytes. An unreadable entry or a record that cannot be decoded
+causes a rebuild before any cached prefix is printed; a successful bounded
+capture replaces the damaged entry. `--no-cache` bypasses both reads and writes.
+
 ### What a cache entry is keyed on
 
 A search-snapshot entry is a function of: the cache format version, the
@@ -113,6 +119,17 @@ commit and output mode, keyed on the full repository key; its header line's
 `repo_root` is restamped for the checkout replaying it. Exact commit identity is required because the cached
 opaque NDJSON header records it; unlike a structured search snapshot, that
 stream cannot be safely restamped on a same-tree cache hit.
+Full-profile record entries also bind the captured co-change evidence from the
+available local history. Full and shallow clones at one commit can expose
+different history; deepening a clone must not replay its earlier history. An
+unavailable history view remains private to that checkout. The transaction uses
+the same captured evidence for its key and build, so a history change during
+construction cannot poison another history view.
+
+A cache hit is a reuse signal, not a latency guarantee. Full-profile search
+hits refresh co-change relations from at most 256 local commits so a different
+available history cannot supply stale edges. A failed or canceled refresh is a
+miss, rather than a reported hit with silently removed history relations.
 
 ### Working-tree queries
 
@@ -332,3 +349,15 @@ newer-minor warning; do not suppress that warning without consumer-side evidence
 Brain also has a separately computed completeness/freshness axis: its legacy
 10% parse-error rule is not changed by this Graph release. Consumers requiring
 the same policy on that axis need a separate coordinated update.
+
+### Selective views derived from a complete cache
+
+A derived view retains the selected files and symbols, and filters the complete
+graph's resolved relations to selected endpoints (or external targets). It does
+not repeat name resolution against only the selection. An uncached selection
+may guess a same-named target or externalize an edge whose real target is not
+selected; the filtered view can omit those edges. Consequently, whole-snapshot
+parity with an uncached selection is not the contract. The tests bound dropped
+edge classes and check exact ranking on fixture queries, without proving
+universal ranking equality. This semantic choice accompanies the cache-sharing
+change and is part of its manual review.

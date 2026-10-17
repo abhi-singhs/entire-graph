@@ -34,7 +34,8 @@ type searchVerifyAboveScope struct {
 	// prefix is the scope's path from the git toplevel, slash-separated, without a trailing slash.
 	// Never empty: a scope that IS the toplevel has nothing above it.
 	prefix string
-	// up is the relative path from the scope back to the toplevel ("../.." for a two-level prefix).
+	// up is the absolute physical checkout root used by the emitted cd command.
+	// Relative parent walks can reach another checkout when --repo is a symlink.
 	up string
 	// read reads a toplevel-relative file.
 	read contentReader
@@ -84,9 +85,34 @@ func openSearchVerifyAboveScope(ctx context.Context, repo, commit string, useHea
 	if err != nil || toplevel == "" {
 		return searchVerifyAboveScope{}, nil, false
 	}
+	// A Git core.worktree override must not move verification outside the
+	// nearest physical checkout marker that encloses the selected scope.
+	absolute, err := filepath.Abs(repo)
+	if err != nil {
+		return searchVerifyAboveScope{}, nil, false
+	}
+	physical, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return searchVerifyAboveScope{}, nil, false
+	}
+	boundary := physical
+	for depth := 0; depth <= searchVerifyMaxDepth; depth++ {
+		if _, err := os.Lstat(filepath.Join(boundary, ".git")); err == nil {
+			break
+		}
+		parent := filepath.Dir(boundary)
+		if parent == boundary {
+			return searchVerifyAboveScope{}, nil, false
+		}
+		boundary = parent
+	}
+	physicalTop, err := filepath.EvalSymlinks(toplevel)
+	if err != nil || boundary != physicalTop {
+		return searchVerifyAboveScope{}, nil, false
+	}
 	scope := searchVerifyAboveScope{
 		prefix: prefix,
-		up:     strings.TrimSuffix(strings.Repeat("../", strings.Count(prefix, "/")+1), "/"),
+		up:     physicalTop,
 	}
 	if useHead {
 		// The committed tree, like every other read this query makes: a --head answer must not
@@ -118,11 +144,15 @@ func openSearchVerifyAboveScope(ctx context.Context, repo, commit string, useHea
 		if err != nil || !info.Mode().IsRegular() || info.Size() > defaultMaxParseBytes {
 			return "", false
 		}
-		file, err := root.Open(name)
+		file, err := openSearchVerifyRegularFile(root, name)
 		if err != nil {
 			return "", false
 		}
 		defer file.Close()
+		opened, err := file.Stat()
+		if err != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+			return "", false
+		}
 		content, err := io.ReadAll(io.LimitReader(file, defaultMaxParseBytes+1))
 		if err != nil || len(content) > defaultMaxParseBytes {
 			return "", false
@@ -146,6 +176,9 @@ func deriveSearchVerifyAboveScope(subject searchVerifySubject, evidence *searchV
 		return nil, nil
 	}
 	outer := &searchVerifyEvidence{
+		// Continue the lookup's existing budget rather than allowing a second
+		// full budget just because its coordinates change at the scope boundary.
+		reads: evidence.reads,
 		// In-scope paths go through the scope's own evidence, so they share its cache, read budget
 		// and replay provenance; only the manifests above the scope are read through the toplevel.
 		read: func(filePath string) (string, bool) {
@@ -156,14 +189,12 @@ func deriveSearchVerifyAboveScope(subject searchVerifySubject, evidence *searchV
 		},
 		lookPath: evidence.lookPath,
 	}
-	// The inventory is what licenses a native file (`.s`, `.c`) as part of a Go package: its
-	// same-directory Go files. Those live in the scope, so the scope's inventory, lifted to
-	// toplevel coordinates, is the evidence a search at the toplevel would have had for them.
-	if len(evidence.files) > 0 {
-		outer.files = make([]string, len(evidence.files))
-		for index, filePath := range evidence.files {
-			outer.files[index] = searchVerifyJoin(scope.prefix, filePath)
-		}
+	defer func() { evidence.reads = outer.reads }()
+	// Native Go inputs need their same-directory Go files as positive package
+	// evidence. Preserve the scoped inventory in the outer walk's coordinates.
+	outer.files = make([]string, len(evidence.files))
+	for index, filePath := range evidence.files {
+		outer.files[index] = searchVerifyJoin(scope.prefix, filePath)
 	}
 	lifted := subject
 	lifted.sourcePath = searchVerifyJoin(scope.prefix, subject.sourcePath)

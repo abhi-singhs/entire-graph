@@ -27,7 +27,7 @@ func goRouteInlineLineFixture(n int, eol string, trailing bool) (string, []Symbo
 func goRouteInlineRelationsFor(content string, symbols []SymbolRecord) []expressRouteRelation {
 	files := []FileRecord{{Path: "routes.go", Language: "Go"}}
 	read := func(path string) (string, bool) { return content, path == "routes.go" }
-	_, inline, _ := goHTTPRouteRelations(files, map[string][]SymbolRecord{"routes.go": symbols}, read, newFileStringConstants())
+	_, inline, _, _ := goHTTPRouteRelations(files, map[string][]SymbolRecord{"routes.go": symbols}, read, newFileStringConstants())
 	return inline
 }
 

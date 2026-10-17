@@ -396,15 +396,10 @@ func runSearch(ctx context.Context, opts Options, args []string) error {
 	if session != nil {
 		out = io.MultiWriter(opts.Stdout, &payload)
 	}
-	render := agentSearchRender{
-		exactName: true, topK: sem.EffectiveSearchTopK(flags.TopK), sessionCapped: session != nil,
-	}
+	render := agentSearchRender{exactName: true, topK: sem.EffectiveSearchTopK(flags.TopK), sessionCapped: session != nil}
 	var exactAnswer bool
 	if flags.Format == "agent" && !flags.MaxContextBytesSet {
-		// No explicit budget: contextBudget is a ceiling (writeAgentSearchAdaptive). Every candidate
-		// goes through the same writer and render context as an explicit budget, so exact-name mode,
-		// VERIFY and the declaration rows behave identically and the whole payload stays bounded.
-		exactAnswer, err = writeAgentSearchAdaptive(out, response, contextBudget, render)
+		exactAnswer, err = writeAgentSearchAdaptiveFor(out, response, contextBudget, render)
 	} else {
 		exactAnswer, err = writeSearchResponseFor(out, response, flags.Format, contextBudget, render)
 	}
@@ -1889,18 +1884,21 @@ func writeAgentSearchPayload(out interface{ Write([]byte) (int, error) }, respon
 		exactAnchors, exactOmitted = agentExactNameAnchors(results, response.Query)
 		exactNote = agentExactNameOmittedLine(exactOmitted, len(exactAnchors), render.topK, render.sessionCapped)
 	}
-	// Exhaust ordinary source-bearing plans before trading the head's identity for a minimal-header
-	// body, and try every tail-preserving plan before source alone.
-	// The fitted ranking depends only on the bytes left for it, and the ladder below asks for the
-	// same widths many times over (every prefix variant of every pass), so fit each width once.
+	// Prefix variants and source-protection passes often offer the same width.
+	// Reuse that deterministic fit instead of repeating declaration scans. Bound
+	// retained payload bytes independently of an explicitly unbounded caller cap.
 	fitted := make(map[int][]byte)
-	fitResults := func(remaining int) []byte {
-		if formatted, ok := fitted[remaining]; ok {
-			return formatted
+	retained := 0
+	fitResults := func(width int) []byte {
+		if block, ok := fitted[width]; ok {
+			return block
 		}
-		formatted := fitAgentSearchResults(results, remaining)
-		fitted[remaining] = formatted
-		return formatted
+		block := fitAgentSearchResults(results, width)
+		if len(block) <= (1<<20)-retained {
+			fitted[width] = block
+			retained += len(block)
+		}
+		return block
 	}
 	for _, pass := range []agentSearchFitPass{agentSearchExactNamePass, agentSearchProtectTopHitPass,
 		agentSearchProtectMinimalSourcePass, agentSearchProtectHeadSourcePass, agentSearchFallbackPass} {
@@ -2465,7 +2463,7 @@ func fitAgentSearchResults(results []sem.SearchResult, budget int) []byte {
 		// `available` is what the RESULTS themselves may spend.
 		separators := count - 1
 		for available := budget - separators; available > 0; {
-			rendered := renderAgentSearchResults(results[:count], agentSearchResultBudgetsFrom(floors[:count], needs[:count], available))
+			rendered := renderAgentSearchResults(results[:count], agentSearchResultBudgetsFrom(results[:count], floors[:count], needs[:count], available))
 			if len(rendered) == 0 {
 				break // nothing renderable this narrow; drop a result instead
 			}
@@ -2586,7 +2584,12 @@ var agentSearchAdaptiveBudgets = []int{4 * 1024, 8 * 1024, 16 * 1024}
 // "Whole" is exact: the unbounded rank-1 block, header included, must appear byte for byte at a
 // line start. Its header carries the displayed line range, so a clipped body cannot match.
 // An explicit --max-context-bytes bypasses this and is honoured exactly.
-func writeAgentSearchAdaptive(out io.Writer, response sem.SearchResponse, ceiling int, render agentSearchRender) (bool, error) {
+func writeAgentSearchAdaptive(out io.Writer, response sem.SearchResponse, ceiling int) error {
+	_, err := writeAgentSearchAdaptiveFor(out, response, ceiling, agentSearchRender{exactName: true})
+	return err
+}
+
+func writeAgentSearchAdaptiveFor(out io.Writer, response sem.SearchResponse, ceiling int, render agentSearchRender) (bool, error) {
 	results := orderAgentSearchResults(response.Results)
 	if ceiling <= 0 || len(results) == 0 {
 		return writeAgentSearchPayload(out, response, ceiling, render)
@@ -2620,17 +2623,12 @@ func writeAgentSearchAdaptive(out io.Writer, response sem.SearchResponse, ceilin
 		}
 		if whole {
 			_, err := out.Write(rendered.Bytes())
-			return false, err
+			return exact, err
 		}
 	}
 	return writeAgentSearchPayload(out, response, ceiling, render)
 }
 
-// agentSearchProtectedHeads returns the unbounded blocks writeAgentSearchAdaptive must find whole:
-// the first block printed AND the absolute best-ranked result. They differ when section grouping
-// (orderAgentSearchResults) prints a lower-ranked primary fix site ahead of a rank-1 docs,
-// related or test hit — which keeps its rank label, so it is still "the top hit" to a reader.
-// Protecting only the first printed block let a 4 KiB render be accepted with rank 1 clipped.
 func agentSearchProtectedHeads(ordered []sem.SearchResult) [][]byte {
 	// The first printed block, plus the agentSearchProtectedRanks best-ranked results by their
 	// ABSOLUTE rank (section grouping can print a lower rank first). Protecting only rank 1 cut the
@@ -2697,7 +2695,7 @@ func agentSearchPayloadCarriesBlock(payload, block []byte) bool {
 // only move left.
 func agentSearchResultBudgets(results []sem.SearchResult, budget int) []int {
 	floors, needs := agentSearchResultFloorsAndNeeds(results)
-	return agentSearchResultBudgetsFrom(floors, needs, budget)
+	return agentSearchResultBudgetsFrom(results, floors, needs, budget)
 }
 
 // agentSearchResultFloorsAndNeeds returns each result's location floor (agentSearchLocationCost)
@@ -2713,7 +2711,7 @@ func agentSearchResultFloorsAndNeeds(results []sem.SearchResult) ([]int, []int) 
 }
 
 // agentSearchResultBudgetsFrom is agentSearchResultBudgets over precomputed floors and needs.
-func agentSearchResultBudgetsFrom(floors, needs []int, budget int) []int {
+func agentSearchResultBudgetsFrom(results []sem.SearchResult, floors, needs []int, budget int) []int {
 	count := len(floors)
 	if count == 0 {
 		return nil
@@ -2727,6 +2725,31 @@ func agentSearchResultBudgetsFrom(floors, needs []int, budget int) []int {
 	}
 	if floorTotal > budget {
 		return rankedAgentSearchBudgets(count, budget)
+	}
+	// When every named declaration can fit, reserve it before distributing surplus.
+	// Adding a declaration to one row must not erase another affordable declaration.
+	declarationFloors := append([]int(nil), floors...)
+	declarationTotal := floorTotal
+	for index, row := range results {
+		shown := searchResultOnOneLine(row)
+		if searchResultNeedsNoFollowUpRead(shown) && !renderedBodyIsTransformed(shown.Snippet) {
+			continue
+		}
+		view := agentSearchBlockViewOf(shown)
+		own, ok, _ := agentSearchDecls(view)
+		if !ok || own.index < 0 || own.index >= len(view.lines) {
+			continue
+		}
+		line := view.first + own.index
+		header := agentSearchLocationHeaders(row.Rank, view.result.FilePath, line, line, view.focusLine, view.name, view.tag, view.scored, "")[0]
+		cost := len(header) + len(view.lines[own.index]) + 1
+		if cost > declarationFloors[index] {
+			declarationTotal += cost - declarationFloors[index]
+			declarationFloors[index] = cost
+		}
+	}
+	if declarationTotal <= budget {
+		floors, floorTotal = declarationFloors, declarationTotal
 	}
 	// Water-filling: each round shares what is left among the results still short of their
 	// natural (unbounded) size, by 1/(index+1)² weights; a result that reaches its natural
@@ -2936,11 +2959,9 @@ func agentSearchBlock(result sem.SearchResult, budget int) []byte {
 			if primaryBudget <= 0 {
 				continue
 			}
-			// Passages may use spare bytes, not the primary identity's promised floor.
-			// Below that floor the existing best-effort fallback still applies.
-			if budget >= locationFloor && primaryBudget < locationFloor {
-				continue
-			}
+		}
+		if budget > 0 && len(passages) > 0 && budget >= locationFloor && primaryBudget < locationFloor {
+			continue
 		}
 		primary := agentSearchPrimaryBlock(result, primaryBudget, primaryBodyChanged)
 		if len(primary) == 0 {

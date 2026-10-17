@@ -289,7 +289,7 @@ type goRouteClosureRewriteTarget struct {
 type goRouteReceivers struct {
 	parsed bool
 	// exhausted means the walk ran out of its step budget: no receiver in the
-	// file is trusted, so every group-capable registration is omitted.
+	// file is trusted, so every registration is omitted with a snapshot warning.
 	exhausted bool
 	uses      map[int]goRouteBinding
 	// groupNames are names bound to a Group value anywhere in the file. A
@@ -336,14 +336,28 @@ func resolveGoRouteReceiversWithBudget(content string, constants map[string]stri
 	}
 	fset := token.NewFileSet()
 	shift := 0
-	file, err := parser.ParseFile(fset, "", content, parser.SkipObjectResolution|parser.ParseComments)
+	parse := func(input string) (*ast.File, error) {
+		file, err := parser.ParseFile(fset, "", input, parser.ParseComments)
+		if err != nil && strings.Contains(err.Error(), "scope depth") {
+			// Object resolution has a smaller nesting ceiling than syntax parsing.
+			// Keep the conservative analysis and its explicit work budget at that limit.
+			return parser.ParseFile(fset, "", input, parser.SkipObjectResolution|parser.ParseComments)
+		}
+		return file, err
+	}
+	file, err := parse(content)
 	if err != nil {
 		// Fragments without a package clause are still worth resolving. A file
 		// that does not parse either way keeps the name-based fallback.
 		const clause = "package routes\n"
 		fset = token.NewFileSet()
-		file, err = parser.ParseFile(fset, "", clause+content, parser.SkipObjectResolution|parser.ParseComments)
+		file, err = parse(clause + content)
 		if err != nil {
+			// Token recovery may keep named registrations, but generic literal
+			// inference must not revisit comments, group prefixes or unknown scopes.
+			if len(content) > 0 {
+				receivers.masks = [][2]int{{0, len(content)}}
+			}
 			return receivers
 		}
 		shift = len(clause)
@@ -367,6 +381,10 @@ func resolveGoRouteReceiversWithBudget(content string, constants map[string]stri
 		return receivers
 	}
 	receivers.masks = resolver.maskSpans()
+	if resolver.steps > resolver.budget {
+		receivers.exhausted = true
+		return receivers
+	}
 	receivers.parsed = true
 	receivers.uses = resolver.uses
 	receivers.regs = resolver.regs
@@ -533,11 +551,16 @@ func (r *goRouteResolver) read(binding *goRouteBinding) goRouteBinding {
 	}
 	value := *binding
 	if r.escaped[binding] {
-		clientType, local := value.httpClientType, value.local
+		before := value
 		value = goRouteUnknownBinding
-		value.httpClientType = clientType
-		value.httpClient = clientType
-		value.local = local
+		value.httpClientType = before.httpClientType
+		value.httpClient = before.httpClientType
+		// Losing value certainty does not disprove known rewrite effects.
+		value.stripPrefixMiddleware = before.stripPrefixMiddleware
+		value.stripPrefixJoins = before.stripPrefixJoins
+		value.stripPrefixSource = before.stripPrefixSource
+		value.closure = before.closure
+		value.local = before.local
 	}
 	if r.escapedStripPrefixWrites[binding] {
 		value.stripPrefixMiddleware = true
@@ -597,9 +620,12 @@ func (r *goRouteResolver) resolve() (ok bool) {
 // router it wraps in http.StripPrefix), or when the function is used as a
 // value. Parameters forwarded to other functions propagate, so this iterates.
 func (r *goRouteResolver) taintParams() {
-	for changed, rounds := true, 0; changed && rounds < 16; rounds++ {
+	// Opacity only grows, so the finite origin set converges. Charge the
+	// shared step budget instead of silently stopping before the fixed point.
+	for changed := true; changed; {
 		changed = false
 		for key, origin := range r.paramOrigins {
+			r.step(1)
 			if origin.opaque {
 				continue
 			}
@@ -612,6 +638,7 @@ func (r *goRouteResolver) taintParams() {
 				args = append(append([]goRouteBinding(nil), args...), r.paramArgs[goRouteParamKey{recv: "*", fn: key.fn, index: key.index}]...)
 			}
 			for _, arg := range args {
+				r.step(1)
 				switch {
 				case goRouteIsServedRoot(arg):
 				case goRouteIsUnplacedRoot(arg):
@@ -689,7 +716,7 @@ func (r *goRouteResolver) walkFile() {
 			if decl.Body == nil {
 				continue
 			}
-			r.fnWritten = r.writtenNames(decl.Body)
+			r.fnWritten = r.collectWrittenNames(decl.Body, true)
 			r.paramFunc = decl.Name.Name
 			r.paramRecv = goRouteRecvTypeName(decl.Recv)
 			r.walkFunc(decl.Recv, decl.Type, decl.Body, pkg, nil)
@@ -697,7 +724,7 @@ func (r *goRouteResolver) walkFile() {
 			if decl.Tok != token.VAR {
 				continue
 			}
-			r.fnWritten = r.writtenNames(decl)
+			r.fnWritten = r.collectWrittenNames(decl, true)
 			r.atPackage = true
 			for _, spec := range decl.Specs {
 				if valueSpec, ok := spec.(*ast.ValueSpec); ok {
@@ -2012,6 +2039,10 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 		if !deferred {
 			unknown.stripPrefixMiddleware = binding.stripPrefixMiddleware
 		}
+		// A captured function can still perform its known rewrite effect. The
+		// callback/collector identity gate treats this descriptor as MAY evidence,
+		// rather than claiming the captured variable keeps this exact value.
+		unknown.closure = binding.closure
 		unknown.httpClientType = binding.httpClientType
 		unknown.httpClient = binding.httpClientType
 		unknown.local = binding.local
@@ -2056,7 +2087,7 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 	}
 	r.undo(mark)
 	if deferred {
-		written := r.writtenNames(lit.Body)
+		written := r.writtenNames(lit)
 		for _, capture := range captures {
 			r.step(1)
 			_, isWritten := written[capture.name]
@@ -2081,10 +2112,12 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 				r.applyClosureEffect(effect)
 			}
 		}
-		r.escapeClosureAddressed(lit, scope, proxies)
+		for name := range r.addressedNames(lit) {
+			r.escape(scope, name)
+		}
 		return
 	}
-	r.markNames(scope, r.writtenNames(lit.Body), false)
+	r.markNames(scope, r.writtenNames(lit), false)
 	for _, capture := range captures {
 		r.step(1)
 		value := *capture.outer
@@ -2112,25 +2145,8 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 			r.set(capture.name, capture.outer, value)
 		}
 	}
-	r.escapeClosureAddressed(lit, scope, proxies)
-}
-
-// escapeClosureAddressed escapes the enclosing bindings whose address the
-// closure takes. A name the closure never declares can only mean the enclosing
-// binding. A name it does declare may mean either, depending on where the `&`
-// sits, so the walk's own scoped resolution decides: the enclosing binding
-// escapes only if the closure's capture proxy for it did (a non-captured name
-// resolved straight through to the enclosing binding during the walk).
-func (r *goRouteResolver) escapeClosureAddressed(lit *ast.FuncLit, scope *goRouteScope, proxies map[string]*goRouteBinding) {
-	declared := r.closureDeclaredNames(lit)
-	for name := range r.addressedNames(lit.Body) {
-		if !declared[name] {
-			r.escape(scope, name)
-			continue
-		}
-		if proxy := proxies[name]; proxy != nil && r.escaped[proxy] {
-			r.escape(scope, name)
-		}
+	for name := range r.addressedNames(lit) {
+		r.escape(scope, name)
 	}
 }
 
@@ -2211,6 +2227,12 @@ func (r *goRouteResolver) addressedNames(node ast.Node) map[string]bool {
 		r.step(1)
 		if unary, ok := n.(*ast.UnaryExpr); ok && unary.Op == token.AND {
 			if ident, ok := goRouteUnparen(unary.X).(*ast.Ident); ok {
+				// A closure-local declaration cannot escape an enclosing namesake.
+				if ident.Obj != nil {
+					if declaration, ok := ident.Obj.Decl.(ast.Node); ok && declaration.Pos() >= node.Pos() && declaration.End() <= node.End() {
+						return true
+					}
+				}
 				names[ident.Name] = true
 			}
 		}
@@ -2234,12 +2256,22 @@ func goRouteUnparen(expr ast.Expr) ast.Expr {
 // true when some write could carry a router group (an identifier, a Group call,
 // or an unpaired multi-value assignment).
 func (r *goRouteResolver) writtenNames(node ast.Node) map[string]bool {
+	return r.collectWrittenNames(node, false)
+}
+
+func (r *goRouteResolver) collectWrittenNames(node ast.Node, includeLocal bool) map[string]bool {
 	written := map[string]bool{}
 	if node == nil {
 		return written
 	}
 	note := func(expr ast.Expr, groupish bool) {
 		if ident, ok := expr.(*ast.Ident); ok && ident.Name != "_" {
+			// Only writes to bindings outside this subtree can invalidate its scope.
+			if !includeLocal && ident.Obj != nil {
+				if declaration, ok := ident.Obj.Decl.(ast.Node); ok && declaration.Pos() >= node.Pos() && declaration.End() <= node.End() {
+					return
+				}
+			}
 			written[ident.Name] = written[ident.Name] || groupish
 		}
 	}
@@ -2611,6 +2643,17 @@ func (r *goRouteResolver) noteMount(call *ast.CallExpr, scope *goRouteScope) {
 	}
 	ident, ok := goRouteUnparen(call.Args[1]).(*ast.Ident)
 	if !ok {
+		// Wrappers may preserve or change placement; never publish the nested
+		// router's bare routes as if this mount had no prefix.
+		ast.Inspect(call.Args[1], func(n ast.Node) bool {
+			r.step(1)
+			if ident, ok := n.(*ast.Ident); ok {
+				if binding := r.lookup(scope, ident.Name); binding != nil && binding.origin != nil {
+					binding.origin.opaque = true
+				}
+			}
+			return true
+		})
 		return
 	}
 	sub, _ := lookup(ident.Name)

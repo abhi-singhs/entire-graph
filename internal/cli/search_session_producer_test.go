@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -97,27 +98,32 @@ func TestSearchEchoReplaysForTheSameProducer(t *testing.T) {
 	}
 }
 
-// The stack binds ONE producer identity, read once per search, to all three replay scopes (the
-// initial lookup, the confirmation and the final check), so the scopes can never disagree about
-// which binary is answering. Main's per-scope re-read (#294) is superseded by that binding; a
-// producer change between searches is what declines replay (TestSearchEchoReArmsOnProducerChange).
-func TestSearchEchoBindsOneProducerAcrossReplayScopes(t *testing.T) {
+func TestSearchEchoCapturesOneProducerForEveryReplayScope(t *testing.T) {
 	t.Parallel()
-	repo, session := producerFixture(t), filepath.Join(t.TempDir(), "s.json")
-	runProducerSearch(t, repo, session, "dev", "producer_alpha_item", stampedBuild("rev-a", false))
-	var out bytes.Buffer
-	reads := 0
-	opts := Options{Env: EntireEnv{RepoRoot: repo, SearchSession: session}, Stdout: &out,
-		buildInfo: func() (*debug.BuildInfo, bool) {
-			reads++
-			return stampedBuild("rev-a", false), true
-		},
-	}
-	if err := Run(t.Context(), opts, []string{"search", "--repo", repo, "--query", "producer_beta_item", "--format", "text", "--profile", "syntax-only", "--head"}); err != nil {
-		t.Fatal(err)
-	}
-	if reads != 1 || !replayed(out.String()) {
-		t.Fatalf("stable producer: reads=%d (want 1), output=%s", reads, out.String())
+	for _, changeAt := range []int{0, 2, 3} {
+		t.Run(fmt.Sprint(changeAt), func(t *testing.T) {
+			t.Parallel()
+			repo, session := producerFixture(t), filepath.Join(t.TempDir(), "s.json")
+			runProducerSearch(t, repo, session, "dev", "producer_alpha_item", stampedBuild("rev-a", false))
+			var out bytes.Buffer
+			reads := 0
+			opts := Options{Env: EntireEnv{RepoRoot: repo, SearchSession: session}, Stdout: &out,
+				buildInfo: func() (*debug.BuildInfo, bool) {
+					reads++
+					revision := "rev-a"
+					if changeAt != 0 && reads >= changeAt {
+						revision = "rev-b"
+					}
+					return stampedBuild(revision, false), true
+				},
+			}
+			if err := Run(t.Context(), opts, []string{"search", "--repo", repo, "--query", "producer_beta_item", "--format", "text", "--profile", "syntax-only", "--head"}); err != nil {
+				t.Fatal(err)
+			}
+			if reads != 1 || !replayed(out.String()) {
+				t.Fatalf("producer should be captured once and shared by every scope: changeAt=%d reads=%d output=%s", changeAt, reads, out.String())
+			}
+		})
 	}
 }
 

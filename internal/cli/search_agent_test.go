@@ -94,8 +94,12 @@ func TestAgentSearchReportsDisplayedSpanAndFocusAfterCompaction(t *testing.T) {
 	}
 	parts := strings.Split(strings.TrimSuffix(text, "\n"), "\n")
 	var first int
-	if _, err := fmt.Sscanf(parts[0], "src/worker.go:%d *", &first); err != nil {
-		t.Fatalf("header %q is not the minimal rung: %v", parts[0], err)
+	format := "src/worker.go:%d *"
+	if strings.HasPrefix(parts[0], "1. ") {
+		format = "1. src/worker.go:%d"
+	}
+	if _, err := fmt.Sscanf(parts[0], format, &first); err != nil {
+		t.Fatalf("header %q has no recoverable first line: %v", parts[0], err)
 	}
 	if len(parts) < 3 {
 		t.Fatalf("fixture: the minimal rung must print several lines to test numbering: %q", text)

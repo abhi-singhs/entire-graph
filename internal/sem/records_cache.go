@@ -12,6 +12,8 @@ import (
 	"io"
 	"path/filepath"
 	"sort"
+
+	"github.com/entireio/entire-graph/internal/gitutil"
 )
 
 // Provider records (the streamed snapshot/symbols/edges NDJSON emitted by the
@@ -24,12 +26,17 @@ import (
 // records carry a single evidence entry per edge rather than every flow; v10
 // retires entries written before truncated records counted what they dropped.
 // v11 retires streams carrying the old diagnostic-count completeness status.
-// v12 retires entries keyed on the checkout path and envelopes that do not record
-// the root their header line was written for, which a path-free hit restamps.
-// v13 retires the path-free v12 entries that omitted the checkout-relative scope,
-// under which a `--repo <subdir>` stream was replayed for the repository root at
-// the same commit, and the other way round.
-const providerRecordsCacheVersion = "provider-records-v13-" + IdentityRevision
+// v12 retires HANDLES_ROUTE streams produced before scoped Go receiver and
+// middleware analysis; unchanged consumer trees must not replay those edges.
+// v13 retires route records from the old sixteen-round parameter-taint cutoff.
+// v14 retires warning text that incorrectly described every command family as worktree-default.
+// v15 retires malformed-route literal guesses and undisclosed signature-budget loss.
+// v16 retires checkout-path keys and carries checkout roots plus relative scopes
+// for safe cross-worktree replay, and binds captured co-change history without
+// reusing older route-producer entries.
+// v17 retires routes omitted by closure-local writes and address escapes.
+// v18 retires bare routes from wrapped mounts and unbounded route masks.
+const providerRecordsCacheVersion = "provider-records-v19-" + IdentityRevision
 
 // cachedProviderRecords is the on-disk envelope for a cached record stream. The
 // key alone is authoritative (sha256 over version+commit+tree+mode+profile+
@@ -75,14 +82,14 @@ type cachedProviderRecords struct {
 // store overwrites the other's and neither ever gets a warm cache. Validating
 // the schema after opening a schema-independent entry catches the wrong answer
 // but cannot stop the mutual eviction that produced it.
-func providerRecordsKey(absRepo, repositoryKey, providerVersion, commit, tree, mode string, options ProviderSnapshotOptions) (string, error) {
-	return providerRecordsKeyForSchema(SchemaVersion, absRepo, repositoryKey, providerVersion, commit, tree, mode, options)
+func providerRecordsKey(absRepo, repositoryKey, providerVersion, commit, tree, mode string, options ProviderSnapshotOptions, contexts ...context.Context) (string, error) {
+	return providerRecordsKeyForSchema(SchemaVersion, absRepo, repositoryKey, providerVersion, commit, tree, mode, options, contexts...)
 }
 
 // providerRecordsKeyForSchema takes the schema version explicitly so a test can
 // address the entry a build at another schema would have written. Production
 // reaches it only through providerRecordsKey, which supplies SchemaVersion.
-func providerRecordsKeyForSchema(schemaVersion, absRepo, repositoryKey, providerVersion, commit, tree, mode string, options ProviderSnapshotOptions) (string, error) {
+func providerRecordsKeyForSchema(schemaVersion, absRepo, repositoryKey, providerVersion, commit, tree, mode string, options ProviderSnapshotOptions, contexts ...context.Context) (string, error) {
 	policy, err := cachePolicyForOptions(absRepo, options)
 	if err != nil {
 		return "", err
@@ -110,10 +117,35 @@ func providerRecordsKeyForSchema(schemaVersion, absRepo, repositoryKey, provider
 	// Path-free is not scope-free: a `--repo <subdir>` stream lists only that
 	// subtree, with subdir-relative paths, at the same commit and tree as the
 	// root's. See the "repository-scope" term in searchSnapshotKeyForSchema.
-	writeCacheKeyString(hash, "repository-scope", cacheCheckoutScope(absRepo))
+	writeCacheKeyString(hash, "repository-scope", cacheCheckoutScope(absRepo, contexts...))
 	writeCacheKeyString(hash, "provider-version", providerVersion)
 	writeCacheKeyString(hash, "commit", commit)
 	writeCacheKeyString(hash, "tree", tree)
+	if resolveProfile(options.Profile).emits("FILE_CHANGES_WITH") {
+		captured := options.historyCochanges
+		if captured == nil {
+			ctx := context.Background()
+			if len(contexts) > 0 && contexts[0] != nil {
+				ctx = contexts[0]
+			}
+			captured = &capturedFileCochanges{unavailable: true}
+			if gitMetadataSafeForSubprocessContext(ctx, absRepo) {
+				if pairs, err := gitutil.FileCochanges(ctx, absRepo, commit, 256); err == nil {
+					captured = &capturedFileCochanges{pairs: pairs}
+				}
+			}
+		}
+		if captured.unavailable {
+			writeCacheKeyString(hash, "history-unavailable-scope", filepath.Clean(absRepo))
+		}
+		writeCacheKeyString(hash, "history-cochanges", "begin")
+		for _, pair := range captured.pairs {
+			writeCacheKeyString(hash, "history-left", pair.Left)
+			writeCacheKeyString(hash, "history-right", pair.Right)
+			writeCacheKeyString(hash, "history-count", fmt.Sprint(pair.Count))
+		}
+	}
+
 	writeCacheKeyString(hash, "mode", mode)
 	writeCacheKeyString(hash, "profile", string(options.Profile))
 	writeCacheKeyString(hash, "max-parse-bytes", fmt.Sprintf("%d", options.MaxParseBytes))
@@ -134,6 +166,7 @@ func providerRecordsKeyForSchema(schemaVersion, absRepo, repositoryKey, provider
 // ProviderRecordsCacheTransaction pins the cache key and immutable ignore
 // policy used by one record-stream lookup/build/store cycle.
 type ProviderRecordsCacheTransaction struct {
+	ctx             context.Context
 	enabled         bool
 	entry           cacheEntry
 	absRepo         string
@@ -150,6 +183,7 @@ type ProviderRecordsCacheTransaction struct {
 // Callers must build records with Options before calling Store.
 func BeginProviderRecordsCache(ctx context.Context, repo, providerVersion, commit, tree, mode, cacheDir string, options ProviderSnapshotOptions) (*ProviderRecordsCacheTransaction, error) {
 	transaction := &ProviderRecordsCacheTransaction{
+		ctx:             ctx,
 		providerVersion: providerVersion,
 		commit:          commit,
 		tree:            tree,
@@ -164,11 +198,28 @@ func BeginProviderRecordsCache(ctx context.Context, repo, providerVersion, commi
 		return nil, err
 	}
 	transaction.absRepo = absRepo
+	// Preserve the caller's validation scope. A transaction may outlive setup,
+	// so it must not mint a safety receipt that later Load/Store calls reuse.
+	safe := gitMetadataSafeForSubprocessContext(ctx, absRepo)
 	transaction.options, err = CaptureProviderCachePolicy(absRepo, options)
 	if err != nil {
 		return nil, err
 	}
 	transaction.repositoryKey = repoKey(ctx, absRepo)
+	if resolveProfile(options.Profile).emits("FILE_CHANGES_WITH") {
+		captured := &capturedFileCochanges{unavailable: true}
+		if safe {
+			pairs, historyErr := gitutil.FileCochanges(ctx, absRepo, commit, 256)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if historyErr == nil {
+				captured = &capturedFileCochanges{pairs: pairs}
+			}
+		}
+		transaction.options.historyCochanges = captured
+	}
+
 	key, err := providerRecordsKey(
 		absRepo,
 		transaction.repositoryKey,
@@ -177,6 +228,7 @@ func BeginProviderRecordsCache(ctx context.Context, repo, providerVersion, commi
 		tree,
 		mode,
 		transaction.options,
+		ctx,
 	)
 	if err != nil {
 		return nil, err
@@ -216,7 +268,7 @@ func (transaction *ProviderRecordsCacheTransaction) Load() ([]byte, *SnapshotSum
 	}
 	// Restamp only between checkouts of the same scope (see cachedProviderRecords.RepoScope);
 	// the same root is the same checkout, so the scope lookup is paid only on a cross-checkout hit.
-	if cache.RepoRoot != transaction.absRepo && cache.RepoScope != cacheCheckoutScope(transaction.absRepo) {
+	if cache.RepoRoot != transaction.absRepo && cache.RepoScope != cacheCheckoutScope(transaction.absRepo, transaction.ctx) {
 		return nil, nil, false
 	}
 	records, ok := restampProviderRecordsRepoRoot(cache.Records, cache.RepoRoot, transaction.absRepo)
@@ -300,7 +352,7 @@ func (transaction *ProviderRecordsCacheTransaction) Store(records []byte, summar
 		Profile:         transaction.options.Profile,
 		MaxParseBytes:   transaction.options.MaxParseBytes,
 		RepoRoot:        transaction.absRepo,
-		RepoScope:       cacheCheckoutScope(transaction.absRepo),
+		RepoScope:       cacheCheckoutScope(transaction.absRepo, transaction.ctx),
 		Records:         records,
 		Summary:         summary,
 	}

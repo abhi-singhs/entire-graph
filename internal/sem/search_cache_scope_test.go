@@ -43,14 +43,18 @@ func scopeWorktrees(t *testing.T) (string, string) {
 // two worktrees must still address one entry.
 func TestCommittedTreeCacheKeysCarryTheCheckoutScope(t *testing.T) {
 	first, second := scopeWorktrees(t)
+	commit, tree, err := resolveCommittedHEAD(t.Context(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
 	options := ProviderSnapshotOptions{Profile: ProfileFull}
 	type keyFunc func(absRepo string) (string, error)
 	for name, key := range map[string]keyFunc{
 		"search": func(absRepo string) (string, error) {
-			return searchSnapshotKey(absRepo, "gh/example/scope", "v", "tree", options)
+			return searchSnapshotKey(absRepo, "gh/example/scope", "v", tree, options)
 		},
 		"records": func(absRepo string) (string, error) {
-			return providerRecordsKey(absRepo, "gh/example/scope", "v", "commit", "tree", "snapshot", options)
+			return providerRecordsKey(absRepo, "gh/example/scope", "v", commit, tree, "snapshot", options)
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

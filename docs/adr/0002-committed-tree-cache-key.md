@@ -197,7 +197,7 @@ entries are retired. Working-tree snapshots are never persisted, as recorded by 
 ## Addendum — cross-worktree sharing (2026-10-05)
 
 The deferred sharing win is taken. Neither key hashes the checkout path any longer
-(`search-snapshot-v19`, `provider-records-v12`), so N worktrees or clones at one tree
+(`search-snapshot-v22`, `provider-records-v16`), so N worktrees or clones at one tree
 (search) or commit (records) share one entry. The two blockers named above are closed:
 
 - **`repoRoot` overwritten from the cached header.** `loadCachedSearchSnapshot` rebinds every
@@ -222,14 +222,37 @@ an entry depends on where the checkout lives once those fields are rebound.
 `TestCollidingRepoKeysShareEntriesUnderTheirOwnRoot` replaces the test that pinned the opposite.
 
 
-**Path-free is not scope-free (`search-snapshot-v20`, `provider-records-v13`).** The v19/v12 keys
+**Path-free is not scope-free (`search-snapshot-v22`, `provider-records-v16`).** Earlier review revisions (v19/v12)
 dropped the checkout path and with it the only term that separated a `--repo <subdir>` (or
 `ENTIRE_REPO_ROOT`) run from a run at the repository root. A subdirectory run lists only that
 subtree, with subdir-relative paths, yet its tree term is still the whole repository's
 `HEAD^{tree}`, so the two shared one address and each was served as the other: a root query after
-a `pkg/` one reported a hit with none of the root's symbols. Both keys now hash the
+a `pkg/` one reported a hit with none of the root's symbols. The integrated generations retain main's newer route-producer invalidations. Both keys now hash the
 checkout-relative scope, Git's `--show-prefix` of the requested directory (empty at the top
 level), and both envelopes record it; the loader restamps `repo_root` only for a checkout of the
 same scope. Worktrees and clones at the same tree and the same prefix still share
 (`TestCommittedTreeCacheKeysCarryTheCheckoutScope`, `TestSearchCacheNeverServesOneScopeToAnother`,
 `TestProviderRecordsCacheNeverReplaysOneScopeToAnother`).
+
+## Addendum — local history is part of the record stream (2026-10-16)
+
+An exact commit does not establish which ancestors are available in a shallow
+clone. Full-profile provider-record entries therefore also key the bounded
+co-change evidence from local history. The transaction captures that evidence
+once and supplies it to the builder: a concurrent deepen cannot store new
+history under the earlier key. A failed or unsafe history lookup contributes no
+history edges and uses a checkout-private address. Structured search entries
+continue to refresh history on load instead of replaying it from another view.
+
+The integrated namespaces are `search-snapshot-v22` and `provider-records-v16`;
+they retain the newer main-branch route and diagnostic invalidations alongside
+path-free, scope-aware sharing. Parser identities and the public schema are
+unchanged. Cross-checkout sharing still depends on all keyed inputs agreeing;
+it is not a promise that every pair of clones shares every cache entry.
+
+Full-profile search cache hits deliberately refresh at most 256 local commits.
+They reuse parsing and static relations, not an immutable history view. If that
+refresh fails or is canceled, the load is a miss rather than a reported hit with
+history edges removed. A hit alone is not a performance guarantee; the current
+repository canary verifies reuse and answer parity, without claiming a latency
+improvement from its timings under concurrent test load.

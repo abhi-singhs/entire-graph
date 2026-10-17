@@ -541,12 +541,19 @@ type ProviderSnapshotOptions struct {
 	// snapshot content and is not part of any cache key.
 	coldComplete coldCompletePolicy
 	// onCompleteDerivation receives the header of the complete snapshot a
-	// selective view was successfully derived from (see
-	// loadOrBuildSearchSnapshotPersisting). A search reports the repository's
-	// coverage diagnostics from it, so a cold query that built the complete
-	// snapshot and a warm one that derived from it say the same thing. Internal
-	// wiring: it changes no snapshot content and is not part of any cache key.
+	// selective view was successfully derived from. A search reports coverage
+	// from it so cold and warm derived views disclose the same diagnostics.
 	onCompleteDerivation func(SnapshotHeader)
+	// historyCochanges pins the local history view for a record-cache transaction.
+	// A shallow clone can have the same commit/tree but different available history.
+	historyCochanges *capturedFileCochanges
+}
+
+type capturedFileCochanges struct {
+	pairs []gitutil.FileCochange
+	// Unknown history stays private to one checkout and contributes no edges,
+	// matching an uncached history-read failure without sharing that failure.
+	unavailable bool
 }
 
 // coldCompletePolicy is the search's input to the cold-complete decision.
@@ -1557,7 +1564,7 @@ func streamSnapshotWithWorkerCount(ctx context.Context, repo, providerVersion st
 		// text (mergePartialFailures folds duplicates) so neither loss is hidden.
 		failures = mergePartialFailures(failures, relationFailures)
 		if spec.emits("FILE_CHANGES_WITH") {
-			for _, r := range fileChangesWithRelations(ctx, sc.absRepo, sc.commit, sc.key, files) {
+			for _, r := range fileChangesWithRelations(ctx, sc.absRepo, sc.commit, sc.key, files, options.historyCochanges) {
 				if emitErr != nil || ctx.Err() != nil {
 					break
 				}
@@ -1934,7 +1941,7 @@ func prepareSource(ctx context.Context, repo string, options ProviderSnapshotOpt
 		warnings = append(warnings, ProviderWarning{
 			Code:                 "W_WORKTREE_SNAPSHOT",
 			Severity:             "warning",
-			EffectOnCompleteness: "snapshot records are read from the working tree; this is the default, and working-tree reads are never cached, so --head is the cacheable, committed-tree baseline",
+			EffectOnCompleteness: "snapshot records are read from the working tree; working-tree reads are never cached, so use --head for the cacheable, committed-tree baseline",
 		})
 	} else if headErr != nil {
 		warnings = append(warnings, ProviderWarning{
@@ -5125,8 +5132,13 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 		}
 	}
 	if spec.emits("HANDLES_ROUTE") {
-		goRoutes, goInline, masks := goHTTPRouteRelations(files, recordsByFile, readContent, constantsByFile)
+		goRoutes, goInline, masks, routeFailures := goHTTPRouteRelations(files, recordsByFile, readContent, constantsByFile)
 		goRouteMasks = masks
+		if recordFailure != nil {
+			for _, failure := range routeFailures {
+				recordFailure(failure)
+			}
+		}
 		for _, r := range goRoutes {
 			if shouldStop != nil && shouldStop() {
 				return
@@ -6520,6 +6532,12 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 			})
 		if scanErr != nil {
 			return
+		}
+	}
+
+	if recordFailure != nil {
+		for _, failure := range goFileImportIndex.partialFailures() {
+			recordFailure(failure)
 		}
 	}
 
@@ -12835,12 +12853,21 @@ func configuresRelations(recordsByFile map[string][]SymbolRecord, readContent co
 	return relations
 }
 
-func fileChangesWithRelations(ctx context.Context, repo, revision, repoKey string, files []FileRecord) []RelationRecord {
+func fileChangesWithRelations(ctx context.Context, repo, revision, repoKey string, files []FileRecord, captured ...*capturedFileCochanges) []RelationRecord {
 	if revision == "" {
 		return nil
 	}
-	cochanges, err := gitutil.FileCochanges(ctx, repo, revision, 256)
-	if err != nil || len(cochanges) == 0 {
+	var cochanges []gitutil.FileCochange
+	if len(captured) > 0 && captured[0] != nil {
+		cochanges = captured[0].pairs
+	} else {
+		var err error
+		cochanges, err = gitutil.FileCochanges(ctx, repo, revision, 256)
+		if err != nil {
+			return nil
+		}
+	}
+	if len(cochanges) == 0 {
 		return nil
 	}
 	known := map[string]bool{}
@@ -24914,8 +24941,9 @@ func routeLiteralsForSymbol(path, content, block string, symbol SymbolRecord, sy
 // goHTTPRouteRelations returns the Go route relations with a named local
 // handler, the inline-handler relations (attributed to the enclosing symbol),
 // and per file the byte spans of every route argument the pass decided.
-func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolRecord, readContent contentReader, constantsByFile *fileStringConstants) ([]expressRouteRelation, []expressRouteRelation, map[string][][2]int) {
+func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolRecord, readContent contentReader, constantsByFile *fileStringConstants) ([]expressRouteRelation, []expressRouteRelation, map[string][][2]int, []PartialFailure) {
 	var relations, inline []expressRouteRelation
+	var failures []PartialFailure
 	masks := map[string][][2]int{}
 	// seen and inlineSeen map an edge (symbol, route) to its index in
 	// relations or inline. The route id is the path, so a second ServeMux
@@ -24946,6 +24974,22 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 			}
 		}
 		detail := goRouteRegistrationsDetailed(content, constantsByFile.forFile(file.Path, content))
+		if detail.parseFailed {
+			failures = append(failures, PartialFailure{
+				Code: "E_PARSE_ERROR", Severity: "warning", FilePath: file.Path,
+				EffectOnCompleteness: "Go route binding parse failed; only conservative named-handler token recovery retained and generic route-literal fallback omitted",
+				Detail:               "Go parser rejected the source, including package-clause recovery",
+			})
+		}
+		if detail.exhausted {
+			failures = append(failures, PartialFailure{
+				Code:                 "E_GO_ROUTE_BUDGET_EXCEEDED",
+				Severity:             "warning",
+				FilePath:             file.Path,
+				EffectOnCompleteness: "Go route analysis exceeded its work budget; HANDLES_ROUTE relations and literal fallback omitted for this file",
+				Detail:               "Scoped Go receiver and middleware resolution exhausted its bounded step budget",
+			})
+		}
 		if len(detail.masks) > 0 {
 			masks[file.Path] = detail.masks
 		}
@@ -25047,7 +25091,7 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 		}
 		return relations[i].Handler.ID < relations[j].Handler.ID
 	})
-	return relations, inline, masks
+	return relations, inline, masks, failures
 }
 
 // goRouteAddMethodEvidence records one more ServeMux method registration of

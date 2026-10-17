@@ -2,6 +2,9 @@ package cli
 
 import (
 	"bytes"
+	"compress/gzip"
+	"encoding/json"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -27,6 +30,122 @@ func recordsCacheEntries(t *testing.T, cacheDir string) []string {
 		t.Fatal(err)
 	}
 	return entries
+}
+
+func TestTargetedEdgesRecoverFromCorruptCache(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init")
+	git(t, repo, "config", "user.name", "Entire Graph Test")
+	git(t, repo, "config", "user.email", "graph@example.com")
+	write(t, repo, "main.go", "package sample\nfunc helper() {}\nfunc Main() { helper() }\n")
+	git(t, repo, "add", ".")
+	git(t, repo, "commit", "-m", "initial")
+
+	for _, damage := range []string{"truncated-gzip", "malformed-record", "invalid-relation", "capture-overflow"} {
+		t.Run(damage, func(t *testing.T) {
+			cacheDir, pluginDir := t.TempDir(), t.TempDir()
+			run := func(extra ...string) (string, string) {
+				t.Helper()
+				var out, errOut bytes.Buffer
+				args := []string{"edges", "--repo", repo, "--format", "ndjson", "--to", "helper", "--relation", "CALLS", "--cache-dir", cacheDir}
+				if err := Run(t.Context(), Options{Version: "cache-recovery-test", Env: EntireEnv{RepoRoot: repo, PluginDataDir: pluginDir}, Stdout: &out, Stderr: &errOut}, append(args, extra...)); err != nil {
+					t.Fatalf("targeted edges: %v\n%s", err, errOut.String())
+				}
+				return out.String(), errOut.String()
+			}
+			want, wantErr := run("--no-cache")
+			if strings.Count(want, `"record_type":"relation"`) != 1 {
+				t.Fatalf("control must contain one matching edge: %s", want)
+			}
+			if damage == "capture-overflow" {
+				previousLimit := providerRecordsCacheMaxBytes
+				providerRecordsCacheMaxBytes = 1
+				defer func() { providerRecordsCacheMaxBytes = previousLimit }()
+				for range 2 {
+					got, gotErr := run()
+					if got != want || gotErr != wantErr {
+						t.Fatal("cache capture overflow changed targeted output")
+					}
+				}
+				if entries := recordsCacheEntries(t, cacheDir); len(entries) != 0 {
+					t.Fatalf("overflow persisted an incomplete cache: %v", entries)
+				}
+				return
+			}
+			run()
+			entries := recordsCacheEntries(t, cacheDir)
+			if len(entries) != 1 {
+				t.Fatalf("control cache entries = %v", entries)
+			}
+			clean, err := os.ReadFile(entries[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			broken := clean[:len(clean)/2]
+			if damage != "truncated-gzip" {
+				reader, err := gzip.NewReader(bytes.NewReader(clean))
+				if err != nil {
+					t.Fatal(err)
+				}
+				raw, err := io.ReadAll(reader)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := reader.Close(); err != nil {
+					t.Fatal(err)
+				}
+				var envelope map[string]json.RawMessage
+				if err := json.Unmarshal(raw, &envelope); err != nil {
+					t.Fatal(err)
+				}
+				// Keep a valid envelope and matching prefix, then damage a later
+				// record. Recovery must not print the prefix before rebuilding.
+				suffix := "{not json\n"
+				if damage == "invalid-relation" {
+					suffix = "{\"record_type\":\"relation\",\"to_id\":7}\n"
+				}
+				envelope["records"], err = json.Marshal([]byte(want + suffix))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var compressed bytes.Buffer
+				writer := gzip.NewWriter(&compressed)
+				if err := json.NewEncoder(writer).Encode(envelope); err != nil {
+					t.Fatal(err)
+				}
+				if err := writer.Close(); err != nil {
+					t.Fatal(err)
+				}
+				broken = compressed.Bytes()
+			}
+			if err := os.WriteFile(entries[0], broken, 0600); err != nil {
+				t.Fatal(err)
+			}
+			got, gotErr := run()
+			if got != want || gotErr != wantErr {
+				t.Fatalf("recovery differs from uncached output:\nstdout %q\nstderr %q\nwant stdout %q\nwant stderr %q", got, gotErr, want, wantErr)
+			}
+			repaired, err := os.ReadFile(entries[0])
+			if err != nil || bytes.Equal(repaired, broken) {
+				t.Fatalf("damaged entry was not replaced: %v", err)
+			}
+			before, err := os.Stat(entries[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, gotErr = run()
+			after, err := os.Stat(entries[0])
+			if err != nil || !os.SameFile(before, after) || !before.ModTime().Equal(after.ModTime()) {
+				t.Fatalf("repaired entry was rebuilt instead of reused: %v", err)
+			}
+			if got != want || gotErr != wantErr {
+				t.Fatal("repaired-cache hit differs from uncached output")
+			}
+			if entries := recordsCacheEntries(t, pluginDir); len(entries) != 0 {
+				t.Fatalf("recovery wrote outside --cache-dir: %v", entries)
+			}
+		})
+	}
 }
 
 // TestTargetedEdgesHonourTheCacheDir pins `--cache-dir` on a targeted edge query. It used to be

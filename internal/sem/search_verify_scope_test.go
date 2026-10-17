@@ -314,7 +314,11 @@ func TestReconcileLedger(t *testing.T) {
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-m", "initial")
 	scope := filepath.Join(repo, "cmd", "tool")
-	const want = "cd ../.. && go test ./cmd/tool/ledger -run '^TestReconcileLedger$'"
+	physicalRepo, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := searchVerifyRunIn(physicalRepo, "go test ./cmd/tool/ledger -run '^TestReconcileLedger$'")
 	for _, worktree := range []bool{false, true} {
 		response, err := SearchRepository(t.Context(), scope, "test-version", "reconcile ledger balance", SearchOptions{
 			Profile: ProfileFull, Worktree: worktree, DisableCache: true, TopK: 5,

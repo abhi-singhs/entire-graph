@@ -68,7 +68,7 @@ func TestAgentSearchAdaptiveUsesSmallestBudgetThatKeepsHeadWhole(t *testing.T) {
 	head := adaptiveHeadBlock(t, response)
 
 	var adaptive, ceiling bytes.Buffer
-	if _, err := writeAgentSearchAdaptive(&adaptive, response, defaultSearchContextBytes, agentSearchRender{exactName: true}); err != nil {
+	if _, err := writeAgentSearchAdaptiveFor(&adaptive, response, defaultSearchContextBytes, agentSearchRender{exactName: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeAgentSearch(&ceiling, response, defaultSearchContextBytes); err != nil {
@@ -110,7 +110,7 @@ func TestAgentSearchAdaptiveGrowsRatherThanClipTheHead(t *testing.T) {
 	}
 
 	var adaptive bytes.Buffer
-	if _, err := writeAgentSearchAdaptive(&adaptive, response, defaultSearchContextBytes, agentSearchRender{exactName: true}); err != nil {
+	if _, err := writeAgentSearchAdaptiveFor(&adaptive, response, defaultSearchContextBytes, agentSearchRender{exactName: true}); err != nil {
 		t.Fatal(err)
 	}
 	if !agentSearchPayloadCarriesBlock(adaptive.Bytes(), head) {
@@ -232,7 +232,7 @@ func TestAgentSearchAdaptiveKeepsAbsoluteRankOneWholeAfterSectionOrdering(t *tes
 		t.Fatal("smallest budget already carries rank 1 whole; test proves nothing")
 	}
 	var got bytes.Buffer
-	if _, err := writeAgentSearchAdaptive(&got, response, defaultSearchContextBytes, agentSearchRender{exactName: true}); err != nil {
+	if _, err := writeAgentSearchAdaptiveFor(&got, response, defaultSearchContextBytes, agentSearchRender{exactName: true}); err != nil {
 		t.Fatal(err)
 	}
 	if !agentSearchPayloadCarriesBlock(got.Bytes(), rankOne) {
@@ -434,7 +434,7 @@ func TestAgentSearchAdaptiveKeepsProtectedLowerRanksWhole(t *testing.T) {
 		t.Fatal("smallest budget already carries rank 3 whole; test proves nothing")
 	}
 	var got bytes.Buffer
-	if _, err := writeAgentSearchAdaptive(&got, response, defaultSearchContextBytes, agentSearchRender{exactName: true}); err != nil {
+	if _, err := writeAgentSearchAdaptiveFor(&got, response, defaultSearchContextBytes, agentSearchRender{exactName: true}); err != nil {
 		t.Fatal(err)
 	}
 	if !agentSearchPayloadCarriesBlock(got.Bytes(), rankThree) {
