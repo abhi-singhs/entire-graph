@@ -47,8 +47,7 @@ func TestEveryGuideKeepsUnmarkedSourceUncertified(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			for _, required := range []string{
 				"An unmarked result is not certified",
-				"a partial window, or a whole body the producer did not certify",
-				"A certified body that cannot fit with its marker becomes an unmarked locator",
+				"a partial window or a whole body whose marker did not fit",
 				"Retrieve only the specific additional span, surrounding context, caller, contract, or second site required for the task",
 			} {
 				if !strings.Contains(guide, required) {
@@ -82,17 +81,29 @@ func TestEveryGuideRefreshesPossiblyChangedSource(t *testing.T) {
 	}
 }
 
-func TestEveryGuidePreservesRequiredReadsAndUnknownFreshness(t *testing.T) {
+// Some editing tools refuse to change a file the agent has not read in the session. A
+// guide that lets [complete] stand in for that read would make the first edit fail, and
+// an agent unable to tell whether source changed must not default to skipping the read.
+func TestEveryGuideKeepsToolRequiredReadsAndDefaultsUnknownFreshnessToRead(t *testing.T) {
 	t.Parallel()
 	for name, guide := range conditionalReadGuides() {
 		t.Run(name, func(t *testing.T) {
 			for _, required := range []string{
-				"The marker never waives a read your editing tool requires before it changes a file",
-				"when the tool requires one, perform that read",
+				"The marker never waives a read your editing tool requires before it changes a file: when the tool requires one, perform that read",
 				"If you cannot establish that a span is unchanged since the query, treat it as changed and read it",
 			} {
 				if !strings.Contains(guide, required) {
-					t.Errorf("rendered guide missing read prerequisite %q", required)
+					t.Errorf("rendered guide missing read-safety instruction %q", required)
+				}
+			}
+			for _, forbidden := range []string{
+				"skip the pre-edit read",
+				"skip the read",
+				"without reading",
+				"no need to read",
+			} {
+				if strings.Contains(strings.ToLower(guide), forbidden) {
+					t.Errorf("rendered guide tells agents to skip a read via %q", forbidden)
 				}
 			}
 		})

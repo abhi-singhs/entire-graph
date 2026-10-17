@@ -184,11 +184,29 @@ func readToolSpan(input map[string]any) *lineSpan {
 // shellTimelineEntry applies the exploration classifier's rules (leading pipeline stage only,
 // writes excluded) and then splits a locate command into search vs read. A search anywhere in the
 // command makes the whole call a re-query. Shell read spans are not parsed: unknown span.
+//
+// Command substitution bodies are scanned too, with the same depth bound, because
+// timelineFromToolUse's graph branch (graphVerbFromCommand) already finds a graph call inside one:
+// counting `x=$(entire graph search ...)` as a locate while missing a follow-up
+// `files=$(grep -rl Foo .)` as its re-query would credit the graph with a displacement it did not
+// make.
 func shellTimelineEntry(command string) timelineEntry {
 	if command == "" {
 		return timelineEntry{kind: timelineOther}
 	}
 	var reads []string
+	if shellTimelineScan(command, 0, &reads) {
+		return timelineEntry{kind: timelineRequery}
+	}
+	if len(reads) == 0 {
+		return timelineEntry{kind: timelineOther}
+	}
+	return timelineEntry{kind: timelineRead, paths: reads}
+}
+
+// shellTimelineScan reports whether the command, or any command substitution inside it, runs a
+// search; reads are collected along the way.
+func shellTimelineScan(command string, depth int, reads *[]string) bool {
 	for _, stage := range pipelineHeadStages(command) {
 		if isWritingShellStage(stage) {
 			continue
@@ -196,15 +214,20 @@ func shellTimelineEntry(command string) timelineEntry {
 		word := shellCommandWord(stage)
 		switch {
 		case shellSearchCommands[word]:
-			return timelineEntry{kind: timelineRequery}
+			return true
 		case shellReadCommands[word]:
-			reads = append(reads, shellStageOperands(stage)...)
+			*reads = append(*reads, shellStageOperands(stage)...)
 		}
 	}
-	if len(reads) == 0 {
-		return timelineEntry{kind: timelineOther}
+	if depth >= maxSubstitutionDepth {
+		return false
 	}
-	return timelineEntry{kind: timelineRead, paths: reads}
+	for _, body := range shellSubstitutionBodies(command) {
+		if shellTimelineScan(body, depth+1, reads) {
+			return true
+		}
+	}
+	return false
 }
 
 // shellStageOperands returns every non-flag word after the command word. Non-path operands (a sed
@@ -330,9 +353,12 @@ func plausibleGraphPath(path string) bool {
 }
 
 // graphJSONResultKeys open the answer sections of query/search, neighbors, impact and def JSON.
+// An ambiguous neighbors/impact answers with its candidates — "match_bodies" and impact's
+// "definitions" — instead of a focus, so those open an answer section too.
 var graphJSONResultKeys = map[string]bool{
-	"results": true, "matches": true, "match_bodies": true, "definitions": true, "focus": true, "callers": true, "callees": true,
+	"results": true, "matches": true, "focus": true, "callers": true, "callees": true,
 	"type_consumers": true, "data_flows": true, "co_changes": true, "siblings": true, "declarations": true,
+	"definitions": true, "match_bodies": true,
 }
 
 var (

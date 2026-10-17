@@ -164,7 +164,10 @@ func TestTheRealSearchPathStillMarksAGenuinelyCompleteSymbol(t *testing.T) {
 			function.WriteString("\treturn attempt >= budget\n}\n")
 			source := "package retry\n\n" + function.String()
 			write(t, repo, "retry.go", source)
-			args := []string{"query", "--repo", repo, "--query", "RetryBudgetExhausted", "--no-cache", "--max-context-bytes", "24576"}
+			// A phrase, not the bare identifier: an exact-identifier query is answered by the
+			// exact-name rows (search_exact_name.go), which never carry the marker. This test is
+			// about the ranked rendering of a certified body.
+			args := []string{"query", "--repo", repo, "--query", "whether the retry budget is exhausted", "--no-cache", "--max-context-bytes", "24576"}
 			if forced {
 				args = append(args, "--full-unit-top", "1")
 			}

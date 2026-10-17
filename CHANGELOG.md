@@ -23,7 +23,7 @@ auto-generated notes on
 
 ### Changed
 
-- `graph query --format agent` with no `--max-context-bytes` now uses the smallest of 4 KiB, 8 KiB or 16 KiB that still shows both the first printed block and the best-ranked result exactly as an unbounded render does, and 24 KiB only when none does. An explicit budget is honoured exactly.
+- `graph query --format agent` with no `--max-context-bytes` now uses the smallest of 4 KiB, 8 KiB or 16 KiB that still shows both the first printed block and the best-ranked result exactly as an unbounded render does, and 24 KiB only when none does. An explicit budget is honoured exactly. Every candidate render keeps the exact-name answer, VERIFY block, declaration rows and session-replay rules of an explicit budget; an exact-identifier query is still rendered at the 24 KiB ceiling.
 - Under a binding budget, agent-format search now keeps every ranked location with its rank, name and score, and shares the remaining bytes towards the head of the ranking, passing any share a result cannot use on to the others. The top hit no longer degrades to a bare `path:line *` to fit one more body line.
 - Upgraded the Go toolchain to 1.27.
 - Improved snapshot, search, and analyze performance and substantially reduced memory allocation, and made `stats` return a fast, single-line answer instead of a full rescan.
@@ -38,7 +38,7 @@ auto-generated notes on
 - Corrected search term-rarity weighting to use repository-wide content frequencies when exact counts are available, with inspected-sample fallback when they are not. This can change result ordering without changing symbols or the output schema.
 - Corrected transcript exploration classification for quoted commands, pipeline tails and writes; added signed stats model totals while retaining legacy JSON fields. Search `stats.context_block_bytes` now includes file outlines and validates their measured cost and independent cap.
 - Scoped generated agent guidance to the observed source view: a complete body does not certify later freshness or dependencies, and unmarked source no longer mandates a duplicate read. Follow-up reads target missing or possibly changed source.
-- Certified already-whole search bodies against their exact source without changing the selected JSON spans, and retained the whole-certified-body-or-locator rendering contract under tight budgets.
+- Certified already-whole search bodies against their exact source without changing the selected JSON spans, and preserved unmarked source excerpts when an agent response cannot fit the complete body and its marker.
 - Preserved validated nested repository boundaries in working-tree fallback scans, avoiding duplicate source and search results from untracked nested clones, linked worktrees, and submodules while retaining outer-repository tracked source.
 - Classified ambiguous same-file nearest-declaration call guesses as `name_only` with reduced confidence, preserving the ambiguity through C++ out-of-line mapping. This corrects false certainty, not semantic overload selection; fast-profile and argument-forwarding filters now omit these uncertain edges.
 - Fixed seven wrong-answer defects in the provider and type scanners and stopped bare type names resolving across language boundaries.

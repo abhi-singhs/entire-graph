@@ -104,6 +104,11 @@ func TestNormalGuideStaysDirective(t *testing.T) {
 	if strings.Contains(BenchmarkNeutralGraphCapability, "MUST") || strings.Contains(BenchmarkNeutralGraphCapability, "FIRST action") {
 		t.Error("BenchmarkNeutralGraphCapability is no longer neutral; an imperative there is an arm-asymmetric instruction")
 	}
+	// The harness selects the output format per experiment (main e89118b8); the neutral capability
+	// statement must not choose one for it.
+	if strings.Contains(BenchmarkNeutralGraphCapability, "--format") {
+		t.Error("BenchmarkNeutralGraphCapability names an output format; the benchmark harness selects it")
+	}
 
 	// Graph before Brain in the combined guide. An obligation printed under a paragraph that
 	// already offers a way to find code reads as the optional one of the two.

@@ -23,7 +23,10 @@ func TestReview303EscapedDeclarationPreservesOtherRow(t *testing.T) {
 		{name: "escaped_declaration", comment: strings.Repeat("\x1b", 100)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			const budget = 600
+			// 1100, not 600: under the head-weighted split (agentSearchResultBudgets, #295) row 2's
+			// share reaches its whole declaration only from about 1100 bytes; at 600 the premise
+			// below fails before the renderer is asked anything.
+			const budget = 1100
 			results := review303RankedDeclarationFixture(tc.comment)
 			got := fitAgentSearchResults(results, budget)
 			t.Logf("final ranking: %d/%d bytes\n%s", len(got), budget, got)

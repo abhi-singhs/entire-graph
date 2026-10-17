@@ -124,7 +124,8 @@ func TestAlreadyCompleteCallableKeepsWholeBodyOrLocatorAtPublicBudgets(t *testin
 	repo := t.TempDir()
 	const body = "def target():\n    return True"
 	write(t, repo, "a.py", body+"\n")
-	args := []string{"query", "--repo", repo, "--query", "target", "--profile", "syntax-only", "--worktree", "--no-cache"}
+	// A phrase: a bare identifier takes the exact-name answer, which never certifies.
+	args := []string{"query", "--repo", repo, "--query", "target returns true", "--profile", "syntax-only", "--worktree", "--no-cache"}
 	var machine bytes.Buffer
 	if err := Run(t.Context(), Options{Env: EntireEnv{RepoRoot: repo}, Stdout: &machine}, append(args, "--format", "json")); err != nil {
 		t.Fatal(err)
@@ -144,10 +145,15 @@ func TestAlreadyCompleteCallableKeepsWholeBodyOrLocatorAtPublicBudgets(t *testin
 		if out.Len() > budget || !strings.Contains(out.String(), "a.py:1") {
 			t.Fatalf("budget %d lost bounds/location: %q", budget, out.String())
 		}
+		// The stack's declaration-row contract: a certified body that cannot fit with its marker
+		// may still show its declaration, unmarked; the marker appears only above the whole body.
 		whole := strings.Contains(out.String(), body)
 		marked := strings.Contains(out.String(), completeMarker)
-		if whole != marked || (strings.Contains(out.String(), "def target():") && !whole) {
-			t.Fatalf("budget %d abbreviated a certified callable: %q", budget, out.String())
+		if marked && !whole {
+			t.Fatalf("budget %d marked a partial body: %q", budget, out.String())
+		}
+		if whole && !marked && budget == 4096 {
+			t.Fatalf("budget %d showed the certified body without its marker: %q", budget, out.String())
 		}
 		if (budget == 4096) != whole {
 			t.Fatalf("budget %d unexpected whole-body state: %q", budget, out.String())

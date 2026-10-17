@@ -138,3 +138,28 @@ func TestColdCompleteAffordabilityReusesTheSearchListing(t *testing.T) {
 		t.Fatal("a known count over the bound was reported affordable")
 	}
 }
+
+func TestSelectiveDerivationReportsCompleteHeaderOnce(t *testing.T) {
+	repo := selectiveFilterFixture(t)
+	cacheDir := t.TempDir()
+	calls := 0
+	options := ProviderSnapshotOptions{Profile: ProfileFull, OnlyFiles: []string{"alpha/run.go"}}
+	options.onCompleteDerivation = func(header SnapshotHeader) {
+		calls++
+		if header.Stats.Files != 4 {
+			t.Fatalf("callback must report complete scope: %#v", header.Stats)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		snapshot, _, err := LoadOrBuildProviderSnapshot(t.Context(), repo, "test-version", options, cacheDir, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(snapshot.Files) != 1 {
+			t.Fatalf("selected files = %d", len(snapshot.Files))
+		}
+		if calls != 1 {
+			t.Fatalf("callback count after request %d = %d, want 1 (direct hits must not derive again)", i+1, calls)
+		}
+	}
+}

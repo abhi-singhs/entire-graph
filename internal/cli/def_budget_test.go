@@ -168,6 +168,59 @@ func TestDefNameBudgetSplitsTheTotal(t *testing.T) {
 	}
 }
 
+// TestDefJSONMultiNameDegradesPerName: several names share the budget, and a
+// name whose smallest JSON answer cannot fit its share must not throw away the
+// answers that do fit. It used to: one over-tight name returned before any
+// output, so `def A B C D E F --format json` at the default budget wrote
+// nothing at all. The names that fit are written within the total budget, and
+// the error names only the ones left out.
+func TestDefJSONMultiNameDegradesPerName(t *testing.T) {
+	repo := t.TempDir()
+	git(t, repo, "init")
+	git(t, repo, "config", "user.name", "Entire Graph Test")
+	git(t, repo, "config", "user.email", "graph@example.com")
+	var source strings.Builder
+	source.WriteString("package sample\n\n")
+	names := make([]string, 6)
+	for index := range names {
+		names[index] = fmt.Sprintf("Helper%d", index)
+		fmt.Fprintf(&source, "func %s() int { return %d }\n\n", names[index], index)
+	}
+	write(t, repo, "main.go", source.String())
+	git(t, repo, "add", "main.go")
+	git(t, repo, "commit", "-m", "initial")
+
+	var stdout, stderr bytes.Buffer
+	err := Run(t.Context(), Options{
+		Version: "test-version",
+		Env:     EntireEnv{RepoRoot: repo, PluginDataDir: t.TempDir()},
+		Stdout:  &stdout,
+		Stderr:  &stderr,
+	}, append([]string{"def", "--head", "--format", "json", "--repo", repo}, names...))
+	if stdout.Len() == 0 {
+		t.Fatalf("no answer was written for any of %d names (err %v)", len(names), err)
+	}
+	if stdout.Len() > defaultDefContextBytes {
+		t.Fatalf("wrote %d bytes, over the %d-byte total budget", stdout.Len(), defaultDefContextBytes)
+	}
+	written := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(stdout.String()), "\n") {
+		var answer struct {
+			Query string `json:"query"`
+		}
+		if decodeErr := json.Unmarshal([]byte(line), &answer); decodeErr != nil {
+			t.Fatalf("an emitted answer is not valid JSON: %v\n%s", decodeErr, line)
+		}
+		written[answer.Query] = true
+	}
+	for _, name := range names {
+		mentioned := err != nil && strings.Contains(err.Error(), name)
+		if written[name] == mentioned {
+			t.Fatalf("%s: written=%v, named in error=%v; each name must be exactly one of the two (err %v)", name, written[name], mentioned, err)
+		}
+	}
+}
+
 func TestDefRejectsMoreNamesThanTotalBytesBeforeWriting(t *testing.T) {
 	repo := t.TempDir()
 	git(t, repo, "init")

@@ -36,7 +36,8 @@ import (
 // reusing older route-producer entries.
 // v17 retires routes omitted by closure-local writes and address escapes.
 // v18 retires bare routes from wrapped mounts and unbounded route masks.
-const providerRecordsCacheVersion = "provider-records-v18-" + IdentityRevision
+// v19 retires entries before unresolved route placement and Go 1.22 method patterns.
+const providerRecordsCacheVersion = "provider-records-v19-" + IdentityRevision
 
 // cachedProviderRecords is the on-disk envelope for a cached record stream. The
 // key alone is authoritative (sha256 over version+commit+tree+mode+profile+

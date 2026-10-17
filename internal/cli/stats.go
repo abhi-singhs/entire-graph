@@ -1149,6 +1149,29 @@ func graphVerbFromToolUse(block contentBlock) (string, bool) {
 }
 
 func graphVerbFromCommand(command string) (string, bool) {
+	return graphVerbFromCommandDepth(command, 0)
+}
+
+// graphVerbFromCommandDepth classifies the top-level segments first and then every command
+// substitution body, recursively. The substitution is masked as ONE opaque word at the top level
+// (see shellQuoteMask), so a call inside `x=$(cd /repo && entire graph impact ...)` is reached only
+// here. isExploringShellCommandDepth recurses identically: both arms must see the same commands.
+func graphVerbFromCommandDepth(command string, depth int) (string, bool) {
+	if verb, ok := graphVerbFromSegments(command); ok {
+		return verb, true
+	}
+	if depth >= maxSubstitutionDepth {
+		return "", false
+	}
+	for _, body := range shellSubstitutionBodies(command) {
+		if verb, ok := graphVerbFromCommandDepth(body, depth+1); ok {
+			return verb, true
+		}
+	}
+	return "", false
+}
+
+func graphVerbFromSegments(command string) (string, bool) {
 	for _, segment := range splitShellSegments(command) {
 		fields := strings.Fields(segment)
 		for index := 0; index < len(fields); index++ {
@@ -1300,7 +1323,17 @@ func explorationKindFromToolUse(block contentBlock) (string, bool) {
 // removes a further 4,502 on top of it, 36,805 in total (36.7%). The calls removed averaged 1,016
 // returned bytes against 3,117 for the ones kept, so the measured exploration price per call — the
 // thing the savings model divides by — rose 32.8%.
+//
+// Command substitutions are classified too, by the same rules applied to each body: the outer
+// statement's pipeline and write check are decided with the substitution masked, and then every
+// `$(...)`/backtick body is a command of its own. `files=$(cd internal && grep -rln Foo .)` is a
+// search; `cat $(git log --oneline | head -5) > summary.txt` is a write whose inner pipeline is
+// headed by `git log`, which locates nothing.
 func isExploringShellCommand(command string) bool {
+	return isExploringShellCommandDepth(command, 0)
+}
+
+func isExploringShellCommandDepth(command string, depth int) bool {
 	if command == "" {
 		return false
 	}
@@ -1312,7 +1345,137 @@ func isExploringShellCommand(command string) bool {
 			return true
 		}
 	}
+	if depth >= maxSubstitutionDepth {
+		return false
+	}
+	for _, body := range shellSubstitutionBodies(command) {
+		if isExploringShellCommandDepth(body, depth+1) {
+			return true
+		}
+	}
 	return false
+}
+
+// maxSubstitutionDepth bounds how deeply nested command substitutions are classified, so a
+// pathological command cannot make the recursion grow with its length.
+const maxSubstitutionDepth = 8
+
+// shellSubstitutionBodies returns the body of every OUTERMOST command substitution in a command,
+// in order: the text inside `$(...)` and inside a backtick pair. Bodies nested inside a body are
+// left for the caller's recursion. `$((...))` is arithmetic, not a command, and is skipped whole.
+//
+// Single-quoted text expands nothing and is skipped; double-quoted text DOES expand substitutions
+// (`x="$(entire graph search ...)"` runs the search), so it is scanned. Here-document bodies are
+// removed first, as everywhere else in this file. A substitution that never closes ends the scan:
+// its text was already split by the unmasked top-level reading shellQuoteMask falls back to.
+func shellSubstitutionBodies(command string) []string {
+	runes := []rune(stripHeredocBodies(command))
+	var bodies []string
+	inDouble := false
+	for index := 0; index < len(runes); index++ {
+		character := runes[index]
+		switch {
+		case character == '\\':
+			index++
+		case character == '\'' && !inDouble:
+			end := indexRuneFrom(runes, index+1, '\'')
+			if end < 0 {
+				return bodies
+			}
+			index = end
+		case character == '"':
+			inDouble = !inDouble
+		case character == '$' && index+1 < len(runes) && runes[index+1] == '(':
+			arithmetic := index+2 < len(runes) && runes[index+2] == '('
+			end := substitutionEnd(runes, index+2, substitutionParen)
+			if end < 0 {
+				return bodies
+			}
+			if !arithmetic {
+				bodies = append(bodies, string(runes[index+2:end]))
+			}
+			index = end
+		case character == '`':
+			end := substitutionEnd(runes, index+1, substitutionBacktick)
+			if end < 0 {
+				return bodies
+			}
+			bodies = append(bodies, string(runes[index+1:end]))
+			index = end
+		}
+	}
+	return bodies
+}
+
+const (
+	substitutionParen = iota
+	substitutionDouble
+	substitutionBacktick
+)
+
+// substitutionEnd returns the index of the rune that closes the construct opened just before start
+// — a `)` for `$(`, a backtick for a backtick — or -1 when it never closes. It tracks quotes,
+// escapes and nested constructs with an explicit stack, so nesting depth costs no Go stack.
+func substitutionEnd(runes []rune, start int, open int) int {
+	stack := []int{open}
+	for index := start; index < len(runes); index++ {
+		character := runes[index]
+		if character == '\\' {
+			index++
+			continue
+		}
+		opensSubstitution := character == '$' && index+1 < len(runes) && runes[index+1] == '('
+		switch stack[len(stack)-1] {
+		case substitutionBacktick:
+			// An unescaped backtick always closes; nothing nests inside without escaping.
+			if character == '`' {
+				stack = stack[:len(stack)-1]
+			}
+		case substitutionDouble:
+			switch {
+			case character == '"':
+				stack = stack[:len(stack)-1]
+			case opensSubstitution:
+				stack = append(stack, substitutionParen)
+				index++
+			case character == '`':
+				stack = append(stack, substitutionBacktick)
+			}
+		default: // substitutionParen
+			switch {
+			case character == '\'':
+				end := indexRuneFrom(runes, index+1, '\'')
+				if end < 0 {
+					return -1
+				}
+				index = end
+			case character == '"':
+				stack = append(stack, substitutionDouble)
+			case character == '`':
+				stack = append(stack, substitutionBacktick)
+			case opensSubstitution:
+				stack = append(stack, substitutionParen)
+				index++
+			case character == '(':
+				stack = append(stack, substitutionParen)
+			case character == ')':
+				stack = stack[:len(stack)-1]
+			}
+		}
+		if len(stack) == 0 {
+			return index
+		}
+	}
+	return -1
+}
+
+func indexRuneFrom(runes []rune, start int, target rune) int {
+	for index := start; index < len(runes); index++ {
+		if runes[index] == target {
+			return index
+		}
+	}
+	return -1
 }
 
 // shellCommandWord returns the command a stage runs — wrappers (`rtk`, `sudo`, `xargs`) and
@@ -1413,14 +1576,23 @@ func pipelineHeadStages(command string) []string {
 // the operators they look for — `|`, `;`, `&`, `>`, `<<` — is an operator inside quotes:
 // `git commit -m "fix: a; grep the logs"` is one commit, and `cat "odd>name.txt"` is a read.
 //
-// A command whose quotes do not balance gets an all-false mask: masking to end-of-string on an
-// unterminated quote would hide every later statement, and falling back to the unquoted reading is
-// this file's pre-existing behaviour, so the failure stays bounded.
+// Command substitution is masked the same way: in `cat $(git log | head -5) > out.txt` the `|`
+// belongs to the substituted command, and splitting the outer statement there hid its `> out.txt`
+// redirect from the write check. `$(...)` nests (and so does `$((...))` arithmetic); a backtick
+// substitution does not. Quotes inside a substitution are still tracked, so `$(grep ")" x)` closes
+// at the last parenthesis, not the quoted one.
+//
+// A command whose quotes or substitutions do not balance gets an all-false mask: masking to
+// end-of-string on an unterminated quote would hide every later statement, and falling back to the
+// unquoted reading is this file's pre-existing behaviour, so the failure stays bounded.
 func shellQuoteMask(runes []rune) []bool {
 	masked := make([]bool, len(runes))
 	var quote rune
+	depth := 0
+	backtick := false
 	for index := 0; index < len(runes); index++ {
 		character := runes[index]
+		inSubstitution := depth > 0 || backtick
 		switch {
 		case character == '\\' && quote != '\'':
 			masked[index] = true
@@ -1436,9 +1608,24 @@ func shellQuoteMask(runes []rune) []bool {
 		case character == '\'' || character == '"':
 			quote = character
 			masked[index] = true
+		case character == '$' && index+1 < len(runes) && runes[index+1] == '(':
+			masked[index], masked[index+1] = true, true
+			depth++
+			index++
+		case character == '(' && depth > 0:
+			masked[index] = true
+			depth++
+		case character == ')' && depth > 0:
+			masked[index] = true
+			depth--
+		case character == '`':
+			masked[index] = true
+			backtick = !backtick
+		case inSubstitution:
+			masked[index] = true
 		}
 	}
-	if quote != 0 {
+	if quote != 0 || depth != 0 || backtick {
 		return make([]bool, len(runes))
 	}
 	return masked
