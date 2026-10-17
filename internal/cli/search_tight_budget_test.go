@@ -22,7 +22,8 @@ import (
 func TestTightAgentBudgetKeepsSourceAcrossHeaderWidths(t *testing.T) {
 	t.Parallel()
 	repo := t.TempDir()
-	write(t, repo, "a.py", "def target():\n    return True\n")
+	// A top-level assignment exercises ordinary source fitting, not callable certification.
+	write(t, repo, "a.py", "target = True\n")
 	for _, budget := range []string{"64", "60", "56", "52", "48"} {
 		var out bytes.Buffer
 		err := Run(t.Context(), Options{Version: "0.1.0", Env: EntireEnv{RepoRoot: repo}, Stdout: &out}, []string{
@@ -89,7 +90,7 @@ func TestAgentSearchBlockKeepsIdentityBeforeBodyLines(t *testing.T) {
 		StartLine: 1, EndLine: 5, SnippetStartLine: 1, FocusLine: 1, Snippet: body,
 	}
 	minimalWhole := len("a.go:1 *\n") + len(body)
-	got := string(agentSearchPrimaryBlock(result, minimalWhole))
+	got := string(agentSearchPrimaryBlock(result, minimalWhole, false))
 	if len(got) > minimalWhole {
 		t.Fatalf("block used %d bytes, budget %d: %q", len(got), minimalWhole, got)
 	}
@@ -103,7 +104,7 @@ func TestAgentSearchBlockKeepsIdentityBeforeBodyLines(t *testing.T) {
 	// body (else span-major and tier-major agree) and MUST fit over the first line (else tier-major
 	// has nothing to choose under the rich header).
 	headers := func(end int) []string {
-		return agentSearchLocationHeaders(1, "a.go", 1, end, 1, "Resolve", "", agentSearchScoreTag(result))
+		return agentSearchLocationHeaders(1, "a.go", 1, end, 1, "Resolve", "", agentSearchScoreTag(result), "")
 	}
 	lines := strings.SplitAfter(strings.TrimSuffix(body, "\n"), "\n")
 	if richWhole := len(headers(5)[0]) + len(body); richWhole <= minimalWhole {

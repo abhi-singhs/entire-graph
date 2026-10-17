@@ -33,17 +33,25 @@ import (
 )
 
 const (
-	// SchemaVersion 1.3 adds optional source-file health accounting; 1.2 added
+	// SchemaVersion 1.4 adds optional derived relation provenance; 1.3 added
+	// source-file health accounting; 1.2 added
 	// optional parser identity metadata.
 	// Schema 1.1 added the snapshot fields introduced
 	// alongside boundary source locations (the `external` flag on external records
 	// and the per-symbol source-location fields). The shape is backward compatible
 	// for tolerant readers; the bump lets consumers detect the new fields.
-	SchemaVersion         = "1.3"
+	SchemaVersion         = "1.4"
 	ProviderName          = "entire-graph"
 	StableSymbolIDVersion = "compound-v1"
 	// IdentityRevision is a global, opaque revision of parser identity rules across
 	// all languages. Change it when corrections re-key existing symbols.
+	//
+	// Revision 4: the same correction for Swift, Kotlin, Rust and PHP, whose
+	// nested callables are local functions / block-scoped items / namespace
+	// functions rather than members of the enclosing type. Revision 3 shipped
+	// the Python half; a build carrying only that half wrote records under the
+	// revision-3 namespace, so these four need their own bump to stop those
+	// records being served for the languages they do not cover.
 	//
 	// Revision 3: Python nested callables are qualified by the enclosing
 	// CALLABLE rather than the enclosing class, so a helper defined inside a
@@ -51,7 +59,7 @@ const (
 	// `C.helper` (kind "method"). This re-keys every Python nested-callable
 	// symbol, and it un-keys the `#sig:` suffixes that the phantom forced onto
 	// real same-named members.
-	IdentityRevision     = "3"
+	IdentityRevision     = "4"
 	defaultMaxParseBytes = 4 * 1024 * 1024
 	// defaultMaxSourceFiles bounds how many files one snapshot will list. The
 	// per-file indexes a snapshot keeps (one file record and its retained symbols)
@@ -217,6 +225,7 @@ var schemaFeatures = []string{
 	"language_versions",
 	"relation_evidence",
 	"relation_evidence_dropped",
+	"relation_provenance",
 	"relation_resolution",
 	"relation_scope",
 	"relation_target_kind",
@@ -360,6 +369,15 @@ type SymbolRecord struct {
 	// frozen provider schema and symbol IDs do not change.
 	sourceStartByte int
 	sourceEndByte   int
+	// nameLine is Entity.nameLine: the parser's line for the declaration's name token, 0 when
+	// unknown. Private for the same reason as the byte range; search carries it to results as
+	// SearchResult.SymbolNameLine. Where it travels: the search snapshot cache keeps it in a side
+	// map (search_cache.go), so cold, complete-cache and selective views agree. The provider
+	// records and their cache are unchanged (it is not a public field). The compact snapshot row
+	// (compact_snapshot.go) does not encode it: symbols restored from a compact snapshot have
+	// none, and consumers use the text fallback for them. Synthetic symbols: a tool keeps its
+	// handler's; routes and workflows, named by path, have none.
+	nameLine int
 	// bodyless: this symbol declares a callable without defining it (a
 	// TypeScript overload signature or ambient declaration; see Entity.bodyless).
 	// Call resolution uses it to tell an overload set apart from genuinely
@@ -440,6 +458,17 @@ type ProviderSnapshot struct {
 	Externals []ExternalRecord
 	Symbols   []SymbolRecord
 	Relations []RelationRecord
+	// unmergedDataFlowEdges names the DATA_FLOWS edges (unmergedDataFlowEdgeKey)
+	// behind the header's W_DATA_FLOW_EVIDENCE_UNMERGED count; nil when there are
+	// none. The stream can only count them, but a snapshot holds every record, so
+	// it can keep which: selectiveSearchSnapshotFromFull recounts the ones its
+	// view retains instead of losing the disclosure. Private, so the wire schema
+	// is unchanged; the search cache carries it beside the other internals.
+	unmergedDataFlowEdges map[string]struct{}
+}
+
+func unmergedDataFlowEdgeKey(fromID, toID string) string {
+	return fromID + "\x00" + toID
 }
 
 type ProviderSnapshotOptions struct {
@@ -496,9 +525,45 @@ type ProviderSnapshotOptions struct {
 	// Deliberately unexported: it is an internal wiring detail, not a documented
 	// option, and is not part of the cache key (it changes no snapshot content).
 	trackRepoIgnored bool
+	// onUnmergedDataFlowEdge, when set, is told each DATA_FLOWS edge counted
+	// into W_DATA_FLOW_EVIDENCE_UNMERGED. BuildProviderSnapshotWithOptions uses
+	// it to remember WHICH edges those are, so a selective view filtered from
+	// the snapshot can disclose the ones it keeps. Internal wiring; it changes
+	// no snapshot content and is not part of any cache key.
+	onUnmergedDataFlowEdge func(fromID, toID string)
 	// cachePolicy is an immutable, bounded capture of external ignore inputs.
 	// Cache pipelines set it once and carry it through keying and construction.
 	cachePolicy *capturedIgnorePolicy
+	// coldComplete carries what a search already knows about whether a cold
+	// selective miss may build the complete snapshot instead (see
+	// loadOrBuildSearchSnapshotPersisting). Internal wiring: it changes no
+	// snapshot content and is not part of any cache key.
+	coldComplete coldCompletePolicy
+	// onCompleteDerivation receives the header of the complete snapshot a
+	// selective view was successfully derived from. A search reports coverage
+	// from it so cold and warm derived views disclose the same diagnostics.
+	onCompleteDerivation func(SnapshotHeader)
+	// historyCochanges pins the local history view for a record-cache transaction.
+	// A shallow clone can have the same commit/tree but different available history.
+	historyCochanges *capturedFileCochanges
+}
+
+type capturedFileCochanges struct {
+	pairs []gitutil.FileCochange
+	// Unknown history stays private to one checkout and contributes no edges,
+	// matching an uncached history-read failure without sharing that failure.
+	unavailable bool
+}
+
+// coldCompletePolicy is the search's input to the cold-complete decision.
+type coldCompletePolicy struct {
+	// disabled says the caller bounded cold parsing explicitly
+	// (--max-indexed-files), which a complete build would ignore.
+	disabled bool
+	// sourceFiles is the size of the listing the search already made with the
+	// same options a complete build lists with, so the bound can be checked
+	// without listing the tree again. Zero means unknown.
+	sourceFiles int
 }
 
 type BuildPhase string
@@ -964,6 +1029,12 @@ func evidenceLimit(spec profileSpec) string {
 func BuildProviderSnapshotWithOptions(ctx context.Context, repo, providerVersion string, options ProviderSnapshotOptions) (ProviderSnapshot, error) {
 	var snapshot ProviderSnapshot
 	var summary SnapshotSummary
+	options.onUnmergedDataFlowEdge = func(fromID, toID string) {
+		if snapshot.unmergedDataFlowEdges == nil {
+			snapshot.unmergedDataFlowEdges = map[string]struct{}{}
+		}
+		snapshot.unmergedDataFlowEdges[unmergedDataFlowEdgeKey(fromID, toID)] = struct{}{}
+	}
 	err := StreamSnapshot(ctx, repo, providerVersion, options, func(record any) error {
 		switch r := record.(type) {
 		case SnapshotHeader:
@@ -1435,6 +1506,9 @@ func streamSnapshotWithWorkerCount(ctx context.Context, repo, providerVersion st
 				if kept, ok := dataFlowEvidence[dedupKey]; ok && kept != evidenceDigest(r.Evidence) {
 					unmergedEvidenceEdges++
 					delete(dataFlowEvidence, dedupKey) // count each edge once
+					if options.onUnmergedDataFlowEdge != nil {
+						options.onUnmergedDataFlowEdge(r.FromID, r.ToID)
+					}
 				}
 			}
 			return
@@ -1489,7 +1563,7 @@ func streamSnapshotWithWorkerCount(ctx context.Context, repo, providerVersion st
 		// text (mergePartialFailures folds duplicates) so neither loss is hidden.
 		failures = mergePartialFailures(failures, relationFailures)
 		if spec.emits("FILE_CHANGES_WITH") {
-			for _, r := range fileChangesWithRelations(ctx, sc.absRepo, sc.commit, sc.key, files) {
+			for _, r := range fileChangesWithRelations(ctx, sc.absRepo, sc.commit, sc.key, files, options.historyCochanges) {
 				if emitErr != nil || ctx.Err() != nil {
 					break
 				}
@@ -1866,7 +1940,7 @@ func prepareSource(ctx context.Context, repo string, options ProviderSnapshotOpt
 		warnings = append(warnings, ProviderWarning{
 			Code:                 "W_WORKTREE_SNAPSHOT",
 			Severity:             "warning",
-			EffectOnCompleteness: "snapshot records are read from the working tree because --worktree was requested",
+			EffectOnCompleteness: "snapshot records are read from the working tree; working-tree reads are never cached, so use --head for the cacheable, committed-tree baseline",
 		})
 	} else if headErr != nil {
 		warnings = append(warnings, ProviderWarning{
@@ -2059,6 +2133,7 @@ func entitySymbols(repoKey, path, language string, entities []Entity) []SymbolRe
 			Local:                   entity.Local,
 			sourceStartByte:         entity.sourceStartByte,
 			sourceEndByte:           entity.sourceEndByte,
+			nameLine:                entityNameLineWithin(entity),
 			bodyless:                entity.bodyless,
 			cPlusPlusOwners:         append([]string(nil), entity.cPlusPlusOwners...),
 			cPlusPlusDefinitionName: entity.cPlusPlusDefinitionName,
@@ -2126,6 +2201,10 @@ func syntheticBoundarySymbols(repoKey, path, language, content string, fileSymbo
 			ContainerID:     source.ID,
 			sourceStartByte: source.sourceStartByte,
 			sourceEndByte:   source.sourceEndByte,
+			// A tool keeps its handler's name and coordinates, so the handler's name token is its
+			// name token too. Routes and workflows (above and below) are named by the path, a
+			// spelling no source token carries, and keep no name line.
+			nameLine: source.nameLine,
 		})
 	}
 	if workflow := applicationWorkflowBoundary(path); workflow != "" {
@@ -5035,6 +5114,9 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 		}
 	}
 	handledRoutes := map[string]struct{}{}
+	// goRouteMasks holds, per Go file, the byte spans of route arguments the
+	// Go route pass decided; the route literal fallback never reads them.
+	var goRouteMasks map[string][][2]int
 	// Shared by the route pass below and the per-file loop further down, which
 	// both resolve routes spelled as constants out of the same files.
 	constantsByFile := newFileStringConstants()
@@ -5049,13 +5131,27 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 		}
 	}
 	if spec.emits("HANDLES_ROUTE") {
-		for _, r := range goHTTPRouteRelations(files, recordsByFile, readContent, constantsByFile) {
+		goRoutes, goInline, masks, routeFailures := goHTTPRouteRelations(files, recordsByFile, readContent, constantsByFile)
+		goRouteMasks = masks
+		if recordFailure != nil {
+			for _, failure := range routeFailures {
+				recordFailure(failure)
+			}
+		}
+		for _, r := range goRoutes {
 			if shouldStop != nil && shouldStop() {
 				return
 			}
 			emit(r.Relation)
 			routeHandlers[r.Route] = append(routeHandlers[r.Route], r.Handler)
 			handledRoutes[r.Route] = struct{}{}
+		}
+		for _, r := range goInline {
+			// Inline-handler registrations replace the route literal fallback
+			// at their own call sites (masked below), so they claim nothing by
+			// string: an identical literal elsewhere is still scanned.
+			emit(r.Relation)
+			routeHandlers[r.Route] = append(routeHandlers[r.Route], r.Handler)
 		}
 		for _, r := range djangoRouteRelations(files, recordsByFile, readContent) {
 			if shouldStop != nil && shouldStop() {
@@ -5332,7 +5428,11 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 			fileStringConstants = constantsByFile.forFile(file.Path, content)
 		}
 		var routeSymbolsByID map[string]SymbolRecord
+		var maskedLines []string
 		if fileNeedsRouteScan {
+			if spans := goRouteMasks[file.Path]; len(spans) > 0 {
+				maskedLines = strings.Split(goRouteMaskContent(content, spans), "\n")
+			}
 			routeSymbolsByID = map[string]SymbolRecord{}
 			for _, symbol := range currentFileSymbols {
 				routeSymbolsByID[symbol.ID] = symbol
@@ -6033,7 +6133,11 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 				}
 			}
 			if fileNeedsRouteScan {
-				for _, route := range routeLiteralsForSymbol(file.Path, content, block, from, routeSymbolsByID, fileStringConstants) {
+				routeBlock := block
+				if maskedLines != nil {
+					routeBlock = symbolBlockFromLines(maskedLines, from)
+				}
+				for _, route := range routeLiteralsForSymbol(file.Path, content, routeBlock, from, routeSymbolsByID, fileStringConstants) {
 					if _, ok := handledRoutes[route]; ok {
 						continue
 					}
@@ -6419,6 +6523,12 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 			})
 		if scanErr != nil {
 			return
+		}
+	}
+
+	if recordFailure != nil {
+		for _, failure := range goFileImportIndex.partialFailures() {
+			recordFailure(failure)
 		}
 	}
 
@@ -9204,6 +9314,19 @@ func goMethodSignaturesMatch(requirement, implementation string, requirementImpo
 // parameter/result name are dropped. It declines (false) on a generic
 // type-parameter list and on any list it cannot split into types.
 func goNormalizedMethodSignature(signature string) (string, bool) {
+	return goNormalizedMethodSignatureWithWalk(signature, &goEvidenceWalk{})
+}
+
+func goNormalizedMethodSignatureWithWalk(signature string, walk *goEvidenceWalk) (string, bool) {
+	if walk == nil || walk.exhausted {
+		return "", false
+	}
+	// Input storage is borrowed rather than constructed key output, but bounding
+	// it independently keeps parameter metadata proportional to a fixed input.
+	if len(signature) > goEvidenceKeyByteBudget {
+		walk.exhausted = true
+		return "", false
+	}
 	rest := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(signature), "{"))
 	if after, ok := strings.CutPrefix(rest, "func"); ok {
 		rest = strings.TrimSpace(after)
@@ -9233,7 +9356,7 @@ func goNormalizedMethodSignature(signature string) (string, bool) {
 	if closing < 0 {
 		return "", false
 	}
-	params, ok := goSignatureTypeList(rest[1:closing])
+	params, ok := goSignatureTypeList(rest[1:closing], walk)
 	if !ok {
 		return "", false
 	}
@@ -9245,11 +9368,57 @@ func goNormalizedMethodSignature(signature string) (string, bool) {
 		}
 		results = results[1:end]
 	}
-	resultTypes, ok := goSignatureTypeList(results)
+	resultTypes, ok := goSignatureTypeList(results, walk)
 	if !ok {
 		return "", false
 	}
-	return "(" + strings.Join(params, ",") + ")(" + strings.Join(resultTypes, ",") + ")", true
+	remaining, ok := walk.remaining()
+	if !ok {
+		return "", false
+	}
+	length, ok := goEvidenceAddRepeatedLength(0, 1, 4, remaining)
+	if !ok {
+		walk.exhausted = true
+		return "", false
+	}
+	addTypes := func(types []string) bool {
+		for i, typeText := range types {
+			if i > 0 {
+				length, ok = goEvidenceAddRepeatedLength(length, 1, 1, remaining)
+				if !ok {
+					return false
+				}
+			}
+			length, ok = goEvidenceAddRepeatedLength(length, len(typeText), 1, remaining)
+			if !ok {
+				return false
+			}
+		}
+		return true
+	}
+	if !addTypes(params) || !addTypes(resultTypes) {
+		walk.exhausted = true
+		return "", false
+	}
+	if !walk.reserve(length) {
+		return "", false
+	}
+	var normalized strings.Builder
+	normalized.Grow(length)
+	writeTypes := func(types []string) {
+		for i, typeText := range types {
+			if i > 0 {
+				normalized.WriteByte(',')
+			}
+			normalized.WriteString(typeText)
+		}
+	}
+	normalized.WriteByte('(')
+	writeTypes(params)
+	normalized.WriteString(")(")
+	writeTypes(resultTypes)
+	normalized.WriteByte(')')
+	return normalized.String(), true
 }
 
 // goSignatureTypeList reduces a Go parameter or result list to its types. Go
@@ -9257,7 +9426,10 @@ func goNormalizedMethodSignature(signature string) (string, bool) {
 // form `ident <type>` marks the whole list named; in a named list a bare
 // identifier is a grouped name that borrows the type declared to its right
 // (`a, b string`).
-func goSignatureTypeList(list string) ([]string, bool) {
+func goSignatureTypeList(list string, walk *goEvidenceWalk) ([]string, bool) {
+	if walk == nil || walk.exhausted {
+		return nil, false
+	}
 	list = strings.TrimSpace(list)
 	if list == "" {
 		return nil, true
@@ -9273,8 +9445,8 @@ func goSignatureTypeList(list string) ([]string, bool) {
 	types := make([]string, len(parts))
 	if !named {
 		for i, part := range parts {
-			typeText := goCanonicalTypeText(part)
-			if typeText == "" {
+			typeText, ok := goCanonicalTypeText(part, walk)
+			if !ok || typeText == "" {
 				return nil, false
 			}
 			types[i] = typeText
@@ -9285,7 +9457,10 @@ func goSignatureTypeList(list string) ([]string, bool) {
 	for i := len(parts) - 1; i >= 0; i-- {
 		part := strings.TrimSpace(parts[i])
 		if _, typeText, ok := goNamedParamSplit(part); ok {
-			pending = goCanonicalTypeText(typeText)
+			pending, ok = goCanonicalTypeText(typeText, walk)
+			if !ok {
+				return nil, false
+			}
 		} else if !isTypeName(part) {
 			// In a named list every remaining part must be a grouped name.
 			return nil, false
@@ -9327,9 +9502,32 @@ func goNamedParamSplit(part string) (string, string, bool) {
 // goCanonicalTypeText drops whitespace that is not separating two identifier
 // characters, so `map[string] int` and `map[string]int` compare equal while
 // `chan int` keeps its word break.
-func goCanonicalTypeText(text string) string {
-	var out strings.Builder
+func goCanonicalTypeText(text string, walk *goEvidenceWalk) (string, bool) {
+	if walk == nil || walk.exhausted {
+		return "", false
+	}
+	length := 0
 	prevIdent, pendingSpace := false, false
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+			pendingSpace = length > 0
+			continue
+		}
+		cur := identifierByte(c)
+		if pendingSpace && prevIdent && cur {
+			length++
+		}
+		pendingSpace = false
+		length++
+		prevIdent = cur
+	}
+	if !walk.reserve(length) {
+		return "", false
+	}
+	var out strings.Builder
+	out.Grow(length)
+	prevIdent, pendingSpace = false, false
 	for i := 0; i < len(text); i++ {
 		c := text[i]
 		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
@@ -9344,7 +9542,7 @@ func goCanonicalTypeText(text string) string {
 		out.WriteByte(c)
 		prevIdent = cur
 	}
-	return out.String()
+	return out.String(), true
 }
 
 // uniqueGoConcreteMethodByShortName is uniqueMethodByShortName restricted to Go
@@ -9682,13 +9880,19 @@ func signatureNamesQualifiedMethodPattern(signature, pattern, name string) bool 
 	}
 	for first := 0; first < len(parts); first++ {
 		part := strings.TrimPrefix(parts[first], "\x00")
-		for offset := 0; ; {
+		// A segment can be empty: a global qualifier (`struct ::Foo`, `inline
+		// namespace ::v1`) encodes as `\x00v1::::Foo` or `\x00::v1::Foo`. The empty
+		// string occurs at every offset, so advancing by len(part) left offset
+		// where it was and the scan spun forever on any signature it did not
+		// match at the first position. Stepping at least one byte visits the same
+		// first candidate as before and then every later one exactly once.
+		for offset := 0; offset <= len(signature); {
 			at := strings.Index(signature[offset:], part)
 			if at < 0 {
 				break
 			}
 			start := offset + at
-			offset = start + len(part)
+			offset = start + max(len(part), 1)
 			if start > 0 && isIdentifierByte(signature[start-1]) {
 				continue
 			}
@@ -12640,12 +12844,21 @@ func configuresRelations(recordsByFile map[string][]SymbolRecord, readContent co
 	return relations
 }
 
-func fileChangesWithRelations(ctx context.Context, repo, revision, repoKey string, files []FileRecord) []RelationRecord {
+func fileChangesWithRelations(ctx context.Context, repo, revision, repoKey string, files []FileRecord, captured ...*capturedFileCochanges) []RelationRecord {
 	if revision == "" {
 		return nil
 	}
-	cochanges, err := gitutil.FileCochanges(ctx, repo, revision, 256)
-	if err != nil || len(cochanges) == 0 {
+	var cochanges []gitutil.FileCochange
+	if len(captured) > 0 && captured[0] != nil {
+		cochanges = captured[0].pairs
+	} else {
+		var err error
+		cochanges, err = gitutil.FileCochanges(ctx, repo, revision, 256)
+		if err != nil {
+			return nil
+		}
+	}
+	if len(cochanges) == 0 {
 		return nil
 	}
 	known := map[string]bool{}
@@ -24716,9 +24929,15 @@ func routeLiteralsForSymbol(path, content, block string, symbol SymbolRecord, sy
 	return sortedKeys(seen)
 }
 
-func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolRecord, readContent contentReader, constantsByFile *fileStringConstants) []expressRouteRelation {
-	var relations []expressRouteRelation
+// goHTTPRouteRelations returns the Go route relations with a named local
+// handler, the inline-handler relations (attributed to the enclosing symbol),
+// and per file the byte spans of every route argument the pass decided.
+func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolRecord, readContent contentReader, constantsByFile *fileStringConstants) ([]expressRouteRelation, []expressRouteRelation, map[string][][2]int, []PartialFailure) {
+	var relations, inline []expressRouteRelation
+	var failures []PartialFailure
+	masks := map[string][][2]int{}
 	seen := map[string]bool{}
+	inlineSeen := map[string]bool{}
 	for _, file := range files {
 		if !strings.EqualFold(filepath.Ext(file.Path), ".go") {
 			continue
@@ -24741,7 +24960,70 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 				}
 			}
 		}
-		for _, registration := range goHTTPRouteRegistrations(content, constantsByFile.forFile(file.Path, content)) {
+		detail := goRouteRegistrationsDetailed(content, constantsByFile.forFile(file.Path, content))
+		if detail.parseFailed {
+			failures = append(failures, PartialFailure{
+				Code: "E_PARSE_ERROR", Severity: "warning", FilePath: file.Path,
+				EffectOnCompleteness: "Go route binding parse failed; only conservative named-handler token recovery retained and generic route-literal fallback omitted",
+				Detail:               "Go parser rejected the source, including package-clause recovery",
+			})
+		}
+		if detail.exhausted {
+			failures = append(failures, PartialFailure{
+				Code:                 "E_GO_ROUTE_BUDGET_EXCEEDED",
+				Severity:             "warning",
+				FilePath:             file.Path,
+				EffectOnCompleteness: "Go route analysis exceeded its work budget; HANDLES_ROUTE relations and literal fallback omitted for this file",
+				Detail:               "Scoped Go receiver and middleware resolution exhausted its bounded step budget",
+			})
+		}
+		if len(detail.masks) > 0 {
+			masks[file.Path] = detail.masks
+		}
+		inlineRegs := detail.inline
+		for _, registration := range detail.regs {
+			if _, ok := resolveRouteHandlerSymbol(handlers, registration.Handler); !ok {
+				// A named handler that is not a symbol here (a local variable,
+				// another package's function): attributed to the enclosing
+				// symbol like an inline handler, never dropped to the bare path.
+				inlineRegs = append(inlineRegs, goRouteInline{Route: registration.Route, Offset: registration.offset})
+			}
+		}
+		for _, registration := range inlineRegs {
+			from, ok := goRouteEnclosingSymbol(recordsByFile[file.Path], 1+strings.Count(content[:registration.Offset], "\n"))
+			if !ok {
+				continue
+			}
+			key := from.ID + "\x00" + registration.Route
+			if inlineSeen[key] {
+				continue
+			}
+			inlineSeen[key] = true
+			inline = append(inline, expressRouteRelation{
+				Route:   registration.Route,
+				Handler: from,
+				Relation: RelationRecord{
+					RecordType:    "relation",
+					FromID:        from.ID,
+					ToID:          externalID("route", registration.Route),
+					Type:          "HANDLES_ROUTE",
+					Confidence:    0.7,
+					Reason:        "Go route registration with an inline handler; route composed from its router, attributed to the enclosing symbol",
+					RelationScope: "external",
+					Resolution:    "pattern",
+					TargetKind:    "route",
+					Evidence: []Evidence{{
+						Kind:      "go_router_inline",
+						FilePath:  from.FilePath,
+						StartLine: from.StartLine,
+						EndLine:   from.EndLine,
+						Detail:    registration.Route,
+					}},
+					WarningCodes: []string{},
+				},
+			})
+		}
+		for _, registration := range detail.regs {
 			handler, ok := resolveRouteHandlerSymbol(handlers, registration.Handler)
 			if !ok {
 				continue
@@ -24782,93 +25064,41 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 		}
 		return relations[i].Handler.ID < relations[j].Handler.ID
 	})
-	return relations
+	return relations, inline, masks, failures
 }
 
-var goHTTPRouteRegistrationsGroupRe = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s*(?::=|=)\s*([A-Za-z_][A-Za-z0-9_]*)\.Group\s*\(\s*([^,\n)]+)\s*\)`)
+// goRouteEnclosingSymbol is the innermost non-type symbol spanning line.
+func goRouteEnclosingSymbol(symbols []SymbolRecord, line int) (SymbolRecord, bool) {
+	var best SymbolRecord
+	found := false
+	for _, symbol := range symbols {
+		if typeLikeKind(symbol.Kind) || symbol.StartLine > line || symbol.EndLine < line {
+			continue
+		}
+		if !found || symbol.EndLine-symbol.StartLine < best.EndLine-best.StartLine {
+			best, found = symbol, true
+		}
+	}
+	return best, found
+}
+
+// goRouteMaskContent blanks the given byte spans (newlines kept).
+func goRouteMaskContent(content string, spans [][2]int) string {
+	masked := []byte(content)
+	for _, span := range spans {
+		for i := span[0]; i < span[1] && i < len(masked); i++ {
+			if masked[i] != '\n' {
+				masked[i] = ' '
+			}
+		}
+	}
+	return string(masked)
+}
 
 func goHTTPRouteRegistrations(content string, constants map[string]string) []goHTTPRouteRegistration {
-	// Group receivers are resolved per use site, not per file-global name: see
-	// go_route_binding.go. Resolution is lazy so files without router method
-	// calls never pay for a parse.
-	var receivers *goRouteReceivers
-	receiverAt := func(offset int, name string) goRouteBinding {
-		if receivers == nil {
-			resolved := resolveGoRouteReceivers(content, constants)
-			receivers = &resolved
-		}
-		return receivers.at(offset, name)
-	}
-	var registrations []goHTTPRouteRegistration
-	add := func(routeExpr, handler, evidence string) {
-		route, ok := staticRouteExpressionValue(routeExpr, constants)
-		if !ok || handler == "" {
-			return
-		}
-		registrations = append(registrations, goHTTPRouteRegistration{
-			Route:        route,
-			Handler:      handler,
-			EvidenceKind: evidence,
-			Detail:       route + " -> " + handler,
-		})
-	}
-	goHandlerExpr := `[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?`
-	handleFuncRe := regexp.MustCompile(`\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?HandleFunc\s*\(\s*([^,\n]+)\s*,\s*(` + goHandlerExpr + `)\s*\)`)
-	handleFuncWrapperRe := regexp.MustCompile(`\b(?:[A-Za-z_][A-Za-z0-9_]*\.)?Handle\s*\(\s*([^,\n]+)\s*,\s*(?:http\.)?HandlerFunc\s*\(\s*(` + goHandlerExpr + `)\s*\)\s*\)`)
-	routerMethodRe := regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\.(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|Get|Post|Put|Patch|Delete|Head|Options)\s*\(\s*([^,\n]+)\s*,\s*(` + goHandlerExpr + `)\s*\)`)
-	chainedGroupMethodRe := regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\.Group\s*\(\s*([^,\n)]+)\s*\)\.(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|Get|Post|Put|Patch|Delete|Head|Options)\s*\(\s*([^,\n]+)\s*,\s*(` + goHandlerExpr + `)\s*\)`)
-	for _, match := range handleFuncRe.FindAllStringSubmatch(content, -1) {
-		if len(match) == 3 {
-			add(match[1], match[2], "go_http_handle_func")
-		}
-	}
-	for _, match := range handleFuncWrapperRe.FindAllStringSubmatch(content, -1) {
-		if len(match) == 3 {
-			add(match[1], match[2], "go_http_handler_func")
-		}
-	}
-	for _, idx := range routerMethodRe.FindAllStringSubmatchIndex(content, -1) {
-		if len(idx) != 8 {
-			continue
-		}
-		receiver := receiverAt(idx[2], content[idx[2]:idx[3]])
-		if receiver.kind == goRouteUnknown || goRouteReceiverIsSelector(content, idx[2]) {
-			// The receiver's prefix at this call is not determined: emitting the
-			// bare path, or another binding's prefix, would invent a route.
-			continue
-		}
-		routeExpr := content[idx[4]:idx[5]]
-		if receiver.kind == goRouteKnown && receiver.prefix != "" {
-			route, ok := staticRouteExpressionValue(routeExpr, constants)
-			if !ok {
-				continue
-			}
-			routeExpr = strconv.Quote(joinRoutePaths(receiver.prefix, route))
-		}
-		add(routeExpr, content[idx[6]:idx[7]], "go_router_method")
-	}
-	for _, idx := range chainedGroupMethodRe.FindAllStringSubmatchIndex(content, -1) {
-		if len(idx) != 10 {
-			continue
-		}
-		receiver := receiverAt(idx[2], content[idx[2]:idx[3]])
-		if receiver.kind == goRouteUnknown || goRouteReceiverIsSelector(content, idx[2]) {
-			continue
-		}
-		prefix, ok := staticRouteExpressionValue(content[idx[4]:idx[5]], constants)
-		if !ok {
-			continue
-		}
-		if receiver.kind == goRouteKnown && receiver.prefix != "" {
-			prefix = joinRoutePaths(receiver.prefix, prefix)
-		}
-		route, ok := staticRouteExpressionValue(content[idx[6]:idx[7]], constants)
-		if !ok {
-			continue
-		}
-		add(strconv.Quote(joinRoutePaths(prefix, route)), content[idx[8]:idx[9]], "go_router_group_method")
-	}
-	return registrations
+	// Registrations are read from real call expressions with their receiver's
+	// prefix resolved at the call: see go_route_binding.go.
+	return goRouteRegistrations(content, constants)
 }
 
 func resolveRouteHandlerSymbol(handlers map[string]SymbolRecord, expr string) (SymbolRecord, bool) {
@@ -26003,6 +26233,8 @@ type goHTTPRouteRegistration struct {
 	EvidenceKind     string
 	Detail           string
 	AllowTypeHandler bool
+	// offset of the registration call in the file (Go route pass only).
+	offset int
 }
 
 type djangoRouteRegistration struct {
@@ -28678,12 +28910,13 @@ func externalID(kind, value string) string {
 // TestRepoKeyLocalIsNotGloballyUnique pins that boundary.
 //
 // The discriminator every side already carries is the absolute repository
-// path. This provider hashes it into both persistent cache keys beside the
-// repo key (searchSnapshotKey, providerRecordsKey), which is why two colliding
-// repositories sharing a cache directory never share an entry even at an
-// identical tree — TestCollidingRepoKeysDoNotShareCacheEntries. `doctor --json`
-// reports `repo_root` beside `repo_key` for the same reason: it is what makes
-// the pair unique.
+// path. The persistent caches are deliberately path-free (searchSnapshotKey,
+// providerRecordsKey): an entry is content-addressed by the tree (search) or
+// commit (records), so two colliding repositories at an identical tree DO share
+// one, and the loaders restamp repo_root to the checkout being served —
+// TestCollidingRepoKeysShareEntriesUnderTheirOwnRoot. `doctor --json` reports
+// `repo_root` beside `repo_key` for the same reason: it is what makes the pair
+// unique.
 func RepoKey(ctx context.Context, repo string) string {
 	return repoKey(ctx, repo)
 }

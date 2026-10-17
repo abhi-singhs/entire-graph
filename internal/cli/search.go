@@ -55,6 +55,12 @@ const (
 	searchReferenceBlocksAll           = "all"
 )
 
+// The two values of `--verify-block` / ENTIRE_GRAPH_VERIFY_BLOCK. See resolveSearchVerifyBlock.
+const (
+	searchVerifyBlockOn  = "on"
+	searchVerifyBlockOff = "off"
+)
+
 type searchFlags struct {
 	// VerifyExplain is appended to the emitted VERIFY line as `... 2>&1 | <cmd>`.
 	VerifyExplain         string
@@ -84,10 +90,15 @@ type searchFlags struct {
 	CalleeHop             bool
 	VerifyPrefix          string
 	VerifyPreFixStatus    string
-	FileOutline           bool
-	Deep                  bool
-	SingleResolution      bool
-	DocumentResolution    bool
+	// VerifyBlock is the explicit `--verify-block` value ("on"/"off"), or "" when no flag named it.
+	// OmitVerify is the resolved decision (flag, then ENTIRE_GRAPH_VERIFY_BLOCK, then on); see
+	// resolveSearchVerifyBlock.
+	VerifyBlock        string
+	OmitVerify         bool
+	FileOutline        bool
+	Deep               bool
+	SingleResolution   bool
+	DocumentResolution bool
 	// The reference blocks, off unless asked for. See SearchOptions in internal/sem/search.go for
 	// the session measurement that made OFF the default.
 	ContainerMap   bool
@@ -120,9 +131,56 @@ func applySearchReferenceBlocks(flags *searchFlags, value string) error {
 	return nil
 }
 
+// resolveSearchVerifyBlock decides whether this search emits its VERIFY block.
+//
+// Precedence: an explicit `--verify-block on|off` (or `--omit-verify`) wins; otherwise
+// ENTIRE_GRAPH_VERIFY_BLOCK; otherwise on. On is the product default and is byte-identical to a
+// build without the flag. Off suppresses the block at its producer (sem.SearchOptions.OmitVerifyCommand)
+// and exists for fair A/B comparisons: the block carries a runnable test command and run-once/fix/stop
+// advice that would help an arm with no tool, and the fairness rule is "both arms or neither".
+//
+// Off refuses the flags that only decorate the VERIFY block, and refuses a pre-delivered payload.
+// Each of those would otherwise be silently ignored (or, for the presearch file, silently echo bytes
+// that may carry a VERIFY block), and a knob that quietly does nothing is how a measurement gets
+// attributed to the wrong configuration.
+func resolveSearchVerifyBlock(flags *searchFlags, env EntireEnv) error {
+	value := flags.VerifyBlock
+	source := "--verify-block"
+	if value == "" {
+		value = strings.ToLower(strings.TrimSpace(env.VerifyBlock))
+		source = envVerifyBlock
+	}
+	switch value {
+	case "", searchVerifyBlockOn:
+		flags.OmitVerify = false
+		return nil
+	case searchVerifyBlockOff:
+	default:
+		return fmt.Errorf("%s: want %s or %s, got %q", source, searchVerifyBlockOn, searchVerifyBlockOff, value)
+	}
+	flags.OmitVerify = true
+	for _, decorator := range []struct{ name, value string }{
+		{"--verify-prefix", flags.VerifyPrefix},
+		{"--verify-prefix-status", flags.VerifyPreFixStatus},
+		{"--verify-explain", flags.VerifyExplain},
+	} {
+		if decorator.value != "" {
+			return fmt.Errorf("%s decorates the VERIFY block, which %s off suppresses", decorator.name, source)
+		}
+	}
+	if strings.TrimSpace(env.PresearchPath) != "" {
+		return fmt.Errorf("%s off cannot apply to a pre-delivered payload (%s): its bytes were rendered elsewhere and are echoed verbatim",
+			source, envPresearch)
+	}
+	return nil
+}
+
 func runSearch(ctx context.Context, opts Options, args []string) error {
 	flags, rest, err := parseSearchFlags(args)
 	if err != nil {
+		return err
+	}
+	if err := resolveSearchVerifyBlock(&flags, opts.Env); err != nil {
 		return err
 	}
 	// The environment sets a session-wide default; the flags then add to it. A flag can only ever
@@ -165,6 +223,8 @@ func runSearch(ctx context.Context, opts Options, args []string) error {
 	if err != nil {
 		return err
 	}
+	// The producer is computed once so all three scope builders bind the same binary identity.
+	producer := opts.sessionProducer()
 	var (
 		scope               searchSessionScope
 		replayPolicy        sem.SearchReplayPolicy
@@ -172,8 +232,7 @@ func runSearch(ctx context.Context, opts Options, args []string) error {
 		forceSessionReplace bool
 	)
 	if session != nil {
-		scope = searchSessionScopeFor(ctx, repo)
-		scope.Format = flags.Format
+		scope = searchSessionScopeForFlags(ctx, repo, flags, producer)
 		// A rendered payload is opaque: snippets and reference blocks cannot be safely removed from
 		// it after the fact. Bind it to the semantic layer's effective corpus policy and validate
 		// every contributing path before writing even the replay header. Policy resolution is an
@@ -227,9 +286,8 @@ func runSearch(ctx context.Context, opts Options, args []string) error {
 					IgnoreFiles:  flags.IgnoreFiles,
 					IncludeFiles: flags.IncludeFiles,
 				})
-				confirmedScope := searchSessionScopeFor(ctx, repo)
+				confirmedScope := searchSessionScopeForFlags(ctx, repo, flags, producer)
 				confirmedScope.PolicyFingerprint = confirmedPolicy.Fingerprint()
-				confirmedScope.Format = flags.Format
 				if confirmErr == nil &&
 					confirmedPolicy.Fingerprint() == replayPolicy.Fingerprint() &&
 					confirmedPolicy.MatchesTree(confirmedScope.Tree) &&
@@ -245,9 +303,8 @@ func runSearch(ctx context.Context, opts Options, args []string) error {
 							IgnoreFiles:  flags.IgnoreFiles,
 							IncludeFiles: flags.IncludeFiles,
 						})
-						finalScope := searchSessionScopeFor(ctx, repo)
+						finalScope := searchSessionScopeForFlags(ctx, repo, flags, producer)
 						finalScope.PolicyFingerprint = finalPolicy.Fingerprint()
-						finalScope.Format = flags.Format
 						if finalErr == nil &&
 							finalPolicy.Fingerprint() == confirmedPolicy.Fingerprint() &&
 							finalPolicy.MatchesTree(finalScope.Tree) &&
@@ -315,6 +372,7 @@ func runSearch(ctx context.Context, opts Options, args []string) error {
 		CalleeHop:                      flags.CalleeHop,
 		VerifyPrefix:                   flags.VerifyPrefix,
 		VerifyPreFixStatus:             flags.VerifyPreFixStatus,
+		OmitVerifyCommand:              flags.OmitVerify,
 		IncludeFileOutline:             flags.FileOutline,
 		VerifyExplainCommand:           flags.VerifyExplain,
 		Deep:                           flags.Deep,
@@ -338,13 +396,14 @@ func runSearch(ctx context.Context, opts Options, args []string) error {
 	if session != nil {
 		out = io.MultiWriter(opts.Stdout, &payload)
 	}
-	write := writeSearchResponse
+	render := agentSearchRender{exactName: true, topK: sem.EffectiveSearchTopK(flags.TopK), sessionCapped: session != nil}
+	var exactAnswer bool
 	if flags.Format == "agent" && !flags.MaxContextBytesSet {
-		write = func(out io.Writer, response sem.SearchResponse, _ string, ceiling int) error {
-			return writeAgentSearchAdaptive(out, response, ceiling)
-		}
+		exactAnswer, err = writeAgentSearchAdaptiveFor(out, response, contextBudget, render)
+	} else {
+		exactAnswer, err = writeSearchResponseFor(out, response, flags.Format, contextBudget, render)
 	}
-	if err := write(out, response, flags.Format, contextBudget); err != nil {
+	if err != nil {
 		return err
 	}
 	if session != nil {
@@ -365,7 +424,11 @@ func runSearch(ctx context.Context, opts Options, args []string) error {
 			})
 			if policyErr == nil {
 				recordScope.PolicyFingerprint = currentPolicy.Fingerprint()
-				replayable = searchResponseCanReplay(flags.Format, response) &&
+				// An exact-name answer (search_exact_name.go) is never the replayed payload. It shows
+				// the named definitions and omits the rest of the ranking, so replaying it for a later,
+				// different question would answer every one of them with names only. It still counts
+				// as a search; the slot stays empty and the task's next search runs and fills it.
+				replayable = !exactAnswer && searchResponseCanReplay(flags.Format, response) &&
 					currentPolicy.Fingerprint() == replayPolicy.Fingerprint() &&
 					currentPolicy.MatchesTree(response.Tree) &&
 					currentPolicy.AllowsReplayPaths(payloadPaths)
@@ -383,14 +446,29 @@ func runSearch(ctx context.Context, opts Options, args []string) error {
 	return nil
 }
 
+// searchSessionScopeForFlags is searchSessionScopeFor plus the render choices that shape the opaque
+// payload bytes: the wire format and whether the VERIFY block was suppressed. Every scope the search
+// verb compares or records is built here, so a render choice cannot be bound at one site and
+// forgotten at another.
+func searchSessionScopeForFlags(ctx context.Context, repo string, flags searchFlags, producer string) searchSessionScope {
+	scope := searchSessionScopeFor(ctx, repo, producer)
+	scope.Format = flags.Format
+	scope.OmitVerify = flags.OmitVerify
+	return scope
+}
+
 // searchSessionScopeFor describes the tree a payload recorded now would be answering for.
 //
 // Failure is not an error here. A directory git cannot describe still has a resolved path, and a
 // path is enough to separate two checkouts in the common case; when even that is unavailable the
 // zero scope matches nothing, so the echo is refused and the question gets a real answer. The one
 // outcome this must never produce is a confident scope that is wrong.
-func searchSessionScopeFor(ctx context.Context, repo string) searchSessionScope {
-	scope := searchSessionScope{Repo: repo}
+//
+// The producer is set HERE, not at call sites: the replay decision rebuilds this scope twice after
+// its policy checks, and an identity field set by only one of three builders silently refused every
+// replay.
+func searchSessionScopeFor(ctx context.Context, repo, producer string) searchSessionScope {
+	scope := searchSessionScope{Repo: repo, Producer: producer}
 	if resolved, err := filepath.Abs(repo); err == nil {
 		scope.Repo = resolved
 	}
@@ -406,19 +484,26 @@ func searchSessionScopeFor(ctx context.Context, repo string) searchSessionScope 
 }
 
 func writeSearchResponse(out io.Writer, response sem.SearchResponse, format string, contextBudget int) error {
+	_, err := writeSearchResponseFor(out, response, format, contextBudget, agentSearchRender{exactName: true})
+	return err
+}
+
+// writeSearchResponseFor is writeSearchResponse with the agent render's context, reporting whether
+// the payload is the exact-name answer.
+func writeSearchResponseFor(out io.Writer, response sem.SearchResponse, format string, contextBudget int, render agentSearchRender) (bool, error) {
 	switch format {
+	case "agent":
+		return writeAgentSearchPayload(out, response, contextBudget, render)
 	case "json":
 		encoder := json.NewEncoder(termsafe.NewJSONWriter(out))
 		encoder.SetEscapeHTML(false)
-		return encoder.Encode(response)
+		return false, encoder.Encode(response)
 	case "ndjson":
-		return writeNdjsonSearch(out, response)
+		return false, writeNdjsonSearch(out, response)
 	case "text":
-		return writeTextSearch(out, response)
-	case "agent":
-		return writeAgentSearch(out, response, contextBudget)
+		return false, writeTextSearch(out, response)
 	default:
-		return fmt.Errorf("search --format must be json, ndjson, text, or agent, got %q", format)
+		return false, fmt.Errorf("search --format must be json, ndjson, text, or agent, got %q", format)
 	}
 }
 
@@ -1107,6 +1192,11 @@ func searchLocatorFollowUp(result sem.SearchResult) string {
 	return "  [body: def " + name + "]"
 }
 
+// searchMetadataLine reserves the completeness token for renderer certification.
+func searchMetadataLine(value string) string {
+	return strings.ReplaceAll(termsafe.Line(value), completeMarker, `\x5bcomplete\x5d`)
+}
+
 // searchResultOnOneLine makes one result safe to print into a one-record-per-line payload.
 //
 // It escapes the fields that go into a result's HEADER, where a newline is not layout but
@@ -1129,11 +1219,17 @@ func searchLocatorFollowUp(result sem.SearchResult) string {
 // it changes. Nothing upstream sees the escaped copy, so the JSON encoding of the same response
 // still reports the exact bytes the repository holds.
 func searchResultOnOneLine(result sem.SearchResult) sem.SearchResult {
-	result.FilePath = termsafe.Line(result.FilePath)
-	result.QualifiedName = termsafe.Line(result.QualifiedName)
-	result.SymbolName = termsafe.Line(result.SymbolName)
-	result.Kind = termsafe.Line(result.Kind)
-	result.Snippet, _ = searchQuarantineBody(result.Snippet)
+	result.FilePath = searchMetadataLine(result.FilePath)
+	result.QualifiedName = searchMetadataLine(result.QualifiedName)
+	result.SymbolName = searchMetadataLine(result.SymbolName)
+	result.Kind = searchMetadataLine(result.Kind)
+	snippet, changed := searchQuarantineBody(result.Snippet)
+	result.Snippet = snippet
+	if slices.Contains(result.Signals, sem.CompleteSymbolSignal) && (changed || renderedBodyIsTransformed(snippet)) {
+		// Quarantine and terminal escaping can make displayed source no longer byte-exact.
+		// Clone before removing the certificate so the machine response is untouched.
+		result.Signals = slices.DeleteFunc(slices.Clone(result.Signals), func(signal string) bool { return signal == sem.CompleteSymbolSignal })
+	}
 	for index, passage := range result.Passages {
 		quarantined, changed := searchQuarantineBody(passage.Snippet)
 		if !changed {
@@ -1434,6 +1530,31 @@ func searchResultCarriesCompleteBody(result sem.SearchResult) bool {
 	return false
 }
 
+// completeMarker certifies a whole, byte-exact primary symbol body in agent output.
+const completeMarker = "[complete]"
+
+// renderedBodyIsTransformed reports whether terminal-safe output rewrites source
+// bytes. Multiline layout alone does not count as a transformation.
+func renderedBodyIsTransformed(body string) bool {
+	return string(termsafe.Bytes([]byte(body))) != body
+}
+
+// searchResultNeedsNoFollowUpRead requires the producer's complete-symbol signal.
+// A full-unit or head-window signal alone does not certify an unelided body;
+// unit-elided wins if a contradictory complete-symbol signal is also present.
+func searchResultNeedsNoFollowUpRead(result sem.SearchResult) bool {
+	complete := false
+	for _, signal := range result.Signals {
+		switch signal {
+		case sem.FullUnitElidedSignal:
+			return false
+		case sem.CompleteSymbolSignal:
+			complete = true
+		}
+	}
+	return complete
+}
+
 // orderAgentSearchResults groups a payload for `--format agent`: candidate fix sites, then the
 // related-site block, then docs and fixtures. The agent format is a hard byte cap that fits
 // results one block at a time, so a group HEADER is the one thing it cannot afford — the label
@@ -1471,6 +1592,19 @@ func agentSearchSectionTag(result sem.SearchResult) string {
 	}
 	return ""
 }
+
+// agentSearchFitPass names the passes writeAgentSearch makes over its prefix ladder, in order.
+type agentSearchFitPass int
+
+const (
+	// agentSearchExactNamePass fits only the exact-name answer (search_exact_name.go), and only
+	// with VERIFY in the prefix when the response has one.
+	agentSearchExactNamePass agentSearchFitPass = iota
+	// agentSearchProtectTopHitPass accepts a plan only if the ranking carries source.
+	agentSearchProtectTopHitPass
+	// agentSearchFallbackPass accepts any plan that holds a ranked location.
+	agentSearchFallbackPass
+)
 
 // agentSearchPrefixHead pairs the two outermost prefix blocks so the fitter can walk them as one
 // flat list. See the comment at its only construction site in writeAgentSearch for the ordering
@@ -1510,6 +1644,31 @@ func agentSearchHeaderRungs(cacheState string, index, query, preselect, total in
 }
 
 func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.SearchResponse, budget int) error {
+	return writeAgentSearchMode(out, response, budget, true)
+}
+
+// writeAgentSearchMode is writeAgentSearch with the exact-name answer (search_exact_name.go)
+// switchable, so a test can render the ordinary answer for the same response and compare.
+func writeAgentSearchMode(out interface{ Write([]byte) (int, error) }, response sem.SearchResponse, budget int, exactName bool) error {
+	_, err := writeAgentSearchPayload(out, response, budget, agentSearchRender{exactName: exactName})
+	return err
+}
+
+// agentSearchRender is what an agent render needs to know beyond the response and the cap.
+type agentSearchRender struct {
+	// exactName enables the exact-name answer (search_exact_name.go).
+	exactName bool
+	// topK is the --top-k the ranking was cut at, 0 when unknown. It lets the exact answer say
+	// that more exact definitions may exist past the cut.
+	topK int
+	// sessionCapped is set when an EG_SEARCH_SESSION cap is active; the exact answer's omission
+	// line then invites no further search. See agentExactNameOmittedLine.
+	sessionCapped bool
+}
+
+// writeAgentSearchPayload writes the agent payload and reports whether it is the exact-name answer.
+func writeAgentSearchPayload(out interface{ Write([]byte) (int, error) }, response sem.SearchResponse, budget int, render agentSearchRender) (bool, error) {
+	exactName := render.exactName
 	// Same sink class as the text renderer, and the format agents are told to
 	// prefer — so it gets the same guard. See writeTextSearch.
 	out = termsafe.NewWriter(out)
@@ -1623,7 +1782,7 @@ func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.
 			payload = append(payload, suffix...)
 		}
 		_, err := out.Write(payload)
-		return err
+		return false, err
 	}
 
 	diagnosticVariants := [][]byte{fullDiagnostics}
@@ -1687,13 +1846,48 @@ func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.
 	// tried without it, which makes the notice the last prefix block the fitter gives up. A rung
 	// without it is offered only when there is a notice at all, so an honest payload adds none.
 	heads := make([]agentSearchPrefixHead, 0, 2*len(headers))
-	for i, header := range headers[:len(headers)-1] {
+	for i, header := range headers {
 		heads = append(heads, agentSearchPrefixHead{notice: forgeryNotice, header: header, reserved: len(reserved[i])})
 	}
 	if len(forgeryNotice) > 0 {
-		for i, header := range headers[:len(headers)-1] {
+		for i, header := range headers {
 			heads = append(heads, agentSearchPrefixHead{header: header, reserved: len(reserved[i])})
 		}
+	}
+	// An exact-identifier query answers with the exact-name rows alone (search_exact_name.go). That
+	// answer gets a pass of its own over the WHOLE prefix ladder before the ordinary passes run: when
+	// it was tried rung by rung beside the ordinary ranking, a rung that kept VERIFY and fitted one
+	// bare locator for an unrelated row beat a rung one step down that showed every exact
+	// declaration, so a larger budget could lose the answer a smaller one had. When no rung can hold
+	// it, the ordinary passes below run untouched and the payload is byte-identical to before.
+	//
+	// The exact pass is tried with VERIFY in the prefix only. VERIFY is "never traded for one more
+	// ranked locator", and it is not traded for a body either: an exact answer that cannot hold it
+	// beside every named line is not taken, and the ordinary passes decide, exactly as before. Trying
+	// the VERIFY-less variant at each rung, as the first version did, let the richest header rung
+	// drop VERIFY to fund bodies before any poorer rung was tried with it.
+	var exactAnchors []exactNameAnchor
+	var exactNote []byte
+	if exactName {
+		var exactOmitted int
+		exactAnchors, exactOmitted = agentExactNameAnchors(results, response.Query)
+		exactNote = agentExactNameOmittedLine(exactOmitted, len(exactAnchors), render.topK, render.sessionCapped)
+	}
+	// Prefix variants and source-protection passes often offer the same width.
+	// Reuse that deterministic fit instead of repeating declaration scans. Bound
+	// retained payload bytes independently of an explicitly unbounded caller cap.
+	fitted := make(map[int][]byte)
+	retained := 0
+	fitResults := func(width int) []byte {
+		if block, ok := fitted[width]; ok {
+			return block
+		}
+		block := fitAgentSearchResults(results, width)
+		if len(block) <= (1<<20)-retained {
+			fitted[width] = block
+			retained += len(block)
+		}
+		return block
 	}
 	const (
 		protectRankedSource = iota
@@ -1701,11 +1895,22 @@ func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.
 		protectHeadSource
 		allowLocators
 	)
-	// Exhaust ordinary source-bearing plans before trading the head's identity
-	// for a minimal-header body. Try every tail-preserving plan before source
-	// alone; locator-only output remains the last resort.
-	for _, mode := range []int{protectRankedSource, protectMinimalSource, protectHeadSource, allowLocators} {
-		protectTopHit := mode != allowLocators
+	for _, plan := range []struct {
+		pass agentSearchFitPass
+		mode int
+	}{
+		{agentSearchExactNamePass, protectRankedSource}, {agentSearchProtectTopHitPass, protectRankedSource},
+		{agentSearchProtectTopHitPass, protectMinimalSource}, {agentSearchProtectTopHitPass, protectHeadSource}, {agentSearchFallbackPass, allowLocators},
+	} {
+		pass, mode := plan.pass, plan.mode
+		if pass == agentSearchExactNamePass && len(exactAnchors) == 0 {
+			continue
+		}
+		passVerifyVariants := verifyVariants
+		if pass == agentSearchExactNamePass {
+			passVerifyVariants = verifyVariants[:1]
+		}
+		protectTopHit := pass == agentSearchProtectTopHitPass
 		if protectTopHit && len(results) == 0 {
 			continue // nothing to protect; the fallback pass is the only pass
 		}
@@ -1720,7 +1925,7 @@ func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.
 				for _, confidence := range confidenceVariants {
 					for _, warning := range closedSetVariants {
 						for _, containerMap := range mapVariants {
-							for _, verify := range verifyVariants {
+							for _, verify := range passVerifyVariants {
 								remaining := budget - len(forgery) - head.reserved - len(diagnostics) - len(confidence) -
 									len(warning) - len(containerMap) - len(verify)
 								if remaining <= 0 {
@@ -1758,11 +1963,26 @@ func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.
 											continue
 										}
 										_, err := out.Write(payload)
-										return err
+										return false, err
 									}
 									continue
 								}
-								formatted := fitAgentSearchResults(results, remaining)
+								if pass == agentSearchExactNamePass {
+									exact := fitAgentExactNameResults(exactAnchors, exactNote, remaining)
+									if len(exact) == 0 {
+										continue
+									}
+									// No suffix rides along: the droppable ones are surplus by this format's
+									// own rule, and refilling the cap with them is the cost this answer exists
+									// to remove; VERIFY is already in the prefix.
+									payload := append(prefix(), exact...)
+									if !searchPayloadDisclosesItsQuarantine(string(payload), quarantinedLines) {
+										continue
+									}
+									_, err := out.Write(payload)
+									return true, err
+								}
+								formatted := fitResults(remaining)
 								if (mode == protectMinimalSource || mode == protectHeadSource) && !agentSearchBlockCarriesSource(formatted) {
 									// Replace only the first locator; retain every tail locator
 									// already seated, unless every such source plan failed.
@@ -1805,7 +2025,7 @@ func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.
 										continue
 									}
 									_, err := out.Write(payload)
-									return err
+									return false, err
 								}
 							}
 						}
@@ -1871,7 +2091,7 @@ func writeAgentSearch(out interface{ Write([]byte) (int, error) }, response sem.
 		payload = payload[:budget]
 	}
 	_, err := out.Write(payload)
-	return err
+	return false, err
 }
 
 // searchLowConfidenceNotices renders the low-confidence marker in a full and a compact
@@ -2359,9 +2579,14 @@ var agentSearchAdaptiveBudgets = []int{4 * 1024, 8 * 1024, 16 * 1024}
 // line start. Its header carries the displayed line range, so a clipped body cannot match.
 // An explicit --max-context-bytes bypasses this and is honoured exactly.
 func writeAgentSearchAdaptive(out io.Writer, response sem.SearchResponse, ceiling int) error {
+	_, err := writeAgentSearchAdaptiveFor(out, response, ceiling, agentSearchRender{exactName: true})
+	return err
+}
+
+func writeAgentSearchAdaptiveFor(out io.Writer, response sem.SearchResponse, ceiling int, render agentSearchRender) (bool, error) {
 	results := orderAgentSearchResults(response.Results)
 	if ceiling <= 0 || len(results) == 0 {
-		return writeAgentSearch(out, response, ceiling)
+		return writeAgentSearchPayload(out, response, ceiling, render)
 	}
 	heads := agentSearchProtectedHeads(results)
 	for _, budget := range agentSearchAdaptiveBudgets {
@@ -2369,8 +2594,9 @@ func writeAgentSearchAdaptive(out io.Writer, response sem.SearchResponse, ceilin
 			break
 		}
 		var rendered bytes.Buffer
-		if err := writeAgentSearch(&rendered, response, budget); err != nil {
-			return err
+		exact, err := writeAgentSearchPayload(&rendered, response, budget, render)
+		if err != nil {
+			return false, err
 		}
 		whole := true
 		for _, head := range heads {
@@ -2381,17 +2607,12 @@ func writeAgentSearchAdaptive(out io.Writer, response sem.SearchResponse, ceilin
 		}
 		if whole {
 			_, err := out.Write(rendered.Bytes())
-			return err
+			return exact, err
 		}
 	}
-	return writeAgentSearch(out, response, ceiling)
+	return writeAgentSearchPayload(out, response, ceiling, render)
 }
 
-// agentSearchProtectedHeads returns the unbounded blocks writeAgentSearchAdaptive must find whole:
-// the first block printed AND the absolute best-ranked result. They differ when section grouping
-// (orderAgentSearchResults) prints a lower-ranked primary fix site ahead of a rank-1 docs,
-// related or test hit — which keeps its rank label, so it is still "the top hit" to a reader.
-// Protecting only the first printed block let a 4 KiB render be accepted with rank 1 clipped.
 func agentSearchProtectedHeads(ordered []sem.SearchResult) [][]byte {
 	// The first printed block, plus the agentSearchProtectedRanks best-ranked results by their
 	// ABSOLUTE rank (section grouping can print a lower rank first). Protecting only rank 1 cut the
@@ -2472,6 +2693,31 @@ func agentSearchResultBudgets(results []sem.SearchResult, budget int) []int {
 	}
 	if floorTotal > budget {
 		return rankedAgentSearchBudgets(count, budget)
+	}
+	// When every named declaration can fit, reserve it before distributing surplus.
+	// Adding a declaration to one row must not erase another affordable declaration.
+	declarationFloors := append([]int(nil), floors...)
+	declarationTotal := floorTotal
+	for index, row := range results {
+		shown := searchResultOnOneLine(row)
+		if searchResultNeedsNoFollowUpRead(shown) && !renderedBodyIsTransformed(shown.Snippet) {
+			continue
+		}
+		view := agentSearchBlockViewOf(shown)
+		own, ok, _ := agentSearchDecls(view)
+		if !ok || own.index < 0 || own.index >= len(view.lines) {
+			continue
+		}
+		line := view.first + own.index
+		header := agentSearchLocationHeaders(row.Rank, view.result.FilePath, line, line, view.focusLine, view.name, view.tag, view.scored, "")[0]
+		cost := len(header) + len(view.lines[own.index]) + 1
+		if cost > declarationFloors[index] {
+			declarationTotal += cost - declarationFloors[index]
+			declarationFloors[index] = cost
+		}
+	}
+	if declarationTotal <= budget {
+		floors, floorTotal = declarationFloors, declarationTotal
 	}
 	// Water-filling: each round shares what is left among the results still short of their
 	// natural (unbounded) size, by 1/(index+1)² weights; a result that reaches its natural
@@ -2599,8 +2845,10 @@ func agentSearchLocationCost(result sem.SearchResult) int {
 		lines = lines[:len(lines)-1]
 	}
 	_, focus, _ := agentSearchPrimaryFocus(result, len(lines))
+	// This reserves an unmarked locator, not a certified body. The body fitter
+	// measures the complete candidate, including marker bytes, against its budget.
 	return len(agentSearchLocationHeaders(result.Rank, result.FilePath, focus, focus, focus,
-		searchResultDisplayName(result), agentSearchSectionTag(result), agentSearchScoreTag(result))[0])
+		searchResultDisplayName(result), agentSearchSectionTag(result), agentSearchScoreTag(result), "")[0])
 }
 
 func rankedAgentSearchBudgets(count, budget int) []int {
@@ -2664,9 +2912,11 @@ func agentSearchScoreTag(result sem.SearchResult) string {
 func agentSearchBlock(result sem.SearchResult, budget int) []byte {
 	// Every location header this block and its helpers emit is one line. See
 	// searchResultOnOneLine.
+	originalSnippet := result.Snippet
 	result = searchResultOnOneLine(result)
+	primaryBodyChanged := result.Snippet != originalSnippet
 	if len(result.Passages) == 0 {
-		return agentSearchPrimaryBlock(result, budget)
+		return agentSearchPrimaryBlock(result, budget, primaryBodyChanged)
 	}
 	locationFloor := agentSearchLocationCost(result)
 	for count := len(result.Passages); count >= 0; count-- {
@@ -2677,13 +2927,11 @@ func agentSearchBlock(result sem.SearchResult, budget int) []byte {
 			if primaryBudget <= 0 {
 				continue
 			}
-			// Passages may use spare bytes, not the primary identity's promised floor.
-			// Below that floor the existing best-effort fallback still applies.
-			if budget >= locationFloor && primaryBudget < locationFloor {
-				continue
-			}
 		}
-		primary := agentSearchPrimaryBlock(result, primaryBudget)
+		if budget > 0 && len(passages) > 0 && budget >= locationFloor && primaryBudget < locationFloor {
+			continue
+		}
+		primary := agentSearchPrimaryBlock(result, primaryBudget, primaryBodyChanged)
 		if len(primary) == 0 {
 			continue
 		}
@@ -2713,107 +2961,158 @@ func renderAgentSearchPassages(path string, passages []sem.SearchPassage) []byte
 	return output.Bytes()
 }
 
-func agentSearchPrimaryBlock(result sem.SearchResult, budget int) []byte {
-	return agentSearchPrimaryBlockFromTier(result, budget, 0)
+func agentSearchPrimaryBlock(result sem.SearchResult, budget int, primaryBodyChanged bool) []byte {
+	view := agentSearchBlockViewOf(result)
+	if len(view.lines) == 0 {
+		return fitAgentSearchLocation(result.Rank, result.FilePath, view.focusLine, view.name, view.tag, view.scored, budget)
+	}
+	// Certified source keeps the approved whole-body-or-locator contract.
+	// Uncertified source may use the focus and declaration windows.
+	if block := agentSearchCompleteBlock(view, budget, primaryBodyChanged); block != nil {
+		return block
+	}
+	if !primaryBodyChanged && searchResultNeedsNoFollowUpRead(result) && !renderedBodyIsTransformed(result.Snippet) {
+		return fitAgentSearchLocation(result.Rank, result.FilePath, view.focusLine, view.name, view.tag, view.scored, budget)
+	}
+	plain, left, right := agentSearchFocusWindow(view, budget)
+	if block := agentSearchDeclarationBlock(view, plain, left, right, budget); block != nil {
+		return block
+	}
+	if plain != nil {
+		return plain
+	}
+	return fitAgentSearchLocation(result.Rank, result.FilePath, view.focusLine, view.name, view.tag, view.scored, budget)
 }
 
-func agentSearchPrimaryBlockFromTier(result sem.SearchResult, budget, firstTier int) []byte {
-	name := searchResultDisplayName(result)
-	tag := agentSearchSectionTag(result)
-	scored := agentSearchScoreTag(result)
+// agentSearchBlockViewOf computes a block's rendering inputs: the snippet's lines, the file line of
+// the first, and the focus line (index and the line the header reports).
+func agentSearchBlockViewOf(result sem.SearchResult) agentSearchBlockView {
+	canCertify := searchResultNeedsNoFollowUpRead(result) && !renderedBodyIsTransformed(result.Snippet)
 	lines := strings.Split(result.Snippet, "\n")
-	if len(lines) > 1 && lines[len(lines)-1] == "" {
+	if len(lines) > 1 && lines[len(lines)-1] == "" && (!canCertify || result.SnippetStartLine <= 0 || result.SnippetEndLine-result.SnippetStartLine+1 < len(lines)) {
 		lines = lines[:len(lines)-1]
 	}
-	snippetStart, focusLine, focus := agentSearchPrimaryFocus(result, len(lines))
-	if len(lines) == 0 {
-		return fitAgentSearchLocation(result.Rank, result.FilePath, focusLine, name, tag, scored, budget)
+	snippetStart := result.SnippetStartLine
+	if snippetStart <= 0 {
+		snippetStart = result.StartLine
 	}
-
-	// Prefer the widest balanced span containing the focus line. The location
-	// in the header is rebuilt for each candidate, so it always describes the
-	// lines actually displayed rather than the original untrimmed region.
-	//
-	// The header tier is the OUTER loop: a block gives up body lines before it
-	// gives up its rank, name and score. With span outermost, the widest span
-	// that fit under ANY header won, so a tight budget bought one or two more
-	// body lines by printing the head result as a bare `path:line *` — the
-	// minimal header, which carries no rank, no name and no score. That is the
-	// one signal agentSearchLocationHeaders calls not optional, dropped from
-	// the result an agent is most likely to act on, to show lines it would
-	// read anyway. So the ladder is: rich header with body, compact header
-	// with body, compact header ALONE, and only then the minimal header with
-	// body — at a cap too small for a rank and a name at all, one line of
-	// source under a bare locator says more than a bare locator with none.
-	for tier := firstTier; tier < agentSearchLocationHeaderTiers; tier++ {
-		if tier == agentSearchMinimalHeaderTier && firstTier != agentSearchMinimalHeaderTier {
-			if located := fitAgentSearchRankedLocation(result.Rank, result.FilePath, focusLine, name, tag, scored, budget); located != nil {
-				return located
-			}
-		}
-		for span := len(lines); span > 0; span-- {
-			leftMin := focus - span + 1
-			if leftMin < 0 {
-				leftMin = 0
-			}
-			leftMax := focus
-			if limit := len(lines) - span; leftMax > limit {
-				leftMax = limit
-			}
-			bestBalance := len(lines) + 1
-			var best []byte
-			for left := leftMin; left <= leftMax; left++ {
-				right := left + span - 1
-				text := strings.Join(lines[left:right+1], "\n")
-				startLine, endLine := snippetStart+left, snippetStart+right
-				header := agentSearchLocationHeaders(result.Rank, result.FilePath, startLine, endLine, focusLine, name, tag, scored)[tier]
-				candidate := []byte(header + text + "\n")
-				if budget <= 0 || len(candidate) <= budget {
-					balance := focus - left - (right - focus)
-					if balance < 0 {
-						balance = -balance
-					}
-					if best == nil || balance < bestBalance {
-						best, bestBalance = candidate, balance
-					}
-				}
-			}
-			if best != nil {
-				return best
-			}
-		}
+	if snippetStart <= 0 {
+		snippetStart = 1
 	}
-	return fitAgentSearchLocation(result.Rank, result.FilePath, focusLine, name, tag, scored, budget)
+	focusLine := result.FocusLine
+	if focusLine <= 0 {
+		focusLine = snippetStart
+	}
+	focus := focusLine - snippetStart
+	switch {
+	case focus >= len(lines) && len(lines) > 0 && result.FocusLine > 0 && result.FocusLine <= result.EndLine:
+		// The matched line lies BELOW the printed lines: a demoted tail row keeps the lines at its
+		// declaration rather than at its match (sem.tersifySearchResultKeepingDeclaration). The header
+		// still reports where the query matched, and the window is taken from the snippet's end,
+		// the lines nearest that match.
+		focus = len(lines) - 1
+	case focus < 0 || focus >= len(lines):
+		focus = len(lines) / 2
+		focusLine = snippetStart + focus
+	}
+	return agentSearchBlockView{
+		result: result, lines: lines, first: snippetStart, focus: focus, focusLine: focusLine,
+		name: searchResultDisplayName(result), tag: agentSearchSectionTag(result), scored: agentSearchScoreTag(result),
+	}
 }
 
-// agentSearchLocationHeaders builds the location line in decreasing cost. `tag` labels a block
-// that is not a candidate fix site; it rides on the two roomier variants and is dropped by the
-// minimal one, which exists for caps too small to hold a rank and a name at all.
-//
-// `scored` is the pre-rendered relevance-score suffix (see agentSearchScoreTag). It is NOT
-// an optional decoration: the score is the only per-result signal that separates a real hit
-// from the best of a bad lot, and its absence from this format let a query about a technology
-// absent from a repo come back as six confident-looking hits. It rides on the two roomier
-// variants at ~7 bytes each and is dropped by the minimal one along with rank and name.
-// agentSearchLocationHeaderTiers is how many variants agentSearchLocationHeaders returns;
-// agentSearchMinimalHeaderTier is the last of them, the one with no rank, name or score.
-const (
-	agentSearchLocationHeaderTiers = 3
-	agentSearchMinimalHeaderTier   = agentSearchLocationHeaderTiers - 1
-)
-
-// fitAgentSearchRankedLocation is fitAgentSearchLocation without the minimal header: a location
-// line that still carries rank, name and score, or nil when none fits.
-func fitAgentSearchRankedLocation(rank int, path string, focus int, name, tag, scored string, budget int) []byte {
-	for _, header := range agentSearchLocationHeaders(rank, path, focus, focus, focus, name, tag, scored)[:agentSearchMinimalHeaderTier] {
-		if budget <= 0 || len(header) <= budget {
-			return []byte(header)
+// agentSearchCompleteBlock is the unchanged whole body under a header carrying completeMarker, or
+// nil when the body is not whole, was changed or transformed, or no marked header fits the budget.
+// Only this block may carry the marker: the focus window and the declaration block show part of it.
+func agentSearchCompleteBlock(view agentSearchBlockView, budget int, primaryBodyChanged bool) []byte {
+	result, lines := view.result, view.lines
+	if primaryBodyChanged || !searchResultNeedsNoFollowUpRead(result) || renderedBodyIsTransformed(result.Snippet) {
+		return nil
+	}
+	text := strings.Join(lines, "\n")
+	startLine, endLine := view.first, view.first+len(lines)-1
+	for _, header := range agentSearchLocationHeaders(result.Rank, result.FilePath, startLine, endLine, view.focusLine, view.name, view.tag, view.scored, completeMarker) {
+		// This pass only considers marked headers. The unmarked fallbacks may use the minimal
+		// header for either a whole body or a smaller source window.
+		if !strings.Contains(header, completeMarker) {
+			break
+		}
+		candidate := []byte(header + text + "\n")
+		if budget <= 0 || len(candidate) <= budget {
+			return candidate
 		}
 	}
 	return nil
 }
 
-func agentSearchLocationHeaders(rank int, path string, start, end, focus int, name, tag, scored string) []string {
+// agentSearchFocusWindow is the block as it has always been rendered: the widest balanced span of
+// the snippet containing the focus line that fits the budget. It also returns the snippet indexes
+// the span covers, or (nil, -1, -1) when not even the focus line fits.
+func agentSearchPrimaryBlockFromTier(result sem.SearchResult, budget, firstTier int) []byte {
+	if searchResultNeedsNoFollowUpRead(result) && !renderedBodyIsTransformed(result.Snippet) {
+		return agentSearchPrimaryBlock(result, budget, false)
+	}
+	view := agentSearchBlockViewOf(result)
+	plain, left, right := agentSearchFocusWindowFromTier(view, budget, firstTier)
+	if block := agentSearchDeclarationBlock(view, plain, left, right, budget); block != nil {
+		return block
+	}
+	return plain
+}
+
+func agentSearchFocusWindow(view agentSearchBlockView, budget int) ([]byte, int, int) {
+	return agentSearchFocusWindowFromTier(view, budget, 0)
+}
+
+func agentSearchFocusWindowFromTier(view agentSearchBlockView, budget, firstTier int) ([]byte, int, int) {
+	result, lines, snippetStart, focus, focusLine := view.result, view.lines, view.first, view.focus, view.focusLine
+	name, tag, scored := view.name, view.tag, view.scored
+	// Candidate byte costs are additive. Measure ranges with prefix sums and
+	// construct only the winning header/body, rather than joining every window.
+	prefix := make([]int, len(lines)+1)
+	digits := make([]int, len(lines))
+	for i, line := range lines {
+		prefix[i+1] = prefix[i] + len(line) + 1
+		digits[i] = len(strconv.Itoa(snippetStart + i))
+	}
+	bases := agentSearchLocationHeaders(result.Rank, result.FilePath, 0, 0, focusLine, name, tag, scored, "")
+	for tier := firstTier; tier < agentSearchLocationHeaderTiers; tier++ {
+		if tier == agentSearchMinimalHeaderTier && firstTier != agentSearchMinimalHeaderTier {
+			if located := fitAgentSearchRankedLocation(result.Rank, result.FilePath, focusLine, name, tag, scored, budget); located != nil {
+				return located, -1, -1
+			}
+		}
+		for span := len(lines); span > 0; span-- {
+			leftMin, leftMax := max(0, focus-span+1), min(focus, len(lines)-span)
+			bestBalance, bestLeft := len(lines)+1, -1
+			for left := leftMin; left <= leftMax; left++ {
+				right := left + span - 1
+				headerCost := len(bases[tier]) - 1 + digits[left]
+				if tier != agentSearchMinimalHeaderTier && right != left {
+					headerCost += 1 + digits[right]
+				}
+				if budget > 0 && headerCost+prefix[right+1]-prefix[left] > budget {
+					continue
+				}
+				balance := focus - left - (right - focus)
+				if balance < 0 {
+					balance = -balance
+				}
+				if bestLeft < 0 || balance < bestBalance {
+					bestBalance, bestLeft = balance, left
+				}
+			}
+			if bestLeft >= 0 {
+				right := bestLeft + span - 1
+				header := agentSearchLocationHeaders(result.Rank, result.FilePath, snippetStart+bestLeft, snippetStart+right, focusLine, name, tag, scored, "")[tier]
+				return []byte(header + strings.Join(lines[bestLeft:right+1], "\n") + "\n"), bestLeft, right
+			}
+		}
+	}
+	return nil, -1, -1
+}
+
+func agentSearchLocationHeaders(rank int, path string, start, end, focus int, name, tag, scored, complete string) []string {
 	location := fmt.Sprintf("%d. %s:%d", rank, path, start)
 	if end != start {
 		location += fmt.Sprintf("-%d", end)
@@ -2825,6 +3124,9 @@ func agentSearchLocationHeaders(rank int, path string, start, end, focus int, na
 	if tag != "" {
 		rich += " " + tag
 	}
+	if complete != "" {
+		rich += " " + complete
+	}
 	rich += scored + fmt.Sprintf(" [focus:%d]\n", focus)
 	compact := location
 	if name != "" {
@@ -2833,13 +3135,42 @@ func agentSearchLocationHeaders(rank int, path string, start, end, focus int, na
 	if tag != "" {
 		compact += " " + tag
 	}
+	if complete != "" {
+		compact += " " + complete
+	}
 	compact += scored + " *\n"
-	minimal := fmt.Sprintf("%s:%d *\n", path, focus)
+	// The minimal rung names the FIRST printed line, so every line under it is numbered by counting
+	// down from it. Naming the focus line misnumbered every line of a window that does not start at
+	// the focus, and named a line that is not printed at all for a demoted tail row whose window was
+	// kept at its declaration (focus below the snippet). A bare locator with no lines
+	// (fitAgentSearchLocation) passes start == focus and is unchanged.
+	minimal := fmt.Sprintf("%s:%d *\n", path, start)
 	return []string{rich, compact, minimal}
 }
 
+// fitAgentSearchLocation fits a bodyless locator, which never carries a marker.
+const (
+	agentSearchLocationHeaderTiers = 3
+	agentSearchMinimalHeaderTier   = agentSearchLocationHeaderTiers - 1
+)
+
+// fitAgentSearchRankedLocation is fitAgentSearchLocation without the minimal header: a location
+// line that still carries rank, name and score, or nil when none fits.
+func fitAgentSearchRankedLocation(rank int, path string, focus int, name, tag, scored string, budget int) []byte {
+	for _, header := range agentSearchLocationHeaders(rank, path, focus, focus, focus, name, tag, scored, "")[:agentSearchMinimalHeaderTier] {
+		if budget <= 0 || len(header) <= budget {
+			return []byte(header)
+		}
+	}
+	return nil
+}
+
+// agentSearchLocationHeaders offers rich, compact, and minimal locator headers.
+// Only the first two can carry a completeness marker. Callers must not seat a
+// certified body under the marker-less minimal header.
+
 func fitAgentSearchLocation(rank int, path string, focus int, name, tag, scored string, budget int) []byte {
-	for _, header := range agentSearchLocationHeaders(rank, path, focus, focus, focus, name, tag, scored) {
+	for _, header := range agentSearchLocationHeaders(rank, path, focus, focus, focus, name, tag, scored, "") {
 		if budget <= 0 || len(header) <= budget {
 			return []byte(header)
 		}
@@ -2973,6 +3304,26 @@ func parseSearchFlags(args []string) (searchFlags, []string, error) {
 				return flags, nil, err
 			}
 			flags.VerifyPreFixStatus, i = value, next
+		// --verify-block on|off: whether the payload carries the VERIFY block. --omit-verify is
+		// shorthand for off. Naming both values in one command line is an error rather than
+		// last-wins. See resolveSearchVerifyBlock.
+		case "--verify-block", "--omit-verify":
+			value, next := searchVerifyBlockOff, i
+			if args[i] == "--verify-block" {
+				raw, after, err := searchFlagValue(args, i)
+				if err != nil {
+					return flags, nil, err
+				}
+				value, next = strings.ToLower(strings.TrimSpace(raw)), after
+				if value != searchVerifyBlockOn && value != searchVerifyBlockOff {
+					return flags, nil, fmt.Errorf("--verify-block: want %s or %s, got %q",
+						searchVerifyBlockOn, searchVerifyBlockOff, raw)
+				}
+			}
+			if flags.VerifyBlock != "" && flags.VerifyBlock != value {
+				return flags, nil, fmt.Errorf("--verify-block given as both %s and %s", flags.VerifyBlock, value)
+			}
+			flags.VerifyBlock, i = value, next
 		case "--max-regions-per-file":
 			value, next, err := searchPositiveIntFlag(args, i)
 			if err != nil {
