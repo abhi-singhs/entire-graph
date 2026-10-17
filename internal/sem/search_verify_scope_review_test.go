@@ -80,3 +80,27 @@ func TestVerifyAboveScopeAcceptsRelativeRepo(t *testing.T) {
 		}
 	}
 }
+
+func TestVerifyAboveScopeRefusesSymlinkedManifest(t *testing.T) {
+	repo := t.TempDir()
+	scope := filepath.Join(repo, "sub")
+	if err := os.MkdirAll(scope, 0755); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repo, "init")
+	write(t, repo, "actual.mod", "module example.com/fixture\n")
+	if err := os.Symlink("actual.mod", filepath.Join(repo, "go.mod")); err != nil {
+		t.Skipf("symlink creation unavailable: %v", err)
+	}
+	above, closeScope, ok := openSearchVerifyAboveScope(t.Context(), scope, "", false)
+	if !ok {
+		t.Fatal("valid physical checkout refused")
+	}
+	defer closeScope()
+	if content, found := above.read("actual.mod"); !found || content != "module example.com/fixture\n" {
+		t.Fatal("control: ordinary manifest must be readable")
+	}
+	if _, found := above.read("go.mod"); found {
+		t.Fatal("a manifest symlink was followed even though its target is inside the checkout")
+	}
+}

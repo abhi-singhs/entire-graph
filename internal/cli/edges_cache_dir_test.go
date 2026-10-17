@@ -41,7 +41,7 @@ func TestTargetedEdgesRecoverFromCorruptCache(t *testing.T) {
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-m", "initial")
 
-	for _, damage := range []string{"truncated-gzip", "malformed-record", "invalid-relation"} {
+	for _, damage := range []string{"truncated-gzip", "malformed-record", "invalid-relation", "capture-overflow"} {
 		t.Run(damage, func(t *testing.T) {
 			cacheDir, pluginDir := t.TempDir(), t.TempDir()
 			run := func(extra ...string) (string, string) {
@@ -56,6 +56,21 @@ func TestTargetedEdgesRecoverFromCorruptCache(t *testing.T) {
 			want, wantErr := run("--no-cache")
 			if strings.Count(want, `"record_type":"relation"`) != 1 {
 				t.Fatalf("control must contain one matching edge: %s", want)
+			}
+			if damage == "capture-overflow" {
+				previousLimit := providerRecordsCacheMaxBytes
+				providerRecordsCacheMaxBytes = 1
+				defer func() { providerRecordsCacheMaxBytes = previousLimit }()
+				for range 2 {
+					got, gotErr := run()
+					if got != want || gotErr != wantErr {
+						t.Fatal("cache capture overflow changed targeted output")
+					}
+				}
+				if entries := recordsCacheEntries(t, cacheDir); len(entries) != 0 {
+					t.Fatalf("overflow persisted an incomplete cache: %v", entries)
+				}
+				return
 			}
 			run()
 			entries := recordsCacheEntries(t, cacheDir)
