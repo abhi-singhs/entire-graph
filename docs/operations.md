@@ -85,6 +85,12 @@ through the same writable namespace.
   `symbols`, `edges`). It is committed-tree only; `--worktree` streams always
   bypass it.
 
+Targeted `edges --to/--from/--relation` requests honor `--cache-dir` and reuse the
+same unfiltered `edges` entry. A hit filters its records without changing the
+matching output bytes. An unreadable entry or a record that cannot be decoded
+causes a rebuild before any cached prefix is printed; a successful bounded
+capture replaces the damaged entry. `--no-cache` bypasses both reads and writes.
+
 ### What a cache entry is keyed on
 
 A search-snapshot entry is a function of: the cache format version, the

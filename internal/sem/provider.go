@@ -539,6 +539,10 @@ type ProviderSnapshotOptions struct {
 	// loadOrBuildSearchSnapshotPersisting). Internal wiring: it changes no
 	// snapshot content and is not part of any cache key.
 	coldComplete coldCompletePolicy
+	// onCompleteDerivation receives the header of the complete snapshot a
+	// selective view was successfully derived from. A search reports coverage
+	// from it so cold and warm derived views disclose the same diagnostics.
+	onCompleteDerivation func(SnapshotHeader)
 	// historyCochanges pins the local history view for a record-cache transaction.
 	// A shallow clone can have the same commit/tree but different available history.
 	historyCochanges *capturedFileCochanges

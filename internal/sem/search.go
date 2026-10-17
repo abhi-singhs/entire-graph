@@ -1360,6 +1360,10 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 		disabled:    explicitIndexedFileBound,
 		sourceFiles: selection.filesScanned,
 	}
+	var derivedFromComplete *SnapshotHeader
+	snapshotOptions.onCompleteDerivation = func(header SnapshotHeader) {
+		derivedFromComplete = &header
+	}
 	snapshot, cacheHit := preindexedSnapshot, preindexCacheHit
 	indexLatency := preindexLoadLatency
 	if cacheHit && len(snapshotOptions.OnlyFiles) > 0 {
@@ -1913,8 +1917,11 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 	// makes anyway — a repo-wide grep, a fumbled test invocation, and the read that discovers a
 	// switch it forgot to extend — which is the property the reference blocks above lack. They are
 	// additive and separately capped; see search_blocks.go.
+	verifyAboveScope, closeVerifyAboveScope := newSearchVerifyAboveScope(ctx, repo, snapshot.Header.Commit, useHead)
+	defer closeVerifyAboveScope()
 	verifyEvidence := searchVerifyEvidence{
 		read: read, files: selection.allFiles, prefix: options.VerifyPrefix, preFixStatus: options.VerifyPreFixStatus,
+		aboveScope: verifyAboveScope,
 	}
 	// The three agent-asked blocks read files the RANKING never asked for: a bounded set of files
 	// containing one literal, a handful of switch sites, and the build manifests above the top hit.
@@ -2050,7 +2057,8 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 	if results == nil {
 		results = []SearchResult{}
 	}
-	partialFailures := snapshot.Header.PartialFailures
+	diagnostics := searchDiagnosticsHeader(snapshot, derivedFromComplete, preindexedSnapshot, preindexCacheHit)
+	partialFailures := diagnostics.PartialFailures
 	if partialFailures == nil {
 		partialFailures = []PartialFailure{}
 	}
@@ -2071,11 +2079,35 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 		CoverageNote:          coverageNote,
 		RepoIgnored:           selection.repoIgnored,
 		Stats:                 stats,
-		Warnings:              withRepoIgnoreDisclosure(snapshot.Header.Warnings, selection.repoIgnored),
+		Warnings:              withRepoIgnoreDisclosure(diagnostics.Warnings, selection.repoIgnored),
 		PartialFailures:       withRepoIgnorePartialFailures(partialFailures, selection.repoIgnored),
-		Completeness:          snapshot.Header.Completeness,
+		Completeness:          diagnostics.Completeness,
 		replayProvenancePaths: replayProvenancePaths,
 	}, nil
+}
+
+// searchDiagnosticsHeader picks the header a search reports its coverage diagnostics (warnings,
+// partial failures, completeness) from.
+//
+// When a complete snapshot of this tree is in hand, that is its header, not the selective view's.
+// The selective view is a function of preselection, and preselection differs between a cold query
+// and a warm one: cold, a small repository indexes every file (or builds the complete snapshot and
+// derives from it), while warm, a preindexed graph lets Git's exact tree grep pick the matching
+// files. The same query then reported `Coverage: degraded (... 1 partial failure)` cold and printed
+// no Coverage line at all on the cache hit, because the file that failed to parse was not among the
+// files the warm grep matched. The repository's parse health does not depend on which files a query
+// ranked, so the complete header answers it whichever path served the query; the no-hit path above
+// already reports the preindexed graph's health the same way.
+func searchDiagnosticsHeader(
+	snapshot ProviderSnapshot, derivedFrom *SnapshotHeader, preindexed ProviderSnapshot, preindexHit bool,
+) SnapshotHeader {
+	if derivedFrom != nil && derivedFrom.Tree == snapshot.Header.Tree && derivedFrom.RepoKey == snapshot.Header.RepoKey {
+		return *derivedFrom
+	}
+	if preindexHit && preindexed.Header.Tree == snapshot.Header.Tree && preindexed.Header.RepoKey == snapshot.Header.RepoKey {
+		return preindexed.Header
+	}
+	return snapshot.Header
 }
 
 // newSearchNeedleGrep is the needle index's Git route: it lists every file in the tree

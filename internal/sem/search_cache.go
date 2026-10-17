@@ -377,6 +377,9 @@ func loadOrBuildSearchSnapshotPersisting(
 			if generationKnown {
 				_ = writeSearchSnapshot(entry, newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom, options, selective, ctx))
 			}
+			if options.onCompleteDerivation != nil {
+				options.onCompleteDerivation(full.Header)
+			}
 			return selective, true
 		}
 		// A preloaded complete snapshot was read by its caller BEFORE this

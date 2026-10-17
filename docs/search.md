@@ -44,6 +44,13 @@ The default format is JSON, one object per query:
   formats render it as a `VERIFY:` line. It is a suggestion constructed from
   repository contents; read it before running it (see
   [trust and security](trust-and-security.md)).
+  When no in-scope command can be derived for a subdirectory `--repo`, manifest
+  discovery may continue to the enclosing physical Git checkout root. The
+  emitted command uses `cd <absolute-physical-root> && ...`, including that local
+  path in its derivation evidence, so a symlinked scope cannot redirect a relative
+  parent walk into another checkout. `--head` reads committed manifests;
+  working-tree reads stay confined to that checkout and refuse symlinked files.
+  A subdirectory with its own build root keeps its in-scope command.
   Language-specific suite fallbacks require a matching source or covering test;
   a neighboring manifest alone does not assign an unrelated language's runner.
   Native Go inputs require bounded, same-package evidence (and a real `import
