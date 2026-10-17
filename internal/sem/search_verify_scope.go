@@ -176,6 +176,9 @@ func deriveSearchVerifyAboveScope(subject searchVerifySubject, evidence *searchV
 		return nil, nil
 	}
 	outer := &searchVerifyEvidence{
+		// Continue the lookup's existing budget rather than allowing a second
+		// full budget just because its coordinates change at the scope boundary.
+		reads: evidence.reads,
 		// In-scope paths go through the scope's own evidence, so they share its cache, read budget
 		// and replay provenance; only the manifests above the scope are read through the toplevel.
 		read: func(filePath string) (string, bool) {
@@ -185,6 +188,13 @@ func deriveSearchVerifyAboveScope(subject searchVerifySubject, evidence *searchV
 			return scope.read(filePath)
 		},
 		lookPath: evidence.lookPath,
+	}
+	defer func() { evidence.reads = outer.reads }()
+	// Native Go inputs need their same-directory Go files as positive package
+	// evidence. Preserve the scoped inventory in the outer walk's coordinates.
+	outer.files = make([]string, len(evidence.files))
+	for index, filePath := range evidence.files {
+		outer.files[index] = searchVerifyJoin(scope.prefix, filePath)
 	}
 	lifted := subject
 	lifted.sourcePath = searchVerifyJoin(scope.prefix, subject.sourcePath)
