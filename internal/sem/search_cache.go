@@ -42,7 +42,8 @@ import (
 // v22 retires checkout-path keys and keys the checkout-relative scope, so shared
 // entries cannot cross repository subdirectories or replay older route producers.
 // v23 retires routes omitted by closure-local writes and address escapes.
-const searchSnapshotCacheVersion = "search-snapshot-v23-" + IdentityRevision
+// v24 retires bare routes from wrapped mounts and unbounded route masks.
+const searchSnapshotCacheVersion = "search-snapshot-v24-" + IdentityRevision
 
 type cachedSymbolByteRange struct {
 	Start int `json:"start"`

@@ -321,6 +321,10 @@ func resolveGoRouteReceiversWithBudget(content string, constants map[string]stri
 		return receivers
 	}
 	receivers.masks = resolver.maskSpans()
+	if resolver.steps > resolver.budget {
+		receivers.exhausted = true
+		return receivers
+	}
 	receivers.parsed = true
 	receivers.uses = resolver.uses
 	receivers.regs = resolver.regs
@@ -460,10 +464,15 @@ func (r *goRouteResolver) read(binding *goRouteBinding) goRouteBinding {
 	}
 	value := *binding
 	if r.escaped[binding] {
-		clientType := value.httpClientType
+		before := value
 		value = goRouteUnknownBinding
-		value.httpClientType = clientType
-		value.httpClient = clientType
+		value.httpClientType = before.httpClientType
+		value.httpClient = before.httpClientType
+		// Losing value certainty does not disprove known rewrite effects.
+		value.stripPrefixMiddleware = before.stripPrefixMiddleware
+		value.stripPrefixJoins = before.stripPrefixJoins
+		value.stripPrefixSource = before.stripPrefixSource
+		value.closure = before.closure
 	}
 	if r.escapedStripPrefixWrites[binding] {
 		value.stripPrefixMiddleware = true
@@ -1864,6 +1873,10 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 		if !deferred {
 			unknown.stripPrefixMiddleware = binding.stripPrefixMiddleware
 		}
+		// A captured function can still perform its known rewrite effect. The
+		// callback/collector identity gate treats this descriptor as MAY evidence,
+		// rather than claiming the captured variable keeps this exact value.
+		unknown.closure = binding.closure
 		unknown.httpClientType = binding.httpClientType
 		unknown.httpClient = binding.httpClientType
 		// Preserve the exact lexical binding. A later escaped write to this
@@ -2397,6 +2410,34 @@ func (r *goRouteResolver) noteMount(call *ast.CallExpr, scope *goRouteScope) {
 	}
 	ident, ok := goRouteUnparen(call.Args[1]).(*ast.Ident)
 	if !ok {
+		// Wrappers may preserve or change placement; never publish the nested
+		// router's bare routes as if this mount had no prefix.
+		argument := call.Args[1]
+		var inspect func(ast.Node) bool
+		inspect = func(n ast.Node) bool {
+			r.step(1)
+			switch node := n.(type) {
+			case *ast.SelectorExpr:
+				// A member name is not a read of an enclosing local namesake.
+				ast.Inspect(node.X, inspect)
+				return false
+			case *ast.FuncLit:
+				// Types and parameter declarations do not read router values.
+				ast.Inspect(node.Body, inspect)
+				return false
+			case *ast.Ident:
+				if node.Obj != nil {
+					if declaration, ok := node.Obj.Decl.(ast.Node); ok && declaration.Pos() >= argument.Pos() && declaration.End() <= argument.End() {
+						return true
+					}
+				}
+				if binding := r.lookup(scope, node.Name); binding != nil && binding.origin != nil {
+					binding.origin.opaque = true
+				}
+			}
+			return true
+		}
+		ast.Inspect(argument, inspect)
 		return
 	}
 	lookup := r.lookupIn(scope)

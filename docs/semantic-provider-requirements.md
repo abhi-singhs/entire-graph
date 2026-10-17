@@ -309,6 +309,10 @@ Relation vocabulary:
   local or closure parameter does not invalidate an outer router with the same
   name. If the route walk exhausts its work budget, registrations for that file
   are omitted and `E_GO_ROUTE_BUDGET_EXCEEDED` reports the completeness loss.
+  Route masking shares that budget and masks the whole file on exhaustion.
+  Wrapped `Mount` arguments make nested router placement unknown. Losing a
+  captured middleware value's identity preserves evidence that it may rewrite
+  paths, so escaped or reassigned closures cannot invent bare routes.
 - `HANDLES_GRPC` / `HANDLES_GRAPHQL` / `HANDLES_TRPC` — service boundary edges
   from protobuf RPC declarations, GraphQL operation literals, JS/TS GraphQL
   resolver-map fields and modular resolver root objects (`Query`, `Mutation`,
