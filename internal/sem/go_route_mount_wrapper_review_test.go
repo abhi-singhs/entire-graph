@@ -73,3 +73,37 @@ func routes() {
 		t.Fatalf("lost independent root: %+v", regs)
 	}
 }
+
+func TestGoRouteWrappedMountRespectsNestedBindings(t *testing.T) {
+	for _, target := range []struct {
+		expr     string
+		wantRoot bool
+	}{
+		{`func(api chi.Router) chi.Router { return api }(other)`, true},
+		{`func() chi.Router { api := other; return api }()`, true},
+		{`func() chi.Router { return api }()`, false},
+		{`holder.api(other)`, true},
+	} {
+		t.Run(target.expr, func(t *testing.T) {
+			source := fmt.Sprintf(`package p
+import "github.com/go-chi/chi/v5"
+func routes() {
+ r := chi.NewRouter()
+ api := chi.NewRouter()
+ other := chi.NewRouter()
+ api.Get("/root", root)
+ other.Get("/child", child)
+ r.Mount("/v1", %s)
+ r.Get("/health", health)
+}`, target.expr)
+			regs := goRouteRegistrations(source, nil)
+			seen := map[string]bool{}
+			for _, reg := range regs {
+				seen[reg.Route] = true
+			}
+			if seen["/root"] != target.wantRoot || !seen["/health"] || (target.wantRoot && seen["/child"]) {
+				t.Fatalf("wrong lexical mount scope: %+v", regs)
+			}
+		})
+	}
+}
