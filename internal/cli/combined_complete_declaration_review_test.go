@@ -83,8 +83,10 @@ func TestCombinedCompleteDeclarationReviewWholeBeforeWindow(t *testing.T) {
 		t.Fatalf("declaration window ran before the marked-whole candidate:\n%s", roomy)
 	}
 
-	// Certification and ordinary declaration excerpts are separate contracts.
-	sawWhole, sawLocator := false, false
+	// Candidate contract: prefer certified whole source, then preserve useful
+	// unmarked source before falling back to a locator. Main's whole-or-locator
+	// rule is intentionally replaced; partial output must never keep the marker.
+	sawWhole, sawLocator, sawPartial := false, false, false
 	for budget := 1; budget <= combinedCompleteMaxBudget; budget++ {
 		block := agentSearchBlock(result, budget)
 		if len(block) > budget || !utf8.Valid(block) {
@@ -92,14 +94,15 @@ func TestCombinedCompleteDeclarationReviewWholeBeforeWindow(t *testing.T) {
 		}
 		text := string(block)
 		_, body, _ := strings.Cut(strings.TrimSuffix(text, "\n"), "\n")
-		if body != "" && (!strings.Contains(text, combinedCompleteDeclarationBody) || !strings.Contains(text, combinedCompleteMarker)) {
-			t.Fatalf("certified body shortened at %d: %s", budget, text)
+		if strings.Contains(text, combinedCompleteMarker) && !strings.Contains(text, combinedCompleteDeclarationBody) {
+			t.Fatalf("partial source certified at %d: %s", budget, text)
 		}
+		sawPartial = sawPartial || body != "" && !strings.Contains(text, combinedCompleteDeclarationBody)
 		sawWhole = sawWhole || strings.Contains(text, combinedCompleteDeclarationBody)
 		sawLocator = sawLocator || len(block) > 0 && body == ""
 	}
-	if !sawWhole || !sawLocator {
-		t.Fatal("both whole and locator paths must execute")
+	if !sawWhole || !sawLocator || !sawPartial {
+		t.Fatal("whole, unmarked partial, and locator paths must execute")
 	}
 	result.Signals = nil
 	declarationFeasible := len("review/complete.go:100 *\n") + len(combinedCompleteDeclarationLine) + 1
