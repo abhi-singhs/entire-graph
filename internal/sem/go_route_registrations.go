@@ -23,13 +23,11 @@ import (
 type goRouteCandidate struct {
 	// order keeps the historical emission order: HandleFunc, then
 	// Handle(HandlerFunc(..)), then router methods, then Group(..).METHOD.
-	order  int
-	offset int
-	route  string
-	// routeSpan keeps the token fallback's argument opaque to literal scans.
-	routeSpan [2]int
-	handler   string
-	evidence  string
+	order    int
+	offset   int
+	route    string
+	handler  string
+	evidence string
 	// inline registrations have a handler this pass cannot name as a symbol
 	// (a closure, a call, a middleware chain): their route is attributed to
 	// the enclosing symbol.
@@ -50,9 +48,11 @@ type goRouteInline struct {
 // composed). The pattern-level route literal fallback must not read those
 // spans: their route is decided here.
 type goRouteDetail struct {
-	regs   []goHTTPRouteRegistration
-	inline []goRouteInline
-	masks  [][2]int
+	regs        []goHTTPRouteRegistration
+	inline      []goRouteInline
+	masks       [][2]int
+	exhausted   bool
+	parseFailed bool
 }
 
 var goRouteMethodNames = map[string]bool{
@@ -81,28 +81,22 @@ func goRouteRegistrationsDetailed(content string, constants map[string]string) g
 		// No registration here, but a Group/Route/Mount/PathPrefix/
 		// StripPrefix prefix is still not a route of this file.
 		receivers := resolveGoRouteReceivers(content, constants)
-		if !receivers.parsed && !receivers.exhausted {
-			receivers.masks = goRouteFallbackPrefixMasks(content)
-		}
-		return goRouteDetail{masks: receivers.masks}
+		return goRouteDetail{masks: receivers.masks, exhausted: receivers.exhausted, parseFailed: !receivers.parsed && !receivers.exhausted}
 	}
 	receivers := resolveGoRouteReceivers(content, constants)
 	switch {
 	case receivers.exhausted:
 		// No receiver in the file is trusted; the route arguments are still
 		// known, so the literal fallback does not re-emit them either.
-		return goRouteDetail{masks: receivers.masks}
+		return goRouteDetail{masks: receivers.masks, exhausted: true}
 	case receivers.parsed:
 		detail := goRouteEmit(receivers.regs, constants)
 		detail.masks = receivers.masks
 		return detail
 	default:
-		candidates := goRouteFallbackRegistrations(content)
-		detail := goRouteEmit(candidates, constants)
-		detail.masks = goRouteFallbackPrefixMasks(content)
-		for _, candidate := range candidates {
-			detail.masks = append(detail.masks, candidate.routeSpan)
-		}
+		detail := goRouteEmit(goRouteFallbackRegistrations(content), constants)
+		detail.masks = receivers.masks
+		detail.parseFailed = true
 		return detail
 	}
 }
@@ -390,8 +384,7 @@ func (r *goRouteResolver) maskSpans() (spans [][2]int) {
 			if _, exceeded := recovered.(goRouteBudgetExceeded); !exceeded {
 				panic(recovered)
 			}
-			// Partial masks could let the literal fallback re-emit omitted routes.
-			// On exhaustion, fail closed for this file without completing the walk.
+			// Incomplete masks must never expose omitted routes to the literal scan.
 			spans = [][2]int{{0, len(r.src)}}
 		}
 	}()
@@ -452,52 +445,6 @@ func (r *goRouteResolver) maskSpans() (spans [][2]int) {
 		return true
 	})
 	return spans
-}
-
-// goRouteFallbackPrefixMasks keeps prefix-call arguments opaque when Go's parser
-// rejects the file. A single scanner pass tracks one outer call at a time, so
-// nested prefix calls cannot cause repeated walks of the same source. Explicit
-// recoverable registrations are still emitted separately by the token fallback.
-func goRouteFallbackPrefixMasks(content string) [][2]int {
-	fset := token.NewFileSet()
-	file := fset.AddFile("", fset.Base(), len(content))
-	var scan scanner.Scanner
-	scan.Init(file, []byte(content), func(token.Position, string) {}, 0)
-	var spans [][2]int
-	var previous, beforePrevious token.Token
-	previousLiteral := ""
-	depth, maskDepth, start := 0, 0, -1
-	for {
-		pos, kind, literal := scan.Scan()
-		offset := file.Offset(pos)
-		if kind == token.EOF {
-			if start >= 0 && start < len(content) {
-				spans = append(spans, [2]int{start, len(content)})
-			}
-			return spans
-		}
-		switch kind {
-		case token.LPAREN:
-			depth++
-			if start < 0 && previous == token.IDENT && beforePrevious == token.PERIOD {
-				switch previousLiteral {
-				case "Group", "Route", "Mount", "PathPrefix", "StripPrefix":
-					start, maskDepth = offset+1, depth
-				}
-			}
-		case token.RPAREN:
-			if start >= 0 && depth == maskDepth {
-				if start < offset {
-					spans = append(spans, [2]int{start, offset})
-				}
-				start = -1
-			}
-			if depth > 0 {
-				depth--
-			}
-		}
-		beforePrevious, previous, previousLiteral = previous, kind, literal
-	}
 }
 
 // goRouteFallbackRegistrations handles a file go/parser rejects. It scans
@@ -644,7 +591,7 @@ func goRouteFallbackRegistrations(content string) []goRouteCandidate {
 		if comma < 0 {
 			continue
 		}
-		candidate := goRouteCandidate{offset: toks[i].off, route: route, routeSpan: [2]int{toks[i+4].off, toks[comma].off}}
+		candidate := goRouteCandidate{offset: toks[i].off, route: route}
 		k := comma + 1
 		switch {
 		case method == "HandleFunc":
@@ -727,8 +674,8 @@ var goRouteClientFuncs = map[string]bool{
 // known not to be a router: request-context methods, HTTP client calls and
 // request constructors, calls on an *http.Client, and same-file request
 // helpers (testRequest, performRequest). Their literals are URLs or keys, so
-// the route literal fallback must not read them. Literals on receivers of
-// unknown type are left alone.
+// the route literal fallback must not read them. Other unknown and untracked
+// receivers retain the generic fallback.
 func (r *goRouteResolver) nonRouterStringSpans() [][2]int {
 	var spans [][2]int
 	addStrings := func(call *ast.CallExpr) {
@@ -756,8 +703,6 @@ func (r *goRouteResolver) nonRouterStringSpans() [][2]int {
 		}
 		return false
 	}
-	clientTypes := map[string]bool{"http.Client": true}
-	clients := map[string]bool{}
 	// Names only ever bound to a composite literal of a type that is not a
 	// framework router (kv := cache{}, api := apiClient{}): a zero value built
 	// here holds no router.
@@ -768,6 +713,12 @@ func (r *goRouteResolver) nonRouterStringSpans() [][2]int {
 			expr = goRouteUnparen(unary.X)
 		}
 		if lit, ok := expr.(*ast.CompositeLit); ok && lit.Type != nil && !isType(lit.Type, goRouteRouterTypes) {
+			if r.isHTTPClientType(lit.Type) {
+				// HTTP clients are classified by the resolver's lexical binding
+				// at each use, not by this file-global zero-value heuristic.
+				otherValues[name] = true
+				return
+			}
 			literalValues[name] = true
 			return
 		}
@@ -786,29 +737,11 @@ func (r *goRouteResolver) nonRouterStringSpans() [][2]int {
 				}
 			}
 		case *ast.Field:
-			if isType(n.Type, clientTypes) {
-				for _, name := range n.Names {
-					r.step(1)
-					clients[name.Name] = true
-				}
-			}
 			for _, name := range n.Names {
 				r.step(1)
 				otherValues[name.Name] = true
 			}
 		case *ast.ValueSpec:
-			if n.Type != nil && isType(n.Type, clientTypes) {
-				for _, name := range n.Names {
-					r.step(1)
-					clients[name.Name] = true
-				}
-			}
-			for i, value := range n.Values {
-				r.step(1)
-				if i < len(n.Names) && goRouteIsClientLit(value, isType, clientTypes) {
-					clients[n.Names[i].Name] = true
-				}
-			}
 			for i, name := range n.Names {
 				r.step(1)
 				if len(n.Values) == len(n.Names) {
@@ -833,20 +766,11 @@ func (r *goRouteResolver) nonRouterStringSpans() [][2]int {
 				if !ok {
 					continue
 				}
-				if goRouteIsClientLit(value, isType, clientTypes) {
-					clients[ident.Name] = true
-				}
 				noteValue(ident.Name, value)
 			}
 		}
 		return true
 	})
-	for name := range literalValues {
-		r.step(1)
-		if !otherValues[name] {
-			clients[name] = true
-		}
-	}
 	var visit func(node ast.Node, contexts map[string]bool)
 	visit = func(node ast.Node, contexts map[string]bool) {
 		ast.Inspect(node, func(n ast.Node) bool {
@@ -864,7 +788,9 @@ func (r *goRouteResolver) nonRouterStringSpans() [][2]int {
 				switch fun := n.Fun.(type) {
 				case *ast.SelectorExpr:
 					if x, ok := fun.X.(*ast.Ident); ok {
-						if contexts[x.Name] || clients[x.Name] || goRouteClientFuncs[r.framework(x.Name)+"."+fun.Sel.Name] {
+						binding := r.uses[r.offset(x.Pos())]
+						builtHere := literalValues[x.Name] && !otherValues[x.Name]
+						if contexts[x.Name] || binding.httpClient || binding.httpClientType || builtHere || goRouteClientFuncs[r.framework(x.Name)+"."+fun.Sel.Name] {
 							addStrings(n)
 						}
 					} else if inner, ok := fun.X.(*ast.SelectorExpr); ok {
@@ -904,13 +830,4 @@ func (r *goRouteResolver) nonRouterStringSpans() [][2]int {
 	}
 	visit(r.file, map[string]bool{})
 	return spans
-}
-
-func goRouteIsClientLit(expr ast.Expr, isType func(ast.Expr, map[string]bool) bool, table map[string]bool) bool {
-	expr = goRouteUnparen(expr)
-	if unary, ok := expr.(*ast.UnaryExpr); ok && unary.Op == token.AND {
-		expr = goRouteUnparen(unary.X)
-	}
-	lit, ok := expr.(*ast.CompositeLit)
-	return ok && isType(lit.Type, table)
 }
