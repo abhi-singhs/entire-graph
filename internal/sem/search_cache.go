@@ -43,6 +43,7 @@ import (
 // entries cannot cross repository subdirectories or replay older route producers.
 // v23 retires routes omitted by closure-local writes and address escapes.
 // v24 retires bare routes from wrapped mounts and unbounded route masks.
+// v25 retires entries before unresolved route placement and Go 1.22 method patterns.
 const searchSnapshotCacheVersion = "search-snapshot-v25-" + IdentityRevision
 
 type cachedSymbolByteRange struct {
@@ -378,9 +379,6 @@ func loadOrBuildSearchSnapshotPersisting(
 			// a direct cache hit. As with ordinary search caching, this is best effort.
 			if generationKnown {
 				_ = writeSearchSnapshot(entry, newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom, options, selective, ctx))
-			}
-			if options.onCompleteDerivation != nil {
-				options.onCompleteDerivation(full.Header)
 			}
 			if options.onCompleteDerivation != nil {
 				options.onCompleteDerivation(full.Header)
