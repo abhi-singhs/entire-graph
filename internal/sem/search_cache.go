@@ -41,7 +41,8 @@ import (
 // v21 retires malformed-route literal guesses and undisclosed signature-budget loss.
 // v22 retires checkout-path keys and keys the checkout-relative scope, so shared
 // entries cannot cross repository subdirectories or replay older route producers.
-const searchSnapshotCacheVersion = "search-snapshot-v22-" + IdentityRevision
+// v23 retires routes omitted by closure-local writes and address escapes.
+const searchSnapshotCacheVersion = "search-snapshot-v23-" + IdentityRevision
 
 type cachedSymbolByteRange struct {
 	Start int `json:"start"`

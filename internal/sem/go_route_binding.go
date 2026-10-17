@@ -229,7 +229,7 @@ type goRouteClosureRewriteTarget struct {
 type goRouteReceivers struct {
 	parsed bool
 	// exhausted means the walk ran out of its step budget: no receiver in the
-	// file is trusted, so every group-capable registration is omitted.
+	// file is trusted, so every registration is omitted with a snapshot warning.
 	exhausted bool
 	uses      map[int]goRouteBinding
 	// groupNames are names bound to a Group value anywhere in the file. A
@@ -276,13 +276,22 @@ func resolveGoRouteReceiversWithBudget(content string, constants map[string]stri
 	}
 	fset := token.NewFileSet()
 	shift := 0
-	file, err := parser.ParseFile(fset, "", content, parser.SkipObjectResolution|parser.ParseComments)
+	parse := func(input string) (*ast.File, error) {
+		file, err := parser.ParseFile(fset, "", input, parser.ParseComments)
+		if err != nil && strings.Contains(err.Error(), "scope depth") {
+			// Object resolution has a smaller nesting ceiling than syntax parsing.
+			// Keep the conservative analysis and its explicit work budget at that limit.
+			return parser.ParseFile(fset, "", input, parser.SkipObjectResolution|parser.ParseComments)
+		}
+		return file, err
+	}
+	file, err := parse(content)
 	if err != nil {
 		// Fragments without a package clause are still worth resolving. A file
 		// that does not parse either way keeps the name-based fallback.
 		const clause = "package routes\n"
 		fset = token.NewFileSet()
-		file, err = parser.ParseFile(fset, "", clause+content, parser.SkipObjectResolution|parser.ParseComments)
+		file, err = parse(clause + content)
 		if err != nil {
 			// Token recovery may keep named registrations, but generic literal
 			// inference must not revisit comments, group prefixes or unknown scopes.
@@ -583,7 +592,7 @@ func (r *goRouteResolver) walkFile() {
 			if decl.Body == nil {
 				continue
 			}
-			r.fnWritten = r.writtenNames(decl.Body)
+			r.fnWritten = r.collectWrittenNames(decl.Body, true)
 			r.paramFunc = decl.Name.Name
 			r.paramRecv = goRouteRecvTypeName(decl.Recv)
 			r.walkFunc(decl.Recv, decl.Type, decl.Body, pkg, nil)
@@ -591,7 +600,7 @@ func (r *goRouteResolver) walkFile() {
 			if decl.Tok != token.VAR {
 				continue
 			}
-			r.fnWritten = r.writtenNames(decl)
+			r.fnWritten = r.collectWrittenNames(decl, true)
 			r.atPackage = true
 			for _, spec := range decl.Specs {
 				if valueSpec, ok := spec.(*ast.ValueSpec); ok {
@@ -1897,7 +1906,7 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 	}
 	r.undo(mark)
 	if deferred {
-		written := r.writtenNames(lit.Body)
+		written := r.writtenNames(lit)
 		for _, capture := range captures {
 			r.step(1)
 			_, isWritten := written[capture.name]
@@ -1919,12 +1928,12 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 				r.applyClosureEffect(effect)
 			}
 		}
-		for name := range r.addressedNames(lit.Body) {
+		for name := range r.addressedNames(lit) {
 			r.escape(scope, name)
 		}
 		return
 	}
-	r.markNames(scope, r.writtenNames(lit.Body), false)
+	r.markNames(scope, r.writtenNames(lit), false)
 	for _, capture := range captures {
 		r.step(1)
 		value := *capture.outer
@@ -1952,7 +1961,7 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 			r.set(capture.name, capture.outer, value)
 		}
 	}
-	for name := range r.addressedNames(lit.Body) {
+	for name := range r.addressedNames(lit) {
 		r.escape(scope, name)
 	}
 }
@@ -1988,6 +1997,12 @@ func (r *goRouteResolver) addressedNames(node ast.Node) map[string]bool {
 		r.step(1)
 		if unary, ok := n.(*ast.UnaryExpr); ok && unary.Op == token.AND {
 			if ident, ok := goRouteUnparen(unary.X).(*ast.Ident); ok {
+				// A closure-local declaration cannot escape an enclosing namesake.
+				if ident.Obj != nil {
+					if declaration, ok := ident.Obj.Decl.(ast.Node); ok && declaration.Pos() >= node.Pos() && declaration.End() <= node.End() {
+						return true
+					}
+				}
 				names[ident.Name] = true
 			}
 		}
@@ -2011,12 +2026,22 @@ func goRouteUnparen(expr ast.Expr) ast.Expr {
 // true when some write could carry a router group (an identifier, a Group call,
 // or an unpaired multi-value assignment).
 func (r *goRouteResolver) writtenNames(node ast.Node) map[string]bool {
+	return r.collectWrittenNames(node, false)
+}
+
+func (r *goRouteResolver) collectWrittenNames(node ast.Node, includeLocal bool) map[string]bool {
 	written := map[string]bool{}
 	if node == nil {
 		return written
 	}
 	note := func(expr ast.Expr, groupish bool) {
 		if ident, ok := expr.(*ast.Ident); ok && ident.Name != "_" {
+			// Only writes to bindings outside this subtree can invalidate its scope.
+			if !includeLocal && ident.Obj != nil {
+				if declaration, ok := ident.Obj.Decl.(ast.Node); ok && declaration.Pos() >= node.Pos() && declaration.End() <= node.End() {
+					return
+				}
+			}
 			written[ident.Name] = written[ident.Name] || groupish
 		}
 	}

@@ -34,7 +34,8 @@ import (
 // v16 retires checkout-path keys and carries checkout roots plus relative scopes
 // for safe cross-worktree replay, and binds captured co-change history without
 // reusing older route-producer entries.
-const providerRecordsCacheVersion = "provider-records-v16-" + IdentityRevision
+// v17 retires routes omitted by closure-local writes and address escapes.
+const providerRecordsCacheVersion = "provider-records-v17-" + IdentityRevision
 
 // cachedProviderRecords is the on-disk envelope for a cached record stream. The
 // key alone is authoritative (sha256 over version+commit+tree+mode+profile+
