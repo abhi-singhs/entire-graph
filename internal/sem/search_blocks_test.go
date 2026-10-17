@@ -5,22 +5,64 @@ import (
 	"testing"
 )
 
+func TestContextBlockBudgetValidatesFileOutlineCostAndCap(t *testing.T) {
+	outline := []SearchFileOutline{{FilePath: "a.go"}}
+	baseCost := SearchFileOutlineCost(outline)
+	for _, tc := range []struct {
+		name              string
+		pathBytes, offset int
+		omit              bool
+		want              string
+	}{
+		{name: "valid additive outline", pathBytes: len("a.go")},
+		{name: "exact cap", pathBytes: len("a.go") + searchOutlineMaxBytes - baseCost},
+		{name: "underreported", pathBytes: len("a.go"), offset: -1, want: "file outline byte accounting mismatch"},
+		{name: "missing body", pathBytes: len("a.go"), omit: true, want: "file outline byte accounting mismatch"},
+		{name: "over cap", pathBytes: len("a.go") + searchOutlineMaxBytes - baseCost + 1, want: "file outline exceeds its allowance"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			outlines := []SearchFileOutline{{FilePath: strings.Repeat("a", tc.pathBytes)}}
+			response := SearchResponse{FileOutlines: outlines, Stats: SearchStats{
+				ResultBytes: 1000, ContextBudgetBytes: 1000,
+				FileOutlineBytes: SearchFileOutlineCost(outlines) + tc.offset,
+			}}
+			if tc.omit {
+				response.FileOutlines = nil
+			}
+			response.Stats.ContextBlockBytes = searchContextBlockBytes(response.Stats)
+			err := validateSearchContextBlockBudget(response)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestSearchAuxiliaryBlocksShareResultSlots(t *testing.T) {
 	for _, tc := range []struct {
 		name                                string
 		coveringFirst, distinctRelatedFiles bool
+		calleeOverflow                      bool
 		wantRelated                         int
 	}{
 		{name: "related first with distinct files", distinctRelatedFiles: true, wantRelated: 2},
 		{name: "covering first with distinct files", coveringFirst: true, distinctRelatedFiles: true, wantRelated: 2},
 		{name: "covering may replace a redundant related locator", wantRelated: 1},
 		{name: "related cannot replace covering test", coveringFirst: true, wantRelated: 2},
+		{name: "callee overflow stays outside shared normal slots", distinctRelatedFiles: true, calleeOverflow: true, wantRelated: 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			results := mergeTestResults(10, "head source")
 			for _, index := range []int{5, 7, 8} {
 				results[index].FilePath = results[0].FilePath
 				results[index].Snippet = strings.Repeat("x", 1200)
+			}
+			if tc.calleeOverflow {
+				results = append(results, contractCalleeEntry(len(results)+1))
 			}
 			entry := contractTestEntry()
 			sites := []searchRelatedSite{mergeTestSite("alpha", 3), mergeTestSite("beta", 11)}
@@ -33,8 +75,9 @@ func TestSearchAuxiliaryBlocksShareResultSlots(t *testing.T) {
 			addCovering := func() {
 				var count int
 				results, _, _, count, _ = mergeSearchContractContext(results, searchContractContext{test: &entry}, 0, 10)
-				if count != 1 || len(results) > 10 {
-					t.Errorf("covering merge: tests=%d results=%d, want 1 and <=10", count, len(results))
+				if count != 1 || countNormalResultsForTest(results) > 10 {
+					t.Errorf("covering merge: tests=%d results=%d normal=%d, want 1 and <=10 normal",
+						count, len(results), countNormalResultsForTest(results))
 				}
 			}
 			if tc.coveringFirst {
@@ -42,8 +85,9 @@ func TestSearchAuxiliaryBlocksShareResultSlots(t *testing.T) {
 			}
 			var count int
 			results, count = mergeSearchRelatedSites(results, sites, fixture.reader(), 0, 10)
-			if count != 2 || len(results) > 10 {
-				t.Errorf("related merge: sites=%d results=%d, want 2 and <=10", count, len(results))
+			if count != 2 || countNormalResultsForTest(results) > 10 {
+				t.Errorf("related merge: sites=%d results=%d normal=%d, want 2 and <=10 normal",
+					count, len(results), countNormalResultsForTest(results))
 			}
 			if !tc.coveringFirst {
 				addCovering()
@@ -55,8 +99,13 @@ func TestSearchAuxiliaryBlocksShareResultSlots(t *testing.T) {
 					t.Errorf("rank %d at index %d", result.Rank, index)
 				}
 			}
-			if len(results) != 10 || sections[searchSectionCoveringTest] != 1 || sections[searchSectionRelated] != tc.wantRelated {
-				t.Errorf("final results=%d sections=%v, want 10 with 1 covering test and %d related sites", len(results), sections, tc.wantRelated)
+			wantTotal := 10
+			if tc.calleeOverflow {
+				wantTotal++
+			}
+			if len(results) != wantTotal || countNormalResultsForTest(results) != 10 || sections[searchSectionCoveringTest] != 1 || sections[searchSectionRelated] != tc.wantRelated {
+				t.Errorf("final results=%d normal=%d sections=%v, want %d with 10 normal, 1 covering test and %d related sites",
+					len(results), countNormalResultsForTest(results), sections, wantTotal, tc.wantRelated)
 			}
 			for index := 0; index < 5; index++ {
 				if results[index].FilePath != original[index].FilePath || results[index].Snippet != original[index].Snippet {
@@ -202,13 +251,39 @@ func TestContextBlockBudgetExcludesTheAdditiveContainerMap(t *testing.T) {
 	}
 }
 
-// TestContextBlockBytesAccountsEveryBlock pins that the one summary counter really is the sum, so a
-// reader who trusts stats.context_block_bytes is not being told a partial truth.
+// TestContextBlockBytesAccountsEveryBlock pins that the one summary counter really is the sum of
+// every COSTED block, so a reader who trusts stats.context_block_bytes is not being told a partial
+// truth. The file outline is included explicitly: it is built, emitted and priced, and it was the
+// one block with a *Bytes counter that the summary silently left out.
 func TestContextBlockBytesAccountsEveryBlock(t *testing.T) {
 	t.Parallel()
-	stats := SearchStats{SignatureTypeBytes: 11, TypeCardBytes: 22, ContainerMapBytes: 33}
-	if total := searchContextBlockBytes(stats); total != 66 {
-		t.Fatalf("context block bytes = %d, want 66 (11+22+33)", total)
+	stats := SearchStats{
+		SignatureTypeBytes:  11,
+		TypeCardBytes:       22,
+		ContainerMapBytes:   33,
+		LiteralClusterBytes: 44,
+		FileOutlineBytes:    55,
+		VerifyCommandBytes:  66,
+		ClosedSetBytes:      77,
+	}
+	if total := searchContextBlockBytes(stats); total != 308 {
+		t.Fatalf("context block bytes = %d, want 308 (11+22+33+44+55+66+77)", total)
+	}
+	// Every *Bytes counter that prices a block outside `results` has to be in that sum. A new
+	// block whose cost is declared but not totalled is free in every report — which is exactly how
+	// the file outline went unaccounted.
+	for name, only := range map[string]SearchStats{
+		"signature types": {SignatureTypeBytes: 7},
+		"type card":       {TypeCardBytes: 7},
+		"container map":   {ContainerMapBytes: 7},
+		"literal cluster": {LiteralClusterBytes: 7},
+		"file outline":    {FileOutlineBytes: 7},
+		"verify command":  {VerifyCommandBytes: 7},
+		"closed set":      {ClosedSetBytes: 7},
+	} {
+		if got := searchContextBlockBytes(only); got != 7 {
+			t.Fatalf("the %s block contributes %d to context_block_bytes, want 7", name, got)
+		}
 	}
 	// A mismatched summary must be caught, not tolerated: it is the number that makes the cost
 	// of the integration attributable.
