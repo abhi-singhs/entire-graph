@@ -1,7 +1,6 @@
 package sem
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -51,7 +50,7 @@ func TestReview312OuterSetterInvokedBySeededCallback(t *testing.T) {
 func TestReview312ReassignedSetterInvokedByCapturedProxy(t *testing.T) {
 	for _, rewrite := range []bool{true, false} {
 		source := review312OuterSetterCallbackSource(rewrite)
-		source = strings.Replace(source, "\tr.Group(", "\tset = set\n\tr.Group(", 1)
+		source = review312Replace(t, source, "\tr.Group(", "\tset = set\n\tr.Group(", 1)
 		review312AssertSeededCallbackRoutes(t, source, !rewrite)
 	}
 }
