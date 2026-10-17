@@ -1,6 +1,9 @@
 package sem
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,12 +18,17 @@ import (
 // nobody has written yet. It is the only round-six test that compiles against
 // the pre-fix tree, so it is also the runtime-failing evidence for the class.
 
-// unbudgetedParseAllowlist is the ONE place in this package allowed to root a
-// parse at context.Background: the documented entry point for callers that are
-// not under a wall-clock budget at all. Everything else must take the caller's
-// context, or an expiring budget cannot reach the cgo parse it starts.
+// Unbudgeted parsing has one explicit entry point. Three legacy cache helpers
+// also accept omitted contexts; all production paths supply the caller context.
+// They never parse source. The allowlist is scoped to each function so another
+// background context in the same file cannot silently pass this guard.
+// TestCheckoutScopeLookupHonorsCallerCancellation and
+// TestRecordsCacheLoadHonorsCallerCancellation verify the cache call paths.
 var unbudgetedParseAllowlist = map[string]string{
-	"parser.go": "return TreeSitterParser{}.ParseWithStatusCtx(context.Background(), path, content)",
+	"parser.go.ParseWithStatus":                    "return TreeSitterParser{}.ParseWithStatusCtx(context.Background(), path, content)",
+	"search_cache.go.cacheCheckoutScope":           "ctx := context.Background()",
+	"search_cache.go.loadCachedSearchSnapshot":     "ctx := context.Background()",
+	"records_cache.go.providerRecordsKeyForSchema": "ctx := context.Background()",
 }
 
 // TestTF142R6NoUnbudgetedParseContext closes the CLASS the three round-six
@@ -44,13 +52,26 @@ func TestTF142R6NoUnbudgetedParseContext(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
 		}
+		fset := token.NewFileSet()
+		parsed, err := parser.ParseFile(fset, name, body, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		owner := func(line int) string {
+			for _, decl := range parsed.Decls {
+				if fn, ok := decl.(*ast.FuncDecl); ok && fset.Position(fn.Pos()).Line <= line && fset.Position(fn.End()).Line >= line {
+					return name + "." + fn.Name.Name
+				}
+			}
+			return name
+		}
 		scanned++
 		for i, line := range strings.Split(string(body), "\n") {
 			trimmed := strings.TrimSpace(line)
 			if strings.HasPrefix(trimmed, "//") || !strings.Contains(trimmed, "context.Background()") {
 				continue
 			}
-			if unbudgetedParseAllowlist[name] == trimmed {
+			if unbudgetedParseAllowlist[owner(i+1)] == trimmed {
 				continue
 			}
 			t.Errorf("%s:%d starts a context the caller's wall-clock budget cannot reach: %s\n"+

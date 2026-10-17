@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/entireio/entire-graph/internal/gitutil"
 )
 
 // searchSnapshotCacheVersion names the on-disk cache directory and is hashed
@@ -28,7 +30,21 @@ import (
 // nested beneath the complete entry it came from, which would otherwise sit
 // unreachable inside a live version directory and defeat that cleanup rule.
 // v16 retires the diagnostic-count status in favor of source-file health.
-const searchSnapshotCacheVersion = "search-snapshot-v16-" + IdentityRevision
+// v17 retired entries written before symbols carried the parser's name line, which renderers
+// anchor on; an older entry would silently send every symbol back to the text heuristic. v18
+// retires v17 entries, whose name lines came from a producer that could record a wrong POSITIVE
+// line (a return-type tag, a typedef alias's neighbour, a qualifier spelled like its member):
+// nothing else in the key binds the producer's code — the provider version is "dev" for every
+// local build — so only the namespace can keep those lines from being served as authoritative.
+// Bump it again whenever the name-line producer's rules change.
+// v19 retires route edges from the old sixteen-round parameter-taint cutoff.
+// v20 retires warning text that incorrectly described every command family as worktree-default.
+// v21 retires malformed-route literal guesses and undisclosed signature-budget loss.
+// v22 retires checkout-path keys and keys the checkout-relative scope, so shared
+// entries cannot cross repository subdirectories or replay older route producers.
+// v23 retires routes omitted by closure-local writes and address escapes.
+// v24 retires bare routes from wrapped mounts and unbounded route masks.
+const searchSnapshotCacheVersion = "search-snapshot-v24-" + IdentityRevision
 
 type cachedSymbolByteRange struct {
 	Start int `json:"start"`
@@ -67,6 +83,10 @@ type cachedSearchSnapshot struct {
 	// derivation reruns that resolution over cached symbols. Without it a cache
 	// hit would downgrade an overloaded call that a cold run resolves exactly.
 	BodylessSymbolIDs []string `json:"bodyless_symbol_ids,omitempty"`
+	// SymbolNameLines carries SymbolRecord.nameLine, the parser's line for each symbol's name
+	// token, which search copies to SearchResult.SymbolNameLine. Without it a warm cache would
+	// answer with the text heuristic where a cold run anchors on the parse tree.
+	SymbolNameLines map[string]int `json:"symbol_name_lines,omitempty"`
 	// DerivedFrom is the generation of the complete entry this selective view was
 	// derived from, empty on a complete entry. Removing the derived directory
 	// cannot stop a derivation that read the OUTGOING complete snapshot before
@@ -76,6 +96,15 @@ type cachedSearchSnapshot struct {
 	// it came from does, and the generation is read before the complete snapshot
 	// is, so such a writer necessarily stamps the generation being retired.
 	DerivedFrom string `json:"derived_from,omitempty"`
+	// RepoScope is the checkout-relative scope the snapshot was built for
+	// (cacheCheckoutScope of Header.RepoRoot). The key already carries it; the
+	// loader re-checks it before restamping Header.RepoRoot for another checkout,
+	// so a root is only ever rewritten between two checkouts of the same scope.
+	RepoScope string `json:"repo_scope,omitempty"`
+	// UnmergedDataFlowEdges carries ProviderSnapshot.unmergedDataFlowEdges as
+	// sorted [from, to] pairs, so a view derived from a cached snapshot discloses
+	// the unmerged DATA_FLOWS edges it retains exactly as one derived in memory.
+	UnmergedDataFlowEdges [][2]string `json:"unmerged_data_flow_edges,omitempty"`
 }
 
 type cachedSignatureTypes struct {
@@ -182,7 +211,7 @@ func loadCachedCompleteSearchSnapshotBinding(
 	if fullOptions.Profile == "" {
 		fullOptions.Profile = ProfileFull
 	}
-	fullKey, keyErr := searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, fullOptions)
+	fullKey, keyErr := searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, fullOptions, ctx)
 	if keyErr != nil {
 		return preloadedCompleteSnapshot{}, false, keyErr
 	}
@@ -196,14 +225,10 @@ func loadCachedCompleteSearchSnapshotBinding(
 	if entryErr != nil {
 		return preloadedCompleteSnapshot{}, false, entryErr
 	}
-	cached, readErr := readSearchSnapshot(fullEntry)
-	if readErr != nil || !validCachedSearchSnapshot(cached, repositoryKey, providerVersion, tree, fullOptions) {
+	cached, ok := loadCachedSearchSnapshot(fullEntry, absRepo, commit, repositoryKey, providerVersion, tree, fullOptions, ctx)
+	if !ok {
 		return preloadedCompleteSnapshot{}, false, nil
 	}
-	// The cache key is tree-only: a hit may have been built for a different
-	// commit that shares this tree. The parsed graph is exactly correct, but
-	// commit provenance must reflect the HEAD we are serving right now.
-	cached = restampCachedSearchSnapshotCommit(cached, commit)
 	return preloadedCompleteSnapshot{
 		snapshot:        cached.Snapshot,
 		generation:      generation,
@@ -215,9 +240,10 @@ func loadCachedCompleteSearchSnapshotBinding(
 // resolves HEAD and the repository key once, serves a valid per-query cache
 // entry first, otherwise derives a selective view from a complete
 // committed-tree snapshot (the optional preloadedFull already in memory, then
-// the on-disk complete entry) and persists it, and finally falls back to a
-// fresh build. Derivation failures are soft so an optional cache can never
-// break retrieval.
+// the on-disk complete entry) and persists it, then, for a repository small
+// enough, builds and persists the complete snapshot and derives from that, and
+// finally falls back to a fresh selective build. Derivation failures are soft so
+// an optional cache can never break retrieval.
 func loadOrBuildSearchSnapshot(
 	ctx context.Context,
 	repo, providerVersion string,
@@ -281,7 +307,7 @@ func loadOrBuildSearchSnapshotPersisting(
 	// had asked to be rid of.
 	completeOptions := options
 	completeOptions.OnlyFiles = nil
-	completeKey, err := searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, completeOptions)
+	completeKey, err := searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, completeOptions, ctx)
 	if err != nil {
 		return ProviderSnapshot{}, false, err
 	}
@@ -315,7 +341,7 @@ func loadOrBuildSearchSnapshotPersisting(
 			generationKnown = false
 		}
 		derivedFrom = generation
-		key, err = searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, options)
+		key, err = searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, options, ctx)
 		if err != nil {
 			return ProviderSnapshot{}, false, err
 		}
@@ -324,18 +350,16 @@ func loadOrBuildSearchSnapshotPersisting(
 			return ProviderSnapshot{}, false, err
 		}
 	}
-	if cached, err := readSearchSnapshot(entry); generationKnown && err == nil &&
-		validCachedSearchSnapshot(cached, repositoryKey, providerVersion, tree, options) &&
-		cached.DerivedFrom == derivedFrom {
-		// See loadCachedCompleteSearchSnapshot: tree-only keying means this hit
-		// may belong to a different commit that shares the tree. Re-stamp before
-		// handing it back so no caller ever reports a stale commit.
-		cached = restampCachedSearchSnapshotCommit(cached, commit)
-		return cached.Snapshot, true, nil
+	if generationKnown {
+		if cached, ok := loadCachedSearchSnapshot(entry, absRepo, commit, repositoryKey, providerVersion, tree, options, ctx); ok &&
+			cached.DerivedFrom == derivedFrom {
+			return cached.Snapshot, true, nil
+		}
 	}
 	// A complete committed-tree snapshot is query independent and can serve a
 	// selective search without rebuilding the same tree for every query. Keep
-	// the selective view so cache presence cannot change retrieval semantics.
+	// the selected file/symbol scope; relation resolution uses the complete graph
+	// and may omit guesses from a selection-only build, as documented below.
 	if len(options.OnlyFiles) > 0 {
 		deriveFromFull := func(full ProviderSnapshot) (ProviderSnapshot, bool) {
 			selective, deriveErr := selectiveSearchSnapshotFromFull(ctx, absRepo, providerVersion, options, full)
@@ -354,7 +378,10 @@ func loadOrBuildSearchSnapshotPersisting(
 			// Persisting the exact selective view makes repeated identical queries
 			// a direct cache hit. As with ordinary search caching, this is best effort.
 			if generationKnown {
-				_ = writeSearchSnapshot(entry, newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom, options, selective))
+				_ = writeSearchSnapshot(entry, newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom, options, selective, ctx))
+			}
+			if options.onCompleteDerivation != nil {
+				options.onCompleteDerivation(full.Header)
 			}
 			return selective, true
 		}
@@ -381,11 +408,84 @@ func loadOrBuildSearchSnapshotPersisting(
 		if entryErr != nil {
 			return ProviderSnapshot{}, false, entryErr
 		}
-		if cached, readErr := readSearchSnapshot(fullEntry); readErr == nil && validCachedSearchSnapshot(cached, repositoryKey, providerVersion, tree, completeOptions) {
-			cached = restampCachedSearchSnapshotCommit(cached, commit)
+		if cached, ok := loadCachedSearchSnapshot(fullEntry, absRepo, commit, repositoryKey, providerVersion, tree, completeOptions, ctx); ok {
 			if selective, ok := deriveFromFull(cached.Snapshot); ok {
 				return selective, true, nil
 			}
+		}
+		// Nothing complete to derive from. Build the complete snapshot instead of
+		// this query's selection, persist it, and derive the selection from it, so
+		// the NEXT query on this tree, whatever it asks, is a hit. Persisting only
+		// the selective view, as before, left every other query to rebuild: on this
+		// repository a cold query cost 16.2s and the next DIFFERENT query 16.5s.
+		// The complete build costs a few seconds more than the selective one, once.
+		//
+		// Bounded by repository size (coldCompleteSnapshotMaxFiles): on a large
+		// repository the complete build is the cost `index` exists to pay ahead of
+		// time, and charging it to an interactive query that selected a few dozen
+		// files would turn a seconds-long cold query into minutes.
+		//
+		// Never when the caller bounded cold parsing itself (--max-indexed-files):
+		// the complete build parses every file regardless of that bound, so it
+		// would turn the flag's promise into its opposite. Measured on an 838-file
+		// repository at --max-indexed-files 5: 21.0s and a 2.8MB complete entry,
+		// against 0.3s uncached. The default pool is not such a bound and keeps
+		// the complete build, which is what makes the next different query a hit.
+		if persistBuilt && generationKnown && !options.coldComplete.disabled &&
+			completeSnapshotAffordableOnColdQuery(ctx, absRepo, completeOptions) {
+			selective, hit, done, buildErr := func() (ProviderSnapshot, bool, bool, error) {
+				// Concurrent cold queries on this tree, typically parallel agents in
+				// separate processes, would each build the same complete snapshot.
+				// The first to take the lock builds and publishes it; the others
+				// wait, then find it below and derive from it as a cache hit.
+				lock, lockErr := acquireCompleteBuildLock(ctx, cacheDir, "search", searchSnapshotCacheVersion, completeKey)
+				if lockErr != nil {
+					return ProviderSnapshot{}, false, true, lockErr
+				}
+				defer lock.release()
+				if cached, ok := loadCachedSearchSnapshot(fullEntry, absRepo, commit, repositoryKey, providerVersion, tree, completeOptions, ctx); ok {
+					if selective, ok := deriveFromFull(cached.Snapshot); ok {
+						return selective, true, true, nil
+					}
+				}
+				if beforeColdCompleteBuild != nil {
+					beforeColdCompleteBuild()
+				}
+				full, buildErr := BuildProviderSnapshotWithOptions(ctx, repo, providerVersion, completeOptions)
+				if buildErr != nil && ctx.Err() != nil {
+					return ProviderSnapshot{}, false, true, buildErr
+				}
+				if buildErr == nil && validateBuiltSearchSnapshot(full, repositoryKey, providerVersion, tree, completeOptions) == nil {
+					full.Header.Commit = commit
+					// Best effort, like every query-time store: an unwritable cache
+					// still serves this query from the snapshot in memory.
+					_ = writeSearchSnapshot(fullEntry, newCachedSearchSnapshot(providerVersion, commit, tree, completeOptions, full, ctx))
+					if selective, ok := deriveFromFull(full); ok {
+						return selective, false, true, nil
+					}
+				}
+				return ProviderSnapshot{}, false, false, nil
+			}()
+			if done {
+				return selective, hit, buildErr
+			}
+		}
+	}
+	// A complete query that missed builds exactly the artifact a concurrent cold
+	// query on the same tree is building, so it takes the same lock and re-checks
+	// the entry once it holds it.
+	if len(options.OnlyFiles) == 0 && persistBuilt && generationKnown {
+		lock, lockErr := acquireCompleteBuildLock(ctx, cacheDir, "search", searchSnapshotCacheVersion, completeKey)
+		if lockErr != nil {
+			return ProviderSnapshot{}, false, lockErr
+		}
+		defer lock.release()
+		if cached, ok := loadCachedSearchSnapshot(entry, absRepo, commit, repositoryKey, providerVersion, tree, options, ctx); ok &&
+			cached.DerivedFrom == derivedFrom {
+			return cached.Snapshot, true, nil
+		}
+		if beforeColdCompleteBuild != nil {
+			beforeColdCompleteBuild()
 		}
 	}
 	snapshot, err := BuildProviderSnapshotWithOptions(ctx, repo, providerVersion, options)
@@ -406,9 +506,38 @@ func loadOrBuildSearchSnapshotPersisting(
 	// Cache persistence is best effort. Retrieval correctness never depends on
 	// a writable cache directory.
 	if generationKnown && persistBuilt {
-		_ = writeSearchSnapshot(entry, newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom, options, snapshot))
+		_ = writeSearchSnapshot(entry, newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom, options, snapshot, ctx))
 	}
 	return snapshot, false, nil
+}
+
+// coldCompleteSnapshotMaxFiles is the largest repository, in source files after
+// ignore rules and the file cap, for which a cold selective query builds and
+// persists the complete snapshot rather than only its selection. This repository
+// (~870 files) builds its complete snapshot in about 16s at GOMAXPROCS=2. A var
+// so a test can lower it.
+var coldCompleteSnapshotMaxFiles = 3000
+
+// completeSnapshotAffordableOnColdQuery reports whether a complete build has few
+// enough files to run on a cold query. A search has already listed exactly those
+// files for preselection, with the same ignore rules and file cap, and passes
+// the count in options.coldComplete.sourceFiles; listing the tree a second time
+// was most of the miss cost on a large repository (a 50k-file repository's cold
+// index latency went from ~1.1s to ~2.0s for an answer that is always no).
+// Without a count it lists the files itself. A listing failure answers no: the
+// selective build then reports it.
+func completeSnapshotAffordableOnColdQuery(ctx context.Context, absRepo string, options ProviderSnapshotOptions) bool {
+	if known := options.coldComplete.sourceFiles; known > 0 {
+		return known <= coldCompleteSnapshotMaxFiles
+	}
+	source, err := prepareSource(ctx, absRepo, options)
+	if err != nil {
+		return false
+	}
+	if source.close != nil {
+		defer source.close()
+	}
+	return len(source.paths) <= coldCompleteSnapshotMaxFiles
 }
 
 // loadOrDeriveSelectiveSearchSnapshot serves a selective query from an
@@ -512,7 +641,7 @@ func preindexProviderSnapshotWithPersistenceVerifier(
 	// command promises a durable artifact: persist it here with any error
 	// surfaced, then prove the entry a later query will open holds exactly those
 	// bytes.
-	key, err := searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, options)
+	key, err := searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, options, ctx)
 	if err != nil {
 		return ProviderSnapshot{}, false, err
 	}
@@ -520,7 +649,7 @@ func preindexProviderSnapshotWithPersistenceVerifier(
 	if err != nil {
 		return ProviderSnapshot{}, false, err
 	}
-	cache := newCachedSearchSnapshot(providerVersion, commit, tree, options, snapshot)
+	cache := newCachedSearchSnapshot(providerVersion, commit, tree, options, snapshot, ctx)
 	if err := persistVerifiedSearchSnapshot(entry, cache, readPersistedDigest); err != nil {
 		return ProviderSnapshot{}, false, fmt.Errorf("persist preindex snapshot: %w", err)
 	}
@@ -619,11 +748,11 @@ func validateBuiltSearchSnapshot(
 	return nil
 }
 
-func newCachedSearchSnapshot(providerVersion, commit, tree string, options ProviderSnapshotOptions, snapshot ProviderSnapshot) cachedSearchSnapshot {
-	return newCachedSearchSnapshotFrom(providerVersion, commit, tree, "", options, snapshot)
+func newCachedSearchSnapshot(providerVersion, commit, tree string, options ProviderSnapshotOptions, snapshot ProviderSnapshot, contexts ...context.Context) cachedSearchSnapshot {
+	return newCachedSearchSnapshotFrom(providerVersion, commit, tree, "", options, snapshot, contexts...)
 }
 
-func newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom string, options ProviderSnapshotOptions, snapshot ProviderSnapshot) cachedSearchSnapshot {
+func newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom string, options ProviderSnapshotOptions, snapshot ProviderSnapshot, contexts ...context.Context) cachedSearchSnapshot {
 	cache := cachedSearchSnapshot{
 		DerivedFrom:     derivedFrom,
 		CacheVersion:    searchSnapshotCacheVersion,
@@ -633,8 +762,17 @@ func newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom stri
 		Profile:         options.Profile,
 		MaxParseBytes:   options.MaxParseBytes,
 		Worktree:        options.Worktree,
+		RepoScope:       cacheCheckoutScope(snapshot.Header.RepoRoot, contexts...),
 		Snapshot:        snapshot,
 	}
+	for key := range snapshot.unmergedDataFlowEdges {
+		fromID, toID, _ := strings.Cut(key, "\x00")
+		cache.UnmergedDataFlowEdges = append(cache.UnmergedDataFlowEdges, [2]string{fromID, toID})
+	}
+	sort.Slice(cache.UnmergedDataFlowEdges, func(i, j int) bool {
+		left, right := cache.UnmergedDataFlowEdges[i], cache.UnmergedDataFlowEdges[j]
+		return left[0] < right[0] || (left[0] == right[0] && left[1] < right[1])
+	})
 	for _, file := range snapshot.Files {
 		if file.Lines == 0 {
 			continue
@@ -650,6 +788,12 @@ func newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom stri
 		}
 		if symbol.bodyless {
 			cache.BodylessSymbolIDs = append(cache.BodylessSymbolIDs, symbol.ID)
+		}
+		if symbol.nameLine > 0 {
+			if cache.SymbolNameLines == nil {
+				cache.SymbolNameLines = make(map[string]int)
+			}
+			cache.SymbolNameLines[symbol.ID] = symbol.nameLine
 		}
 		if symbol.sourceEndByte > symbol.sourceStartByte {
 			if cache.SymbolByteRanges == nil {
@@ -683,6 +827,12 @@ func newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom stri
 }
 
 func restoreCachedSearchInternals(cache *cachedSearchSnapshot) {
+	for _, edge := range cache.UnmergedDataFlowEdges {
+		if cache.Snapshot.unmergedDataFlowEdges == nil {
+			cache.Snapshot.unmergedDataFlowEdges = map[string]struct{}{}
+		}
+		cache.Snapshot.unmergedDataFlowEdges[unmergedDataFlowEdgeKey(edge[0], edge[1])] = struct{}{}
+	}
 	for index := range cache.Snapshot.Files {
 		cache.Snapshot.Files[index].Lines = cache.FileLines[cache.Snapshot.Files[index].ID]
 	}
@@ -702,6 +852,7 @@ func restoreCachedSearchInternals(cache *cachedSearchSnapshot) {
 		symbol := &cache.Snapshot.Symbols[index]
 		symbol.Local = localIDs[symbol.ID]
 		symbol.bodyless = bodylessIDs[symbol.ID]
+		symbol.nameLine = cache.SymbolNameLines[symbol.ID]
 		if sourceRange, ok := cache.SymbolByteRanges[symbol.ID]; ok && sourceRange.End > sourceRange.Start {
 			symbol.sourceStartByte = sourceRange.Start
 			symbol.sourceEndByte = sourceRange.End
@@ -723,11 +874,6 @@ func restoreCachedSearchInternals(cache *cachedSearchSnapshot) {
 // path's cost unchanged while bounding the residual to one stride.
 const budgetPollStride = 1024
 
-// selectiveSearchSnapshotFromFull derives the same graph that a fresh
-// OnlyFiles build would produce. It reuses cached parse output, but deliberately
-// reruns relation resolution against only the selected symbols: simply dropping
-// cross-boundary edges from a complete graph is wrong because an OnlyFiles build
-// externalizes those targets and records different resolution metadata.
 // filterFilesAndSymbolsForBudget filters fullFiles and fullSymbols down to
 // the files allowedFiles admits, in lockstep, stopping as soon as stop
 // reports true.
@@ -783,6 +929,27 @@ func filterFilesAndSymbolsForBudget(fullFiles []FileRecord, fullSymbols []Symbol
 	return files, symbols, true
 }
 
+// selectiveSearchSnapshotFromFull derives the selective view of a complete
+// snapshot: the selected files, their symbols, and the complete graph's
+// relations FILTERED to those that start at a selected file or symbol and end at
+// a selected one or at an `external:` target. It reuses the complete snapshot's
+// relation resolution instead of rerunning it. This avoids re-extracting the
+// selected files' relations. Performance depends on the repository, profile and
+// selected scope; the historical prototype timings are not a latency guarantee.
+//
+// The result is a subset of what a fresh OnlyFiles build of the same selection
+// produces, and the difference is deliberate. A fresh selective build resolves
+// names against the SELECTION, so where the real target lies outside it, it
+// either externalizes the edge (`external:` target, no symbol to rank or quote)
+// or falls back to a weaker same-named candidate that happens to be selected (a
+// name_only/pattern CALLS, a representative-file IMPORTS, a SIMILAR_TO chosen
+// among the selected bodies only, a name_only type edge where the complete graph
+// resolved it by package). The complete graph resolved every one of those against
+// the whole tree, so the filtered view keeps the complete graph's answer and
+// drops the edge whose answer lies outside the selection. This is not whole-
+// snapshot equality with an uncached OnlyFiles build. Tests pin both retained
+// and dropped relation classes and exact ranked results for selected fixtures;
+// they do not establish universal ranking parity across arbitrary queries.
 func selectiveSearchSnapshotFromFull(
 	ctx context.Context,
 	repo, providerVersion string,
@@ -803,7 +970,7 @@ func selectiveSearchSnapshotFromFull(
 	// The ceiling has to be derived HERE, not only inside
 	// BuildProviderSnapshotWithOptions. On a cold cache the caller falls
 	// through to that build and is bounded; on a warm complete snapshot this
-	// derivation re-runs the entire relation phase instead. Observing only the
+	// derivation filters its cached files, symbols and relations instead. Observing only the
 	// caller's context therefore made the SAME call with the SAME options
 	// bounded or unbounded purely as a function of cache state -- measured on a
 	// 500-function nested fixture, a 1 ns budget still built 385,137 relations
@@ -842,7 +1009,7 @@ func selectiveSearchSnapshotFromFull(
 	// One stop predicate for the whole derivation, defined HERE rather than at
 	// the relation phase: everything below this point -- filtering the complete
 	// cached inventory (linear in the FULL snapshot, not the selection) and the
-	// per-file importsFor precompute (a content scan per selected file) -- is
+	// retained record indexes -- is
 	// budgeted work that used to run unchecked, so a selective request could
 	// overshoot MaxDuration before the relation phase ever created a predicate.
 	shouldStop := func() bool { return budgetHit || gate.expired() }
@@ -928,26 +1095,6 @@ func selectiveSearchSnapshotFromFull(
 			i++
 		}
 	}
-	// Every content read below this point goes through the budgeted reader, so
-	// a producer that scans file content per symbol cannot keep scanning after
-	// the budget is gone even though it builds its whole slice before returning.
-	budgetedRead := gate.reader(sc.read)
-	precomputedImports := make(map[string][]string)
-	if spec.name != ProfileSyntaxOnly {
-		for _, file := range selective.Files {
-			// importsFor reads and scans the whole file, so this is real
-			// per-file work and is polled per file, not per stride.
-			if stopNow() {
-				break
-			}
-			if !skipFastProfilePerSymbolScan(spec, file.Language) {
-				continue
-			}
-			if content, ok := budgetedRead(file.Path); ok {
-				precomputedImports[file.Path] = importsFor(file.Path, content)
-			}
-		}
-	}
 
 	seenRelations := make(map[uint64]struct{})
 	externalsByID := make(map[string]ExternalRecord)
@@ -991,23 +1138,44 @@ func selectiveSearchSnapshotFromFull(
 		relationsByType[relation.Type]++
 		selective.Relations = append(selective.Relations, relation)
 	}
-	var relationFailures []PartialFailure
 	if spec.name == ProfileSyntaxOnly {
 		emitStructuralRelationsCompact(sc.key, selective.Files, structuralByFile, shouldStop, emitRelation)
 	} else {
-		forEachRelation(workCtx, sc.key, selective.Files, recordsByFile, budgetedRead, precomputedImports, spec, selectiveRelationWorkers(options), shouldStop, emitRelation, func(failure PartialFailure) {
-			relationFailures = append(relationFailures, failure)
-		})
-		// fileChangesWithRelations runs a `git log` subprocess and returns a
-		// fully materialised slice, so the budget is checked before entering it
-		// and the subprocess itself runs under workCtx.
-		if spec.emits("FILE_CHANGES_WITH") && !shouldStop() {
-			for _, relation := range fileChangesWithRelations(workCtx, sc.absRepo, sc.commit, sc.key, selective.Files) {
-				if shouldStop() {
-					break
-				}
-				emitRelation(relation)
+		// Filter, do not re-extract; see the function comment for what this keeps
+		// and why. FILE_CHANGES_WITH needs no special case: it is a pairwise fact
+		// about two files computed over history independently of the file set, so
+		// keeping the pairs whose files are both selected is exactly what a fresh
+		// selective build emits.
+		selectedIDs := make(map[string]bool, len(selective.Files)+len(selective.Symbols))
+		for _, file := range selective.Files {
+			if shouldStop() {
+				break
 			}
+			selectedIDs[file.ID] = true
+		}
+		for _, symbol := range selective.Symbols {
+			if shouldStop() {
+				break
+			}
+			selectedIDs[symbol.ID] = true
+		}
+		for _, relation := range full.Relations {
+			if shouldStop() {
+				break
+			}
+			if !selectiveRelationRetained(relation, selectedIDs) {
+				continue
+			}
+			if relation.Type == "DATA_FLOWS" {
+				key := unmergedDataFlowEdgeKey(relation.FromID, relation.ToID)
+				if _, unmerged := full.unmergedDataFlowEdges[key]; unmerged {
+					if selective.unmergedDataFlowEdges == nil {
+						selective.unmergedDataFlowEdges = map[string]struct{}{}
+					}
+					selective.unmergedDataFlowEdges[key] = struct{}{}
+				}
+			}
+			emitRelation(relation)
 		}
 	}
 	// shouldStop deliberately returns no reason, so classify the stop once here:
@@ -1028,9 +1196,11 @@ func selectiveSearchSnapshotFromFull(
 
 	finalizeSelectiveOrdering(&selective, externalsByID, externalOrder, budgetHit)
 
-	warnings := sc.warnings
+	warnings := append([]ProviderWarning{}, sc.warnings...)
+	if len(selective.unmergedDataFlowEdges) > 0 {
+		warnings = append(warnings, unmergedDataFlowEvidenceWarning(len(selective.unmergedDataFlowEdges)))
+	}
 	failures := filterSearchPartialFailures(full.Header.PartialFailures, selectiveFailureFiles(allowedFiles, selective.Files, selectionComplete))
-	failures = mergePartialFailures(failures, relationFailures)
 	if budgetHit {
 		// The marker both tells the caller the view is partial and makes the
 		// view uncacheable: writeSearchSnapshot refuses any snapshot carrying
@@ -1207,6 +1377,23 @@ func selectiveFailureFiles(allowedFiles map[string]bool, retained []FileRecord, 
 	return retainedFileSet(retained)
 }
 
+// selectiveRelationRetained is the filter selectiveSearchSnapshotFromFull applies
+// to the complete graph: the relation must start at a selected file or symbol and
+// end at a selected one or at an `external:` target. An edge into an unselected
+// symbol is dropped rather than kept dangling, because a fresh selective build
+// never names an unselected symbol either.
+func selectiveRelationRetained(relation RelationRecord, selectedIDs map[string]bool) bool {
+	if !selectedIDs[relation.FromID] {
+		return false
+	}
+	return selectedIDs[relation.ToID] || strings.HasPrefix(relation.ToID, "external:")
+}
+
+// filterSearchPartialFailures keeps the complete build's failures that belong to
+// the selection, plus the repository-wide ones that name no file. The complete
+// build already merged each file's relation-phase failure into its parse-phase
+// record (mergePartialFailures, provider.go), so the selective view reports the
+// same single record, carrying both phases' effects, that a full build does.
 func filterSearchPartialFailures(failures []PartialFailure, allowedFiles map[string]bool) []PartialFailure {
 	filtered := make([]PartialFailure, 0, len(failures))
 	for _, failure := range failures {
@@ -1243,16 +1430,12 @@ func LoadOrBuildProviderSnapshot(
 // entry can reuse it (e.g. --allow-empty commits, amends, rebases that don't
 // touch content). Commit is provenance metadata carried on the cached value
 // and re-stamped to the serving HEAD on load; it never influences the key.
-// This is scoped to the parsed graph itself: a full-profile snapshot also
-// embeds FILE_CHANGES_WITH co-change relations derived by walking recent git
-// history (see fileChangesWithRelations), so a same-tree hit after a rebase
-// can serve co-change edges computed against the prior history. That is
-// accepted because those edges are heuristic and confidence-scored, not
-// exact facts about the tree.
+// History-derived FILE_CHANGES_WITH edges are refreshed on each full-profile
+// cache load against the serving checkout, rather than reused across histories.
 // searchSnapshotKey addresses an entry for the schema THIS build serializes
 // under; searchSnapshotKeyForSchema carries the reasoning.
-func searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree string, options ProviderSnapshotOptions) (string, error) {
-	return searchSnapshotKeyForSchema(SchemaVersion, absRepo, repositoryKey, providerVersion, tree, options)
+func searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree string, options ProviderSnapshotOptions, contexts ...context.Context) (string, error) {
+	return searchSnapshotKeyForSchema(SchemaVersion, absRepo, repositoryKey, providerVersion, tree, options, contexts...)
 }
 
 // searchSnapshotKeyForSchema takes the schema version explicitly so a test can
@@ -1264,7 +1447,7 @@ func searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree string, opt
 // one's store overwrites the other's and neither ever gets a warm cache. The
 // validity check catches the wrong answer; it cannot stop the mutual eviction
 // that produced it, because by then the entry has already been replaced.
-func searchSnapshotKeyForSchema(schemaVersion, absRepo, repositoryKey, providerVersion, tree string, options ProviderSnapshotOptions) (string, error) {
+func searchSnapshotKeyForSchema(schemaVersion, absRepo, repositoryKey, providerVersion, tree string, options ProviderSnapshotOptions, contexts ...context.Context) (string, error) {
 	if options.Worktree {
 		return "", errors.New("working-tree snapshots cannot have persistent cache keys")
 	}
@@ -1275,8 +1458,23 @@ func searchSnapshotKeyForSchema(schemaVersion, absRepo, repositoryKey, providerV
 	hash := sha256.New()
 	writeCacheKeyString(hash, "cache-version", searchSnapshotCacheVersion)
 	writeCacheKeyString(hash, "schema-version", schemaVersion)
-	writeCacheKeyString(hash, "repository-path", absRepo)
-	writeCacheKeyString(hash, "repository-key", repositoryKey)
+	// No checkout path: the entry is content-addressed by the tree, so every
+	// worktree and clone of one repository at one tree shares it, and the loader
+	// restamps the path-bearing header fields for the checkout it serves
+	// (loadCachedSearchSnapshot). The identity term is the repository KEY CLASS:
+	// the full gh/<owner>/<name> key, which is what every stored ID embeds, but
+	// one term for all local/<basename> keys, whose IDs the loader rewrites into
+	// the serving checkout's namespace. See searchCacheRepositoryKeyTerm.
+	writeCacheKeyString(hash, "repository-key", searchCacheRepositoryKeyTerm(repositoryKey))
+	// The checkout-relative SCOPE is in the key, because a checkout path is not the
+	// only thing the path-free key dropped. An explicit `--repo <subdir>` (or
+	// ENTIRE_REPO_ROOT) indexes only that subtree, with subdir-relative paths,
+	// while the tree term is still the whole repository's HEAD^{tree}, so without
+	// this term the subtree snapshot and the root snapshot share one address and
+	// each is served as the other: a root query after a subdir one reported a hit
+	// with none of the root's symbols. Two worktrees or clones at the same tree and
+	// the same prefix still share; that is what the path-free key is for.
+	writeCacheKeyString(hash, "repository-scope", cacheCheckoutScope(absRepo, contexts...))
 	writeCacheKeyString(hash, "provider-version", providerVersion)
 	writeCacheKeyString(hash, "tree", tree)
 	writeCacheKeyString(hash, "profile", string(options.Profile))
@@ -1337,8 +1535,9 @@ func validCachedSearchSnapshot(cache cachedSearchSnapshot, repositoryKey, provid
 		cache.Profile == options.Profile &&
 		cache.MaxParseBytes == options.MaxParseBytes &&
 		cache.Snapshot.Header.RepoKey == repositoryKey &&
-		// Both identity gates remain required for decoding older entries: RepoKey
-		// separates two checkouts that share a tree hash, while Worktree prevents a
+		// Both identity gates remain required: RepoKey is the namespace every stored
+		// ID embeds, so an entry is served only after loadCachedSearchSnapshot has
+		// rebound it to the serving checkout's key, while Worktree prevents a
 		// retired working-tree entry from ever serving a committed-tree request.
 		cache.Worktree == options.Worktree &&
 		cache.Snapshot.Header.Tree == tree &&
@@ -1360,6 +1559,176 @@ func validCachedSearchSnapshot(cache cachedSearchSnapshot, repositoryKey, provid
 func restampCachedSearchSnapshotCommit(cache cachedSearchSnapshot, commit string) cachedSearchSnapshot {
 	cache.Commit = commit
 	cache.Snapshot.Header.Commit = commit
+	return cache
+}
+
+// cacheCheckoutScope is the checkout-relative scope term of the committed-tree
+// cache keys: Git's --show-prefix of absRepo ("" at a checkout's top level,
+// "pkg/" for a `--repo <top>/pkg` run), which is what decides the subtree a build
+// lists and the coordinates its paths are written in. It is identical across
+// worktrees and clones of one repository, so they keep sharing entries. When Git
+// cannot answer (or may not be run on this metadata), the term falls back to the
+// absolute path: that entry is then private to the directory, never shared with a
+// scope it might not match.
+func cacheCheckoutScope(absRepo string, contexts ...context.Context) string {
+	if absRepo == "" {
+		return "path:"
+	}
+	ctx := context.Background()
+	if len(contexts) > 0 && contexts[0] != nil {
+		ctx = contexts[0]
+	}
+	if gitMetadataSafeForSubprocessContext(ctx, absRepo) {
+		if prefix, err := gitutil.RepoPrefix(ctx, absRepo); err == nil {
+			return "prefix:" + filepath.ToSlash(prefix)
+		}
+	}
+	return "path:" + filepath.Clean(absRepo)
+}
+
+// searchCacheRepositoryKeyTerm is the repository-identity term of a search
+// snapshot key. A gh/<owner>/<name> key is globally unique and is hashed as is.
+// Every local/<basename> key hashes to one term: two remote-less clones of one
+// tree under different directory names parse identically except for the ID
+// namespace, which rebindCachedSearchSnapshot rewrites, so they can share an
+// entry. Sharing is sound because the cache is per user and the tree hash is a
+// content address: nothing in the entry is a function of anything but the tree,
+// the keyed options, and the namespace being rewritten.
+func searchCacheRepositoryKeyTerm(repositoryKey string) string {
+	if strings.HasPrefix(repositoryKey, "local/") {
+		return "local/"
+	}
+	return repositoryKey
+}
+
+// loadCachedSearchSnapshot reads one entry and, when it is valid for this
+// request, returns it bound to the checkout serving it. A read or validation
+// failure is a miss: the cache is optional on every path that consults it.
+func loadCachedSearchSnapshot(
+	entry cacheEntry,
+	absRepo, commit, repositoryKey, providerVersion, tree string,
+	options ProviderSnapshotOptions,
+
+	contexts ...context.Context,
+) (cachedSearchSnapshot, bool) {
+	cached, err := readSearchSnapshot(entry)
+	if err != nil {
+		return cachedSearchSnapshot{}, false
+	}
+	// Restamp the root only between checkouts of the same scope. The key already
+	// separates scopes; this keeps a hand-edited, colliding or pre-scope entry from
+	// being adopted by a checkout whose subtree it does not describe. Same root
+	// means same checkout, so the scope lookup is paid only on a cross-checkout hit.
+	if cached.Snapshot.Header.RepoRoot != absRepo && cached.RepoScope != cacheCheckoutScope(absRepo, contexts...) {
+		return cachedSearchSnapshot{}, false
+	}
+	cached = rebindCachedSearchSnapshot(cached, absRepo, repositoryKey)
+	if !validCachedSearchSnapshot(cached, repositoryKey, providerVersion, tree, options) {
+		return cachedSearchSnapshot{}, false
+	}
+	// The cache key is tree-only: a hit may have been built for a different
+	// commit that shares this tree. The parsed graph is exactly correct, but
+	// commit provenance must reflect the HEAD we are serving right now.
+	cached = restampCachedSearchSnapshotCommit(cached, commit)
+	if options.Profile == ProfileFull {
+		ctx := context.Background()
+		if len(contexts) > 0 && contexts[0] != nil {
+			ctx = contexts[0]
+		}
+		if !gitMetadataSafeForSubprocessContext(ctx, absRepo) {
+			return cachedSearchSnapshot{}, false
+		}
+		cochanges, historyErr := gitutil.FileCochanges(ctx, absRepo, commit, 256)
+		if historyErr != nil || ctx.Err() != nil {
+			// An unavailable refresh must not be presented as a hit whose
+			// history edges disappeared. Fall back through the ordinary build.
+			return cachedSearchSnapshot{}, false
+		}
+		refreshed := make([]RelationRecord, 0, len(cached.Snapshot.Relations))
+		for _, relation := range cached.Snapshot.Relations {
+			if relation.Type != "FILE_CHANGES_WITH" {
+				refreshed = append(refreshed, relation)
+			}
+		}
+		history := fileChangesWithRelations(ctx, absRepo, commit, repositoryKey, cached.Snapshot.Files, &capturedFileCochanges{pairs: cochanges})
+		refreshed = append(refreshed, history...)
+		sort.Slice(refreshed, func(i, j int) bool {
+			left, right := refreshed[i], refreshed[j]
+			return left.Type+left.FromID+left.ToID < right.Type+right.FromID+right.ToID
+		})
+		cached.Snapshot.Relations = refreshed
+		cached.Snapshot.Header.Stats.Relations = len(refreshed)
+		counts := make(map[string]int, len(cached.Snapshot.Header.Completeness.Relations))
+		for kind, count := range cached.Snapshot.Header.Completeness.Relations {
+			if kind != "FILE_CHANGES_WITH" {
+				counts[kind] = count
+			}
+		}
+		if len(history) > 0 {
+			counts["FILE_CHANGES_WITH"] = len(history)
+		}
+		cached.Snapshot.Header.Completeness.Relations = counts
+	}
+	return cached, true
+}
+
+// rebindCachedSearchSnapshot adopts an entry, which may have been written from
+// another worktree or clone of the same tree, for the checkout at repoRoot.
+//
+// Header.RepoRoot is the only absolute path an entry carries: file, symbol,
+// relation, evidence and failure paths are repository-relative, and
+// TestSearchCacheEntryCarriesNoCheckoutPathButTheHeader pins that. It is not
+// cosmetic. Search reports it as repo_root, and def, neighbors and impact open
+// their git readers and quote source through it (callsite.go), so a stale root
+// would read another checkout's files.
+//
+// A local/<basename> namespace is rewritten to the serving checkout's. Every
+// repository ID is symbolID/fileID: the key, a colon, and a key-independent
+// remainder, so a prefix rewrite reproduces what a cold build here would emit,
+// and it preserves every ordering a snapshot relies on (all rewritten IDs share
+// one prefix, and that prefix still sorts after `external:`). A gh/ key is never
+// rewritten: it is in the cache key, so an entry under another one never loads.
+func rebindCachedSearchSnapshot(cache cachedSearchSnapshot, repoRoot, repositoryKey string) cachedSearchSnapshot {
+	cache.Snapshot.Header.RepoRoot = repoRoot
+	from := cache.Snapshot.Header.RepoKey
+	if from == repositoryKey || !strings.HasPrefix(from, "local/") || !strings.HasPrefix(repositoryKey, "local/") {
+		return cache
+	}
+	prefix := from + ":"
+	rename := func(id string) string {
+		if strings.HasPrefix(id, prefix) {
+			return repositoryKey + ":" + id[len(prefix):]
+		}
+		return id
+	}
+	snapshot := &cache.Snapshot
+	snapshot.Header.RepoKey = repositoryKey
+	for index := range snapshot.Files {
+		snapshot.Files[index].ID = rename(snapshot.Files[index].ID)
+	}
+	for index := range snapshot.Symbols {
+		symbol := &snapshot.Symbols[index]
+		symbol.ID = rename(symbol.ID)
+		symbol.ContainerID = rename(symbol.ContainerID)
+	}
+	for index := range snapshot.Relations {
+		relation := &snapshot.Relations[index]
+		relation.FromID = rename(relation.FromID)
+		relation.ToID = rename(relation.ToID)
+	}
+	if len(snapshot.unmergedDataFlowEdges) > 0 {
+		renamed := make(map[string]struct{}, len(snapshot.unmergedDataFlowEdges))
+		for key := range snapshot.unmergedDataFlowEdges {
+			fromID, toID, _ := strings.Cut(key, "\x00")
+			renamed[unmergedDataFlowEdgeKey(rename(fromID), rename(toID))] = struct{}{}
+		}
+		snapshot.unmergedDataFlowEdges = renamed
+	}
+	// External IDs are `external:` and carry no namespace; renaming them is a
+	// no-op kept so the rewrite covers every ID field the snapshot has.
+	for index := range snapshot.Externals {
+		snapshot.Externals[index].ID = rename(snapshot.Externals[index].ID)
+	}
 	return cache
 }
 
