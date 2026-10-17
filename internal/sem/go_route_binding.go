@@ -2645,15 +2645,32 @@ func (r *goRouteResolver) noteMount(call *ast.CallExpr, scope *goRouteScope) {
 	if !ok {
 		// Wrappers may preserve or change placement; never publish the nested
 		// router's bare routes as if this mount had no prefix.
-		ast.Inspect(call.Args[1], func(n ast.Node) bool {
+		argument := call.Args[1]
+		var inspect func(ast.Node) bool
+		inspect = func(n ast.Node) bool {
 			r.step(1)
-			if ident, ok := n.(*ast.Ident); ok {
-				if binding := r.lookup(scope, ident.Name); binding != nil && binding.origin != nil {
+			switch node := n.(type) {
+			case *ast.SelectorExpr:
+				// A member name is not a read of an enclosing local namesake.
+				ast.Inspect(node.X, inspect)
+				return false
+			case *ast.FuncLit:
+				// Types and parameter declarations do not read router values.
+				ast.Inspect(node.Body, inspect)
+				return false
+			case *ast.Ident:
+				if node.Obj != nil {
+					if declaration, ok := node.Obj.Decl.(ast.Node); ok && declaration.Pos() >= argument.Pos() && declaration.End() <= argument.End() {
+						return true
+					}
+				}
+				if binding := r.lookup(scope, node.Name); binding != nil && binding.origin != nil {
 					binding.origin.opaque = true
 				}
 			}
 			return true
-		})
+		}
+		ast.Inspect(argument, inspect)
 		return
 	}
 	sub, _ := lookup(ident.Name)
