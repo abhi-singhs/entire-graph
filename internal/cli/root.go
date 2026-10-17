@@ -118,6 +118,11 @@ func runUnderSignals(run func(context.Context) error) error {
 	}()
 
 	err := run(ctx)
+	// A signal may race with successful completion. Only attribute an error
+	// returned by run to cancellation; do not turn completed output into failure.
+	if err == nil {
+		return nil
+	}
 
 	var caught os.Signal
 	select {
@@ -125,9 +130,6 @@ func runUnderSignals(run func(context.Context) error) error {
 	default:
 	}
 	if caught != nil {
-		if err == nil {
-			return &SignalError{Signal: caught, Err: context.Canceled}
-		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return &SignalError{Signal: caught, Err: err}
 		}

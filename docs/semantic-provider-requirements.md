@@ -507,7 +507,10 @@ following bounds are enforced:
     partial graph is never handed one with a nil error, because it would then
     persist that graph under a budget-independent tree key and serve the gap to
     every later unbudgeted query. A context *cancellation* (Ctrl-C) likewise
-    still aborts with an error.
+    still aborts with an error. When SIGINT/SIGTERM causes that cancellation,
+    the CLI exits with status 130/143. If a signal races with a command that
+    nevertheless completes successfully, the CLI preserves that success; an
+    independent command error also retains its original status.
   - **Runs do not resume.** Repeating a budget below the time needed to finish
     starts from the beginning again and cannot guarantee a complete replacement.
     Consumers such as Brain that require a complete index must leave the budget
