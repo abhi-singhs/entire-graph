@@ -1,6 +1,11 @@
 package sem
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 // Flow extraction must run only the pattern families a language can express.
 // Before routing, every family scanned every body: a Python conditional
@@ -57,5 +62,50 @@ func TestFlowExtractionIsLanguageRouted(t *testing.T) {
 	// must never drop a real edge under uncertainty.
 	if kinds := flowKinds(pythonCond, "SomeFutureLanguage"); !kinds["conditional_assigned_return_flow"] {
 		t.Fatalf("unknown language lost a flow family: %v", kinds)
+	}
+}
+
+// End-to-end pin for the one place a cross-language shape reaches a body in
+// practice: code that does not parse but still yields symbols through
+// tree-sitter error recovery (pasted pseudo-code, generated or corrupted
+// files). Before routing, a Python conditional inside an INVALID Go function
+// produced DATA_FLOWS edges for code that cannot compile; those edges must be
+// gone, while the same shapes in their own languages — and Go's legal `||`
+// flow — survive untouched.
+func TestSnapshotDropsCrossLanguageFlowMatches(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("pick.go", "package demo\n\nfunc primary() int  { return 1 }\nfunc fallback() int { return 2 }\n\nfunc pick() int {\n\tv := primary() if ready else fallback()\n\treturn v\n}\n")
+	write("pick.py", "def primary():\n    return 1\n\ndef fallback():\n    return 2\n\ndef pick(ready):\n    v = primary() if ready else fallback()\n    return v\n")
+	write("pick.js", "function primary() { return 1; }\nfunction fallback() { return 2; }\nfunction pick(ready) {\n  return ready ? primary() : fallback();\n}\n")
+	write("bools.go", "package demo\n\nfunc isReady() bool { return true }\nfunc isArmed() bool { return false }\n\nfunc either() bool {\n\treturn isReady() || isArmed()\n}\n")
+
+	snapshot, err := BuildProviderSnapshotWithOptions(t.Context(), dir, "0.0.0-test", ProviderSnapshotOptions{Worktree: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	flows := map[string]bool{}
+	for _, relation := range snapshot.Relations {
+		if relation.Type != "DATA_FLOWS" {
+			continue
+		}
+		fromFile := ""
+		if parts := strings.Split(relation.FromID, ":"); len(parts) > 2 {
+			fromFile = parts[2]
+		}
+		flows[fromFile] = true
+	}
+	if flows["pick.go"] {
+		t.Fatal("a Python conditional inside an invalid Go body produced a DATA_FLOWS edge; cross-language flow matches must not survive routing")
+	}
+	for _, want := range []string{"pick.py", "pick.js", "bools.go"} {
+		if !flows[want] {
+			t.Fatalf("legitimate %s flow edge was lost; flows seen: %v", want, flows)
+		}
 	}
 }
