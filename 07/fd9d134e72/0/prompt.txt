@@ -1,0 +1,120 @@
+<pasted_content id="1797">
+Fix entireio/entire-graph issue #350: Julia signatures include the whole body, and `module` symbols (Julia and Ruby) get false DATA_FLOWS edges.
+
+Follow AGENTS.md and .entire/agent-guide.md. Use `entire graph query/def/neighbors/impact --head` for every locate or relationship question, and grep only for literal strings. Create a new branch `fix/julia-signature-module-dataflow` from an up-to-date main. Commit when you are done, but do NOT push; I will push and open the PR myself.
+
+## Before changing code
+
+1. Read the issue with `gh issue view 350 -R entireio/entire-graph`.
+2. Build a "before" binary from the unchanged code: `go build -o /tmp/eg-before ./cmd/entire-graph`.
+3. Recreate the issue's repro in a temp git repo: `src/Shapes.jl` and `lib/util.rb`, two commits, with the second commit a body-only edit. Run the issue's `snapshot`/`jq`/`diff` commands with /tmp/eg-before and keep the output for the PR.
+
+## Part A: signatures (internal/sem/parser.go)
+
+`signatureFromNode` (~8109) ends a signature at a `body` field or a body-like child. tree-sitter-julia keeps body statements as direct, unlabeled children, so nothing gets cut.
+
+- Add `juliaSignature(node, src) string`, modelled on `fsharpSignature` (~4680).
+- Apply it the same way the F# override is applied after entity construction (~6488), including recomputing `Fingerprint`.
+- Check every Julia-gated case in the extraction switch (~5955-6060) for any path that sets `Signature` separately.
+
+Cut rules. Confirm the node shapes by dumping the tree for a sample file rather than guessing:
+
+- `function_definition` / `macro_definition`: end of the `signature` child. This keeps `::ReturnType` and `where {...}`, which sit inside `signature`. Expected: `function area(c::Circle)::Float64`, `function bump!(n)`, `function Base.show(io::IO, x)`, `macro trace(ex)`.
+- `struct_definition`: end of `type_head`. Expected: `struct Circle <: Shape`, `mutable struct Counter`, `struct Point{T}`.
+- `abstract_definition` / `primitive_definition`: keep the header whole, e.g. `abstract type A <: B end`.
+- `module_definition` (including `baremodule`): end of the name. Expected: `module Shapes`.
+- Short-form `assignment` (`f(x) = expr`, `f(x)::T = expr`, `f(x) where T = expr`): end of the left-hand side.
+- If the expected child is missing, fall back to `signatureFromNode`.
+
+Symbol IDs are `repo:language:path:kind:qualifiedName`; the signature is not part of them. Do NOT bump `IdentityRevision`. Prove the IDs are unchanged: collect the Julia symbol IDs from the before and after binaries on the repro and on `internal/sem/testdata`, and check the sets match.
+
+## Part B: module DATA_FLOWS (internal/sem/provider.go)
+
+`forEachRelation` sets `callableSymbol := !typeLikeKind(from.Kind)` (~5975). `module` is not type-like, so the DATA_FLOWS pass (~6024, which calls `returnFlowCalls` in types.go ~1052) scans a module's block. That block spans the module's member functions: the Julia `exactSymbolSource`, or the Ruby line span.
+
+- Skip DATA_FLOWS when `from.Kind == "module"`, for every language. No language can `return` from a module body. Also make sure no DATA_FLOWS record has a module `to_id` through another producer.
+- Keep the change local to the DATA_FLOWS gate. Do not change `callableSymbol` itself: it also gates ASYNC_CALLS (~5984) and the HTTP scan (~6176). List those in the PR as a follow-up.
+
+## Part C: caches, tests, docs
+
+**Cache versions.** Output changes for unchanged trees, and every local build shares provider version "dev". Bump both:
+
+- `searchSnapshotCacheVersion` in internal/sem/search_cache.go: v25 to v26
+- `providerRecordsCacheVersion` in internal/sem/records_cache.go: v19 to v20
+
+Add a one-line comment to each in the existing "vNN retires ..." style.
+
+**Tests.** Add these to internal/sem/provider_test.go, next to the `TestJulia*` tests (~14671):
+
+1. Exact expected signature strings for these Julia forms:
+   - long-form functions
+   - functions with a `::T` return type
+   - functions with a `where` clause
+   - qualified `Base.show`
+   - short-form functions
+   - macros
+   - plain, mutable and parametric structs with `<:`
+   - abstract types
+   - modules
+2. No DATA_FLOWS relation with a `module` symbol at either end. Cover both a Julia module (members with `return f(x)` and an assigned-return) and a Ruby module (`def self.a; return b(); end`). The members' own DATA_FLOWS edges must still be emitted.
+3. No USES_TYPE from a function to a type named only in its body. The parameter-type and return-type USES_TYPE and PARAM_TYPE edges must still appear, and so must CONSTRUCTS `bump! -> Counter`.
+4. Diff classification: a body-only edit to a Julia function yields `body_changed`, not `signature_changed`. Find the existing `compareEntities`/analyze tests and follow their setup.
+
+**Goldens and contract tests.**
+
+- Regenerate the julia-r-basic golden using the repo's `-update` flag (see golden_test.go) and confirm only signature fields changed.
+- Regenerate any other golden that changes, and explain each change.
+- Run `TestCapabilityMatrixCoversEmittedRelations`, `TestCapabilityRelationDeclarationsMatchIsolatedExtraction` and the language matrix test. `ooRelationSupport["Julia"]` must NOT change.
+
+**Changelog.** Add a CHANGELOG.md entry under the unreleased 0.5.0 section, next to the existing Julia items.
+
+## Verify before committing
+
+- Run `go test ./internal/sem -run 'Julia|Ruby|Capability|LanguageMatrix|Golden|Analyze|Compare'`, then `mise run test`, and `mise run check` if time allows. Report the actual output, and never claim a pass you didn't run.
+- Build an after binary: `go build -o /tmp/eg-after ./cmd/entire-graph`. Rerun the repro with both binaries and show:
+  - the before and after signatures
+  - that the three module DATA_FLOWS edges and `USES_TYPE bump! -> Counter` are gone
+  - that the diff now reports `body_changed` for `Shapes.bump!` and `Shapes`
+
+## Finish with
+
+- The commit hash.
+- The test commands you ran and their results.
+- A PR title and description, ending with "Fixes #350". Sections:
+  - Summary
+  - Root cause
+  - Changes
+  - Before/After repro output
+  - Tests
+  - Follow-ups: ASYNC_CALLS and the HTTP scan still treat modules as callable
+</pasted_content id="1797">
+
+---
+
+<task-notification>
+<task-id>bhq8ye8sz</task-id>
+<tool-use-id>toolu_01FqWZAuWLywqXQRgL67Lads</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-abhi-Documents-entire-graph/a1870155-101a-49bb-a35b-e3e8ed3d1416/tasks/bhq8ye8sz.output</output-file>
+<status>completed</status>
+<summary>Background command "Graph query via binary built from main" completed (exit code 0)</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>b3pyxsio8</task-id>
+<tool-use-id>toolu_01GufsDj6UiwzaMtzsgiyPKx</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-abhi-Documents-entire-graph/a1870155-101a-49bb-a35b-e3e8ed3d1416/tasks/b3pyxsio8.output</output-file>
+<status>failed</status>
+<summary>Background command "Graph search for Julia/F# signature extraction" failed with exit code 143</summary>
+</task-notification>
+
+---
+
+<task-notification>
+<task-id>b9t5lalyd</task-id>
+<tool-use-id>toolu_01HGu2WngFi2fPoMJ5XQEFdd</tool-use-id>
+<output-file>/private/tmp/claude-501/-Users-abhi-Documents-entire-graph/a1870155-101a-49bb-a35b-e3e8ed3d1416/tasks/b9t5lalyd.output</output-file>
+<status>completed</status>
+<summary>Background command "Run the full test suite via mise" completed (exit code 0)</summary>
+</task-notification>

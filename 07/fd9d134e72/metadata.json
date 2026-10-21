@@ -1,0 +1,33 @@
+{
+  "cli_version": "0.11.4",
+  "checkpoint_id": "07fd9d134e72",
+  "strategy": "manual-commit",
+  "branch": "fix/julia-signature-module-dataflow",
+  "checkpoints_count": 2,
+  "files_touched": [
+    "CHANGELOG.md",
+    "internal/sem/parser.go",
+    "internal/sem/provider.go",
+    "internal/sem/provider_test.go",
+    "internal/sem/records_cache.go",
+    "internal/sem/search_cache.go",
+    "internal/sem/testdata/fixtures/julia-r-basic.ndjson.golden",
+    "internal/sem/testdata/fixtures/quality_coverage.json"
+  ],
+  "sessions": [
+    {
+      "metadata": "/07/fd9d134e72/0/metadata.json",
+      "transcript": "/07/fd9d134e72/0/full.jsonl",
+      "compact_transcript": "/07/fd9d134e72/0/transcript.jsonl",
+      "content_hash": "/07/fd9d134e72/0/content_hash.txt",
+      "prompt": "/07/fd9d134e72/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 246,
+    "cache_creation_tokens": 261435,
+    "cache_read_tokens": 21590563,
+    "output_tokens": 121050,
+    "api_call_count": 121
+  }
+}
