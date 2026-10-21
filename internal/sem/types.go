@@ -1049,7 +1049,7 @@ type returnFlowCall struct {
 	Direction    string
 }
 
-func returnFlowCalls(body symbolBody, params map[string]bool) []returnFlowCall {
+func returnFlowCalls(body symbolBody, params map[string]bool, syntax flowSyntax) []returnFlowCall {
 	stripped := body.stripped
 	flows := map[string]returnFlowCall{}
 	for _, name := range returnFlowCallNames(body) {
@@ -1061,13 +1061,13 @@ func returnFlowCalls(body symbolBody, params map[string]bool) []returnFlowCall {
 			Direction:    "callee_to_caller",
 		}
 	}
-	for _, flow := range ternaryReturnFlows(stripped) {
+	for _, flow := range ternaryReturnFlows(stripped, syntax) {
 		flows[flow.Name+"\x00"+flow.EvidenceKind] = flow
 	}
-	for _, flow := range fallbackReturnFlows(stripped) {
+	for _, flow := range fallbackReturnFlows(stripped, syntax) {
 		flows[flow.Name+"\x00"+flow.EvidenceKind] = flow
 	}
-	for _, flow := range expressionAssignedReturnFlows(stripped) {
+	for _, flow := range expressionAssignedReturnFlows(stripped, syntax) {
 		flows[flow.Name+"\x00"+flow.EvidenceKind+"\x00"+flow.Detail] = flow
 	}
 	assigned := map[string]string{}
@@ -1191,7 +1191,7 @@ func returnFlowCalls(body symbolBody, params map[string]bool) []returnFlowCall {
 	return out
 }
 
-func ternaryReturnFlows(block string) []returnFlowCall {
+func ternaryReturnFlows(block string, syntax flowSyntax) []returnFlowCall {
 	seen := map[string]bool{}
 	var flows []returnFlowCall
 	addMatches := func(re *regexp.Regexp) {
@@ -1215,8 +1215,12 @@ func ternaryReturnFlows(block string) []returnFlowCall {
 			}
 		}
 	}
-	addMatches(ternaryReturnCallRe)
-	addMatches(pythonIfReturnRe)
+	if syntax.ternary {
+		addMatches(ternaryReturnCallRe)
+	}
+	if syntax.pythonCond {
+		addMatches(pythonIfReturnRe)
+	}
 	if len(flows) == 0 {
 		return nil
 	}
@@ -1226,7 +1230,7 @@ func ternaryReturnFlows(block string) []returnFlowCall {
 	return flows
 }
 
-func fallbackReturnFlows(block string) []returnFlowCall {
+func fallbackReturnFlows(block string, syntax flowSyntax) []returnFlowCall {
 	seen := map[string]bool{}
 	var flows []returnFlowCall
 	addMatches := func(re *regexp.Regexp) {
@@ -1250,8 +1254,12 @@ func fallbackReturnFlows(block string) []returnFlowCall {
 			}
 		}
 	}
-	addMatches(jsFallbackReturnRe)
-	addMatches(pythonOrReturnRe)
+	if syntax.logicalFallback {
+		addMatches(jsFallbackReturnRe)
+	}
+	if syntax.orFallback {
+		addMatches(pythonOrReturnRe)
+	}
 	if len(flows) == 0 {
 		return nil
 	}
@@ -1269,8 +1277,8 @@ type assignmentFlowEvent struct {
 	Pos          int
 }
 
-func expressionAssignedReturnFlows(block string) []returnFlowCall {
-	events := assignmentFlowEvents(block)
+func expressionAssignedReturnFlows(block string, syntax flowSyntax) []returnFlowCall {
+	events := assignmentFlowEvents(block, syntax)
 	if len(events) == 0 {
 		return nil
 	}
@@ -1321,7 +1329,7 @@ func expressionAssignedReturnFlows(block string) []returnFlowCall {
 	return flows
 }
 
-func assignmentFlowEvents(block string) []assignmentFlowEvent {
+func assignmentFlowEvents(block string, syntax flowSyntax) []assignmentFlowEvent {
 	var events []assignmentFlowEvent
 	addExpressionMatches := func(re *regexp.Regexp, reason, evidence string) {
 		for _, match := range re.FindAllStringSubmatchIndex(block, -1) {
@@ -1343,10 +1351,18 @@ func assignmentFlowEvents(block string) []assignmentFlowEvent {
 			})
 		}
 	}
-	addExpressionMatches(ternaryAssignCallRe, "callee return value assigned through conditional expression and returned by caller", "conditional_assigned_return_flow")
-	addExpressionMatches(pythonIfAssignRe, "callee return value assigned through conditional expression and returned by caller", "conditional_assigned_return_flow")
-	addExpressionMatches(jsFallbackAssignRe, "callee return value assigned through fallback expression and returned by caller", "fallback_assigned_return_flow")
-	addExpressionMatches(pythonOrAssignRe, "callee return value assigned through fallback expression and returned by caller", "fallback_assigned_return_flow")
+	if syntax.ternary {
+		addExpressionMatches(ternaryAssignCallRe, "callee return value assigned through conditional expression and returned by caller", "conditional_assigned_return_flow")
+	}
+	if syntax.pythonCond {
+		addExpressionMatches(pythonIfAssignRe, "callee return value assigned through conditional expression and returned by caller", "conditional_assigned_return_flow")
+	}
+	if syntax.logicalFallback {
+		addExpressionMatches(jsFallbackAssignRe, "callee return value assigned through fallback expression and returned by caller", "fallback_assigned_return_flow")
+	}
+	if syntax.orFallback {
+		addExpressionMatches(pythonOrAssignRe, "callee return value assigned through fallback expression and returned by caller", "fallback_assigned_return_flow")
+	}
 	for _, match := range assignCallRe.FindAllStringSubmatchIndex(block, -1) {
 		if len(match) != 6 {
 			continue

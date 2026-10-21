@@ -6044,7 +6044,7 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 				// paid for. Revisit if a corpus shows it is not rare.
 				edgeOrder := []string{}
 				flowsByEdge := map[string]*RelationRecord{}
-				for _, flow := range returnFlowCalls(body, symbolFlowParameterNames(from)) {
+				for _, flow := range returnFlowCalls(body, symbolFlowParameterNames(from), flowSyntaxFor(file.Language)) {
 					if flow.Name == from.Name {
 						continue
 					}

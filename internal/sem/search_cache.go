@@ -44,7 +44,9 @@ import (
 // v23 retires routes omitted by closure-local writes and address escapes.
 // v24 retires bare routes from wrapped mounts and unbounded route masks.
 // v25 retires entries before unresolved route placement and Go 1.22 method patterns.
-const searchSnapshotCacheVersion = "search-snapshot-v25-" + IdentityRevision
+// v26 retires entries carrying DATA_FLOWS edges matched by another language's
+// expression patterns; language-routed flow extraction no longer produces them.
+const searchSnapshotCacheVersion = "search-snapshot-v26-" + IdentityRevision
 
 type cachedSymbolByteRange struct {
 	Start int `json:"start"`
