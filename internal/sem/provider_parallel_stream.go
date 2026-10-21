@@ -52,21 +52,27 @@ func runIndexedStreamingPipeline[T, R any](
 		out := &slot{batches: make(chan []T, providerStreamBufferBatches)}
 		group.Go(func() {
 			defer close(out.batches)
-			batch := make([]T, 0, providerStreamBatchRecords)
+			// The batch allocates lazily on first append: many files emit
+			// nothing, and the final flush would otherwise leave a dead
+			// replacement buffer behind on every file. No per-record
+			// cancellation check: that was the last per-record acquisition of
+			// the shared context mutex in this hot path, and flush's select
+			// already observes cancellation once per batch, which is as often
+			// as anything downstream can act on it.
+			var batch []T
 			flush := func() {
 				if len(batch) == 0 {
 					return
 				}
-				full := batch
-				batch = make([]T, 0, providerStreamBatchRecords)
 				select {
-				case out.batches <- full:
+				case out.batches <- batch:
 				case <-workerCtx.Done():
 				}
+				batch = nil
 			}
 			out.result = process(workerCtx, index, func(value T) {
-				if workerCtx.Err() != nil {
-					return
+				if batch == nil {
+					batch = make([]T, 0, providerStreamBatchRecords)
 				}
 				batch = append(batch, value)
 				if len(batch) == providerStreamBatchRecords {
@@ -99,8 +105,8 @@ func runIndexedStreamingPipeline[T, R any](
 					}
 					goto next
 				}
-				for _, value := range batch {
-					if err := emit(index, value); err != nil {
+				for i := range batch {
+					if err := emit(index, batch[i]); err != nil {
 						return err
 					}
 				}

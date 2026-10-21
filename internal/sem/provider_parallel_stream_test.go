@@ -12,6 +12,12 @@ func TestIndexedStreamingPipelineBoundsAndOrdersLargeOutput(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	const files, workers, records = 17, 8, 10000
+	// The liveness interlock below fires at record providerStreamBatchRecords;
+	// with fewer records per file it would silently never run and the pin
+	// would pass vacuously.
+	if records <= providerStreamBatchRecords {
+		t.Fatalf("records (%d) must exceed the batch size (%d) for the liveness pin to fire", records, providerStreamBatchRecords)
+	}
 	var outstanding, peak atomic.Int64
 	firstConsumed := make(chan struct{})
 	nextFile, nextRecord := 0, 0
