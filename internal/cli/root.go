@@ -445,7 +445,11 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 			options = recordsCache.Options()
 		}
 	}
-	recordBuf := boundedRecordBuffer{limit: providerRecordsCacheMaxBytes}
+	// The spool is created only on a cache miss and consumed by Store; the
+	// deferred Abandon covers every other exit (stream error, provenance
+	// refusal upstream of Store) so a failed run leaves no temporary behind.
+	var spool *sem.ProviderRecordsSpool
+	defer func() { spool.Abandon() }()
 
 	if filterActive {
 		reportMatched := func(matched int) {
@@ -471,8 +475,8 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 		// only the matching relations reach stdout, so the next targeted query on
 		// this tree, whatever it asks, is a hit.
 		var cacheRecord func(any) error
-		if recordsCache != nil {
-			cacheRecord = newRecordEncoder(&recordBuf)
+		if spool = beginRecordsSpool(recordsCache, opts.Stderr); spool != nil {
+			cacheRecord = newRecordEncoder(spool)
 		}
 		var matched int
 		if err := sem.StreamSnapshot(ctx, repo, opts.Version, options, func(record any) error {
@@ -499,9 +503,13 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 		}
 		warnIfPartial(opts.Stderr, flags.Worktree, summary)
 		reportMatched(matched)
-		if recordsCache != nil && !recordBuf.overflowed {
-			// Best effort: a failed cache write never fails the command.
-			_ = recordsCache.Store(recordBuf.buffer.Bytes(), summary, snapshotHeader)
+		if spool != nil {
+			// Best effort: a failed cache write never fails the command, but it is
+			// said once on stderr rather than silently costing a re-parse per run.
+			if err := recordsCache.Store(spool, summary, snapshotHeader); err != nil {
+				fmt.Fprintf(opts.Stderr, "graph: provider records cache not stored: %v\n", err)
+			}
+			spool = nil
 		}
 		return nil
 	}
@@ -521,17 +529,15 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 		}
 	}
 
-	// On a miss, tee the serialized record stream into a buffer so we can persist it after
-	// a successful run without a second pass over the graph.
-	//
-	// BOUNDED, because the cache is on by default: resolveCacheDir falls back to the user cache
-	// directory, so useCache is true for every ordinary committed snapshot/symbols/edges run and this
-	// tee is no longer the opt-in it was written as. An unbounded tee makes a streaming command hold
-	// its ENTIRE output in memory — proportional to the whole graph, on exactly the large repositories
-	// the streaming contract exists for. Past the cap the buffer is released and the entry is not
-	// stored: the cache is best effort, the stream is not.
-	if recordsCache != nil {
-		encodeRecord = newRecordEncoder(io.MultiWriter(opts.Stdout, &recordBuf))
+	// On a miss, tee the serialized record stream into the disk spool so we can
+	// persist it after a successful run without a second pass over the graph.
+	// The spool gzips to a temporary file in the cache directory, so the tee's
+	// memory stays constant whatever the graph's size: the cache is on by
+	// default, and an in-memory capture here once held the command's ENTIRE
+	// output — or, capped, silently stored nothing on exactly the large
+	// repositories the cache matters most for.
+	if spool = beginRecordsSpool(recordsCache, opts.Stderr); spool != nil {
+		encodeRecord = newRecordEncoder(io.MultiWriter(opts.Stdout, spool))
 	}
 	if err := sem.StreamSnapshot(ctx, repo, opts.Version, options, func(record any) error {
 		capture(record)
@@ -549,39 +555,32 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 	} else {
 		warnIfPartial(opts.Stderr, flags.Worktree, summary)
 	}
-	if recordsCache != nil && !recordBuf.overflowed {
-		// Best effort: a failed cache write never fails the command.
-		_ = recordsCache.Store(recordBuf.buffer.Bytes(), summary, snapshotHeader)
+	if spool != nil {
+		// Best effort: a failed cache write never fails the command, but it is
+		// said once on stderr rather than silently costing a re-parse per run.
+		if err := recordsCache.Store(spool, summary, snapshotHeader); err != nil {
+			fmt.Fprintf(opts.Stderr, "graph: provider records cache not stored: %v\n", err)
+		}
+		spool = nil
 	}
 	return nil
 }
 
-// providerRecordsCacheMaxBytes caps the in-memory capture of a cold run's records. A var rather than
-// a const so a test can shrink it to a size a fixture can actually exceed.
-var providerRecordsCacheMaxBytes = 64 << 20
-
-// boundedRecordBuffer accumulates the record stream up to a byte limit and then stops, releasing what
-// it held and remembering that it did. Writes ALWAYS report success: this sits inside the
-// io.MultiWriter that also feeds stdout, and a short write there would abort the stream the command
-// exists to produce. Giving up on the cache entry is the correct trade; giving up on the output is
-// not.
-type boundedRecordBuffer struct {
-	buffer     bytes.Buffer
-	limit      int
-	overflowed bool
-}
-
-func (b *boundedRecordBuffer) Write(records []byte) (int, error) {
-	if b.overflowed {
-		return len(records), nil
+// beginRecordsSpool opens the disk spool a cold run tees its records into, or
+// returns nil (after one stderr line) when the cache cannot take them. The
+// spool writes ALWAYS report success to the io.MultiWriter that also feeds
+// stdout only in the sense that a working spool never short-writes; a spool
+// that cannot even open is dropped here so no cache failure can abort the
+// stream the command exists to produce. Its predecessor buffered the capture
+// in memory under a 64MB cap and silently stored nothing past it, so every
+// repository whose snapshot outgrew the cap re-parsed on each run.
+func beginRecordsSpool(recordsCache *sem.ProviderRecordsCacheTransaction, stderr io.Writer) *sem.ProviderRecordsSpool {
+	spool, err := recordsCache.NewSpool()
+	if err != nil {
+		fmt.Fprintf(stderr, "graph: provider records cache unavailable: %v\n", err)
+		return nil
 	}
-	if b.buffer.Len()+len(records) > b.limit {
-		b.overflowed = true
-		// The entry will never be stored, so nothing here is worth the memory any longer.
-		b.buffer = bytes.Buffer{}
-		return len(records), nil
-	}
-	return b.buffer.Write(records)
+	return spool
 }
 
 func scipOmissionNoteWithSummary(note sem.SCIPOmissionNote, summary *sem.SnapshotSummary) sem.SCIPOmissionNote {
