@@ -58,6 +58,17 @@ func TestFlowExtractionIsLanguageRouted(t *testing.T) {
 		t.Fatalf("`or` pattern matched a Go body: %v", kinds)
 	}
 
+	// `or` is also a legal `||` spelling where it is an alternative token
+	// (C++, C via <iso646.h>) or an infix function (Kotlin, Scala). The line
+	// guards hand ` or ` lines to this family exclusively, so these languages
+	// must keep it or the edge is lost entirely.
+	cppOr := "int pick() {\n  return primary() or fallback();\n}\n"
+	for _, language := range []string{"C++", "C", "Kotlin", "Scala"} {
+		if !flowKinds(cppOr, language)["fallback_return_flow"] {
+			t.Fatalf("`or` return flow dropped on %s, where `or` parses", language)
+		}
+	}
+
 	// An unknown language keeps every family: routing is an optimization that
 	// must never drop a real edge under uncertainty.
 	if kinds := flowKinds(pythonCond, "SomeFutureLanguage"); !kinds["conditional_assigned_return_flow"] {

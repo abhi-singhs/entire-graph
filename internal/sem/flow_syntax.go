@@ -32,13 +32,22 @@ func flowSyntaxFor(language string) flowSyntax {
 		return flowSyntax{logicalFallback: true}
 	case "Python":
 		return flowSyntax{pythonCond: true, orFallback: true}
-	case "JavaScript", "TypeScript", "Java", "C", "C++", "C#", "Swift", "Dart":
+	case "JavaScript", "TypeScript", "Java", "C#", "Swift", "Dart":
 		return flowSyntax{ternary: true, logicalFallback: true}
+	case "C", "C++":
+		// `or` is a legal spelling of `||` here too: a C++ alternative token,
+		// and in C the <iso646.h> macro. Guard rules exclude ` or ` lines from
+		// the generic scanners, so dropping the family would lose real edges.
+		return flowSyntax{ternary: true, orFallback: true, logicalFallback: true}
 	case "Ruby", "PHP", "Perl":
 		// Ternary plus both fallback spellings (`||` and the word `or`).
 		return flowSyntax{ternary: true, orFallback: true, logicalFallback: true}
-	case "Rust", "Kotlin", "Scala", "Bash":
-		// Expression-if / elvis languages without a C ternary; `||` is legal.
+	case "Kotlin", "Scala":
+		// No C ternary, but `a() or b()` parses: Kotlin's infix `or` and
+		// Scala's arbitrary infix methods.
+		return flowSyntax{orFallback: true, logicalFallback: true}
+	case "Rust", "Bash":
+		// Expression-if languages without a C ternary or a word `or`; `||` is legal.
 		return flowSyntax{logicalFallback: true}
 	case "Lua":
 		return flowSyntax{orFallback: true}
