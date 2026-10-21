@@ -3772,8 +3772,8 @@ func resolveJuliaSameContainerMethodCallTargets(name string, from SymbolRecord, 
 	}
 	parameters := symbolFlowParameterNames(from)
 	if !from.parameterNamesKnown {
-		// A short-form signature includes its RHS; stop at the first balanced
-		// argument list so calls on the RHS are not mistaken for parameters.
+		// Stop at the first balanced argument list so parentheses in a
+		// `::T` return annotation or `where` clause are not read as parameters.
 		if open := strings.Index(from.Signature, "("); open >= 0 {
 			if close := matchingParen(from.Signature, open); close > open {
 				parameters = parameterNames(from.Signature[:close+1])
@@ -6021,7 +6021,11 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 					}
 				}
 			}
-			if needsDataFlow && callableSymbol {
+			// A module body cannot hand a value back to a caller and a module has
+			// no parameters to forward, so every flow found in a module's block
+			// (which spans its members) belongs to a member function, and that
+			// member already emits it.
+			if needsDataFlow && callableSymbol && from.Kind != "module" {
 				// Several flows can describe one edge: `f(a, b, c)` forwards three
 				// caller parameters into the same callee, and relation identity is
 				// from+to+type, so all three land on one record. Collect every flow

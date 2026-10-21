@@ -41,7 +41,8 @@ import (
 // sidecar so a producer spools them to disk as they arrive; the envelope keeps
 // the sidecar's digest. Entries written by earlier builds embed the records
 // inline and are unreadable at this version (and vice versa).
-const providerRecordsCacheVersion = "provider-records-v20-" + IdentityRevision
+// v21 retires body-laden Julia signatures and module DATA_FLOWS edges.
+const providerRecordsCacheVersion = "provider-records-v21-" + IdentityRevision
 
 // cachedProviderRecords is the on-disk envelope for a cached record stream. The
 // key alone is authoritative (sha256 over version+commit+tree+mode+profile+

@@ -44,7 +44,8 @@ import (
 // v23 retires routes omitted by closure-local writes and address escapes.
 // v24 retires bare routes from wrapped mounts and unbounded route masks.
 // v25 retires entries before unresolved route placement and Go 1.22 method patterns.
-const searchSnapshotCacheVersion = "search-snapshot-v25-" + IdentityRevision
+// v26 retires body-laden Julia signatures and module DATA_FLOWS edges.
+const searchSnapshotCacheVersion = "search-snapshot-v26-" + IdentityRevision
 
 type cachedSymbolByteRange struct {
 	Start int `json:"start"`

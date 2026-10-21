@@ -4721,6 +4721,47 @@ func fsharpSignature(node *sitter.Node, src []byte) string {
 	return strings.TrimSpace(strings.TrimRight(signature, "=: \t\r\n"))
 }
 
+// juliaSignature returns the declaration header of a Julia definition.
+// tree-sitter-julia keeps body statements as direct, unlabeled children (its
+// _block rule is hidden), so the generic body-boundary cut never applies. It
+// returns "" when the expected header child is missing, and the caller then
+// keeps the generic signature.
+func juliaSignature(node *sitter.Node, src []byte) string {
+	start := node.StartByte()
+	var end uint32
+	switch node.Type() {
+	case "function_definition", "macro_definition":
+		// The signature child spans the call plus any `::ReturnType` and
+		// `where {...}` clause.
+		if signature := firstNamedChildOfType(node, "signature"); validNode(signature) {
+			end = signature.EndByte()
+		}
+	case "struct_definition":
+		// type_head spans the name, type parameters and the `<:` supertype.
+		if head := firstNamedChildOfType(node, "type_head"); validNode(head) {
+			end = head.EndByte()
+		}
+	case "abstract_definition", "primitive_definition":
+		// Header-only declarations (`abstract type A <: B end`): keep them whole.
+		end = node.EndByte()
+	case "module_definition":
+		// `module Name` and `baremodule Name`, without the members.
+		if name := node.ChildByFieldName("name"); validNode(name) {
+			end = name.EndByte()
+		}
+	case "assignment":
+		// Short-form `f(x) = expr`: the left-hand side, which also holds any
+		// `::T` or `where` clause.
+		if lhs := node.NamedChild(0); validNode(lhs) {
+			end = lhs.EndByte()
+		}
+	}
+	if end <= start || int(end) > len(src) {
+		return ""
+	}
+	return strings.Join(strings.Fields(string(src[start:end])), " ")
+}
+
 // fieldEntities extracts struct/class field declarations as field symbols, one
 // per declared name, qualified under the containing type's scope. It returns
 // false for non-field nodes and for declarations outside a container (so local
@@ -6491,6 +6532,16 @@ func entityFromNode(node *sitter.Node, src []byte, language, scope string) (Enti
 	// signature. Cap it to the declaration header.
 	if language == "F#" {
 		if sig := fsharpSignature(node, src); sig != "" {
+			entity.Signature = sig
+			entity.Fingerprint = hash(normalize(entityFingerprintSource(Entity{Name: name, Signature: sig}, block)))
+		}
+	}
+	// Julia definitions have the same shape: body statements follow the header
+	// as direct children, so signatureFromNode would keep the whole definition
+	// (for a module, every member) and any body edit would read as a signature
+	// change. Cap it to the declaration header.
+	if language == "Julia" {
+		if sig := juliaSignature(node, src); sig != "" {
 			entity.Signature = sig
 			entity.Fingerprint = hash(normalize(entityFingerprintSource(Entity{Name: name, Signature: sig}, block)))
 		}
