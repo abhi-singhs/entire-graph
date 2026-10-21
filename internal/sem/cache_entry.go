@@ -34,6 +34,20 @@ func newCacheEntry(cacheDir, family, version, key string) (cacheEntry, error) {
 	return newDerivedCacheEntry(cacheDir, family, version, "", key)
 }
 
+// newCacheStreamEntry addresses the raw byte sidecar of a cache entry: a gzip
+// stream stored beside the `.json.gz` envelope rather than inside it. Keeping
+// bulk bytes out of the JSON envelope is what lets a producer spool them to
+// disk as they arrive instead of holding the whole stream in memory to encode
+// one field.
+func newCacheStreamEntry(cacheDir, family, version, key string) (cacheEntry, error) {
+	entry, err := newDerivedCacheEntry(cacheDir, family, version, "", key)
+	if err != nil {
+		return cacheEntry{}, err
+	}
+	entry.relative = filepath.Join(family, version, key+".stream.gz")
+	return entry, nil
+}
+
 // newDerivedCacheEntry addresses an artifact that was DERIVED from another entry
 // and is only valid while that entry is. It nests the artifact in a directory
 // named by the entry it came from, which is what makes the dependent set

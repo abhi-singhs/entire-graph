@@ -37,7 +37,11 @@ import (
 // v17 retires routes omitted by closure-local writes and address escapes.
 // v18 retires bare routes from wrapped mounts and unbounded route masks.
 // v19 retires entries before unresolved route placement and Go 1.22 method patterns.
-const providerRecordsCacheVersion = "provider-records-v19-" + IdentityRevision
+// v20 moves the record bytes out of the JSON envelope into a `.stream.gz`
+// sidecar so a producer spools them to disk as they arrive; the envelope keeps
+// the sidecar's digest. Entries written by earlier builds embed the records
+// inline and are unreadable at this version (and vice versa).
+const providerRecordsCacheVersion = "provider-records-v20-" + IdentityRevision
 
 // cachedProviderRecords is the on-disk envelope for a cached record stream. The
 // key alone is authoritative (sha256 over version+commit+tree+mode+profile+
@@ -63,9 +67,15 @@ type cachedProviderRecords struct {
 	RepoRoot string `json:"repo_root"`
 	// RepoScope is cacheCheckoutScope of RepoRoot. A hit from another checkout
 	// restamps repo_root only when that checkout has the same scope.
-	RepoScope string           `json:"repo_scope,omitempty"`
-	Records   []byte           `json:"records"`
-	Summary   *SnapshotSummary `json:"summary,omitempty"`
+	RepoScope string `json:"repo_scope,omitempty"`
+	// RecordsDigest is the SHA-256 (hex) of the `.stream.gz` sidecar's stored
+	// bytes. The record stream lives there, not in this envelope, so the
+	// envelope must say which stream it vouches for: the two files are renamed
+	// into place separately, and a reader that finds a sidecar this digest does
+	// not match treats the entry as a miss rather than serving bytes nothing
+	// validated.
+	RecordsDigest string           `json:"records_digest"`
+	Summary       *SnapshotSummary `json:"summary,omitempty"`
 }
 
 // providerRecordsKey derives the cache key for a record stream. It intentionally
@@ -170,6 +180,7 @@ type ProviderRecordsCacheTransaction struct {
 	ctx             context.Context
 	enabled         bool
 	entry           cacheEntry
+	streamEntry     cacheEntry
 	absRepo         string
 	providerVersion string
 	repositoryKey   string
@@ -238,8 +249,24 @@ func BeginProviderRecordsCache(ctx context.Context, repo, providerVersion, commi
 	if err != nil {
 		return nil, err
 	}
+	transaction.streamEntry, err = newCacheStreamEntry(cacheDir, "records", providerRecordsCacheVersion, key)
+	if err != nil {
+		return nil, err
+	}
 	transaction.enabled = true
 	return transaction, nil
+}
+
+// NewSpool returns the writer a producer tees its record stream into while
+// building, so the bytes land on disk as they arrive instead of accumulating
+// in memory. A disabled transaction returns a nil spool: the caller skips the
+// tee and Store stays a no-op, the same silence the disabled path always had.
+// Give the finished spool to Store; Abandon it on any other exit.
+func (transaction *ProviderRecordsCacheTransaction) NewSpool() (*ProviderRecordsSpool, error) {
+	if transaction == nil || !transaction.enabled {
+		return nil, nil
+	}
+	return newProviderRecordsSpool(transaction.streamEntry)
 }
 
 // Options returns the policy-pinned options that must shape records stored by
@@ -272,7 +299,11 @@ func (transaction *ProviderRecordsCacheTransaction) Load() ([]byte, *SnapshotSum
 	if cache.RepoRoot != transaction.absRepo && cache.RepoScope != cacheCheckoutScope(transaction.absRepo, transaction.ctx) {
 		return nil, nil, false
 	}
-	records, ok := restampProviderRecordsRepoRoot(cache.Records, cache.RepoRoot, transaction.absRepo)
+	stored, err := readProviderRecordsStream(transaction.streamEntry, cache.RecordsDigest)
+	if err != nil {
+		return nil, nil, false
+	}
+	records, ok := restampProviderRecordsRepoRoot(stored, cache.RepoRoot, transaction.absRepo)
 	if !ok {
 		return nil, nil, false
 	}
@@ -320,13 +351,20 @@ func providerRecordsRepoRootField(root string) []byte {
 	return append([]byte(`"repo_root":`), bytes.TrimSuffix(encoded.Bytes(), []byte("\n"))...)
 }
 
-// Store persists records built with Options only when their observed header
-// still matches the immutable schema, commit, tree, repository identity,
-// provider, and profile that keyed this transaction. A moving HEAD, remote, or
+// Store persists the spooled records only when their observed header still
+// matches the immutable schema, commit, tree, repository identity, provider,
+// and profile that keyed this transaction. A moving HEAD, remote, or
 // serializer therefore cannot place a different snapshot's record stream under
 // the earlier cache entry.
-func (transaction *ProviderRecordsCacheTransaction) Store(records []byte, summary *SnapshotSummary, observed SnapshotHeader) error {
-	if transaction == nil || !transaction.enabled {
+//
+// Store consumes the spool on every path, success or failure; callers must not
+// reuse or Abandon it afterwards (Abandon stays safe, just redundant). The
+// sidecar is renamed into place before the envelope is written: a crash
+// between the two leaves a sidecar the surviving envelope's digest does not
+// match, which reads as a miss, never as the wrong bytes.
+func (transaction *ProviderRecordsCacheTransaction) Store(spool *ProviderRecordsSpool, summary *SnapshotSummary, observed SnapshotHeader) error {
+	if transaction == nil || !transaction.enabled || spool == nil {
+		spool.Abandon()
 		return nil
 	}
 	if observed.SchemaVersion != SchemaVersion ||
@@ -337,11 +375,19 @@ func (transaction *ProviderRecordsCacheTransaction) Store(records []byte, summar
 		observed.ProviderVersion != transaction.providerVersion ||
 		observed.Profile != string(transaction.options.Profile) ||
 		(observed.RepoRoot != "" && observed.RepoRoot != transaction.absRepo) {
+		spool.Abandon()
 		return fmt.Errorf(
 			"provider records snapshot provenance changed while building: got schema=%q commit=%q tree=%q repo=%q provider=%q version=%q profile=%q root=%q, want schema=%q commit=%q tree=%q repo=%q provider=%q version=%q profile=%q root=%q",
 			observed.SchemaVersion, observed.Commit, observed.Tree, observed.RepoKey, observed.Provider, observed.ProviderVersion, observed.Profile, observed.RepoRoot,
 			SchemaVersion, transaction.commit, transaction.tree, transaction.repositoryKey, ProviderName, transaction.providerVersion, transaction.options.Profile, transaction.absRepo,
 		)
+	}
+	digest, err := spool.finish()
+	if err != nil {
+		return err
+	}
+	if err := spool.install(transaction.streamEntry); err != nil {
+		return err
 	}
 	cache := cachedProviderRecords{
 		CacheVersion:    providerRecordsCacheVersion,
@@ -354,7 +400,7 @@ func (transaction *ProviderRecordsCacheTransaction) Store(records []byte, summar
 		MaxParseBytes:   transaction.options.MaxParseBytes,
 		RepoRoot:        transaction.absRepo,
 		RepoScope:       cacheCheckoutScope(transaction.absRepo, transaction.ctx),
-		Records:         records,
+		RecordsDigest:   fmt.Sprintf("%x", digest[:]),
 		Summary:         summary,
 	}
 	return writeProviderRecords(transaction.entry, cache)
