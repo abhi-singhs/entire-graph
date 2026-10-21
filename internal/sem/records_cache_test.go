@@ -20,10 +20,8 @@ func spoolRecords(transaction *ProviderRecordsCacheTransaction, records []byte) 
 		// test depends on.
 		return nil, err
 	}
-	if _, err := spool.Write(records); err != nil {
-		spool.Abandon()
-		return nil, err
-	}
+	// Spool writes always report success; a failure is deferred to Store.
+	_, _ = spool.Write(records)
 	return spool, nil
 }
 

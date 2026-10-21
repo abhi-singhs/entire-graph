@@ -33,6 +33,9 @@ type ProviderRecordsSpool struct {
 	compressor    *gzip.Writer
 	digest        hashpkg.Hash
 	closed        bool
+	// err is the first spool failure. Write remembers it instead of returning
+	// it (see Write), and finish surfaces it so Store abandons the entry.
+	err error
 }
 
 func newProviderRecordsSpool(entry cacheEntry) (*ProviderRecordsSpool, error) {
@@ -74,35 +77,52 @@ func newProviderRecordsSpool(entry cacheEntry) (*ProviderRecordsSpool, error) {
 	}, nil
 }
 
-// Write appends produced record bytes to the spool.
+// Write appends produced record bytes to the spool. It ALWAYS reports
+// success: this writer sits inside the io.MultiWriter that also feeds stdout,
+// and a short write there would abort the stream the command exists to
+// produce — on exactly the large repositories the cache matters most for. A
+// failure (a full or flaky cache disk, a write after finish) is remembered
+// and resurfaces from Store, which abandons the entry instead of installing a
+// partial one. The cache is best effort; the stream is not. This is the same
+// contract the in-memory capture this spool replaced had.
 func (spool *ProviderRecordsSpool) Write(p []byte) (int, error) {
-	if spool == nil || spool.closed {
-		return 0, fmt.Errorf("provider records spool is closed")
+	if spool.err == nil && spool.closed {
+		spool.err = fmt.Errorf("provider records spool written after finish")
 	}
-	return spool.compressor.Write(p)
+	if spool.err == nil {
+		if _, err := spool.compressor.Write(p); err != nil {
+			spool.err = err
+		}
+	}
+	return len(p), nil
 }
 
 // finish flushes and closes the temporary file and returns the digest of its
-// stored bytes. The spool keeps its directory handle for install.
+// stored bytes, or the first failure the spool deferred. The file is closed
+// exactly once, before any discard, so a failed finish cannot leak the handle
+// — on Windows removing a still-open file fails, which would leave `.stream-*`
+// leftovers in the cache directory. The spool keeps its directory handle for
+// install.
 func (spool *ProviderRecordsSpool) finish() (cacheDigest, error) {
 	if spool.closed {
 		return cacheDigest{}, fmt.Errorf("provider records spool is closed")
 	}
 	spool.closed = true
-	if err := spool.compressor.Close(); err != nil {
-		spool.discard()
-		return cacheDigest{}, err
+	err := spool.err
+	if closeErr := spool.compressor.Close(); err == nil && closeErr != nil {
+		err = closeErr
 	}
-	if err := spool.buffered.Flush(); err != nil {
-		spool.discard()
-		return cacheDigest{}, err
+	if flushErr := spool.buffered.Flush(); err == nil && flushErr != nil {
+		err = flushErr
 	}
-	if err := spool.file.Close(); err != nil {
-		spool.file = nil
-		spool.discard()
-		return cacheDigest{}, err
+	if closeErr := spool.file.Close(); err == nil && closeErr != nil {
+		err = closeErr
 	}
 	spool.file = nil
+	if err != nil {
+		spool.discard()
+		return cacheDigest{}, err
+	}
 	var digest cacheDigest
 	copy(digest[:], spool.digest.Sum(nil))
 	return digest, nil

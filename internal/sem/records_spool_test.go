@@ -2,6 +2,7 @@ package sem
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -76,6 +77,45 @@ func TestProviderRecordsSpoolRoundTripAndCleanup(t *testing.T) {
 	}
 	if err := disabled.Store(nilSpool, nil, SnapshotHeader{}); err != nil {
 		t.Fatalf("disabled store must stay a no-op: %v", err)
+	}
+}
+
+// A spool failure must never abort the record stream it tees from: Write keeps
+// reporting success and the deferred error surfaces from Store, which refuses
+// the entry and cleans up. This is the contract that keeps a full or flaky
+// cache disk from failing a snapshot after partial output.
+func TestProviderRecordsSpoolDefersWriteFailureToStore(t *testing.T) {
+	repo := t.TempDir()
+	transaction, err := BeginProviderRecordsCache(
+		t.Context(), repo, "test", "commit-a", "tree-a", "snapshot", t.TempDir(), ProviderSnapshotOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spool, err := transaction.NewSpool()
+	if err != nil {
+		t.Fatal(err)
+	}
+	spool.err = fmt.Errorf("disk full")
+	if n, writeErr := spool.Write([]byte("records\n")); n != 8 || writeErr != nil {
+		t.Fatalf("spool write must report success after a failure, got n=%d err=%v", n, writeErr)
+	}
+	if err := transaction.Store(spool, nil, SnapshotHeader{
+		SchemaVersion:   SchemaVersion,
+		Provider:        ProviderName,
+		ProviderVersion: "test",
+		RepoKey:         transaction.repositoryKey,
+		Commit:          "commit-a",
+		Tree:            "tree-a",
+		Profile:         string(transaction.options.Profile),
+	}); err == nil {
+		t.Fatal("store must surface the deferred spool failure")
+	}
+	if _, _, hit := transaction.Load(); hit {
+		t.Fatal("a failed spool must not produce a cache entry")
+	}
+	if leftovers := spoolTemporaries(t, transaction); len(leftovers) != 0 {
+		t.Fatalf("failed store left spool temporaries %v", leftovers)
 	}
 }
 

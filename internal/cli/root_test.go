@@ -1648,12 +1648,13 @@ func TestSnapshotRecordCacheSpoolsToDisk(t *testing.T) {
 	}
 
 	// A cache directory the spool cannot create its temporary in: the stream
-	// must be unaffected, the failure said once on stderr, nothing stored.
+	// must be unaffected, the failure said once on stderr, nothing stored. The
+	// blocker is a regular FILE at the cache-directory path — unlike a 0o500
+	// directory, which Windows does not treat as unwritable.
 	unwritable := filepath.Join(t.TempDir(), "sealed")
-	if err := os.MkdirAll(unwritable, 0o500); err != nil {
+	if err := os.WriteFile(unwritable, []byte("not a directory"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(unwritable, 0o700) })
 	degraded, degradedErr := run(unwritable)
 	if degraded != full {
 		t.Fatalf("a failed spool changed the streamed output:\n got %q\nwant %q", degraded, full)
@@ -1661,7 +1662,7 @@ func TestSnapshotRecordCacheSpoolsToDisk(t *testing.T) {
 	if !strings.Contains(degradedErr, "provider records cache") {
 		t.Fatalf("a failed spool should be reported on stderr, got %q", degradedErr)
 	}
-	if files := cacheFiles(unwritable); len(files) != 0 {
-		t.Fatalf("a failed spool stored %v", files)
+	if info, err := os.Stat(unwritable); err != nil || info.IsDir() {
+		t.Fatalf("a failed spool replaced the blocking file: %v %v", info, err)
 	}
 }
