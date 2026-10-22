@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/entireio/entire-graph/internal/agentsetup"
@@ -111,6 +112,9 @@ func isHomeDir(dir string) bool {
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
 		return false
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(absHome, absDir)
 	}
 	return absHome == absDir
 }

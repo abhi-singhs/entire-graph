@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -142,7 +143,12 @@ func TestNestedRepoWarningSkipsAGitTrackedHome(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	t.Setenv("HOME", home)
+	// os.UserHomeDir reads USERPROFILE on Windows and HOME elsewhere.
+	homeEnv := "HOME"
+	if runtime.GOOS == "windows" {
+		homeEnv = "USERPROFILE"
+	}
+	t.Setenv(homeEnv, home)
 
 	var out bytes.Buffer
 	_ = Run(context.Background(), Options{Stdout: &out, Stderr: &out, Env: EntireEnv{RepoRoot: project}}, []string{"setup"})
