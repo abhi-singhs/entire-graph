@@ -19,6 +19,8 @@ import (
 // its latency is bounded by indexed reads, and a missing store is a clean
 // machine-readable degradation signal rather than a multi-second surprise.
 type contextFlags struct {
+	IgnoreFiles    storeStringList
+	IncludeFiles   storeStringList
 	Repo           string
 	Task           string
 	Limit          int
@@ -32,6 +34,8 @@ func parseContextFlags(args []string) (contextFlags, error) {
 	flags := contextFlags{}
 	set := flag.NewFlagSet("context", flag.ContinueOnError)
 	set.SetOutput(io.Discard)
+	set.Var(&flags.IgnoreFiles, "ignore-file", "extra ignore file")
+	set.Var(&flags.IncludeFiles, "include-file", "extra include file")
 	set.StringVar(&flags.Repo, "repo", "", "repository path (default: current repo)")
 	set.StringVar(&flags.Task, "task", "", "task text to find context for (required)")
 	set.IntVar(&flags.Limit, "limit", 12, "maximum symbols returned")
@@ -86,8 +90,10 @@ func runContext(ctx context.Context, opts Options, args []string) error {
 	cacheDir := resolveCacheDir(flags.CacheDir, opts.Env.PluginDataDir)
 	started := time.Now()
 	result, err := sem.LoadSearchStoreContext(ctx, repo, opts.Version, cacheDir, flags.Task, sem.ProviderSnapshotOptions{
-		NoNetwork: true,
-		Profile:   profile,
+		NoNetwork:    true,
+		IgnoreFiles:  flags.IgnoreFiles,
+		IncludeFiles: flags.IncludeFiles,
+		Profile:      profile,
 	}, flags.Limit, flags.TestsLimit, flags.RelationsLimit)
 	response := contextResponse{
 		SchemaVersion:      sem.SchemaVersion,

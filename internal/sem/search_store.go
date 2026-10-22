@@ -34,7 +34,8 @@ import (
 // derived sibling of the search snapshot entry and shares its key.
 // v2 adds the relations_from/relations_to indexes with their first reader
 // (the store context query's fan-out); v1 entries lack them and are rebuilt.
-const searchStoreVersion = "search-store-sqlite-v2"
+// v3 adds the versioned read-only projection used by Brain inspection.
+const searchStoreVersion = "search-store-sqlite-v3"
 
 // searchStoreEnv gates the READ path while the store rolls out: the artifact
 // is written beside complete JSON entries, but it is only served when the
@@ -95,6 +96,24 @@ CREATE TABLE relations (
 CREATE INDEX relations_from ON relations(from_id);
 CREATE INDEX relations_to ON relations(to_id);
 CREATE TABLE unmerged_data_flow_edges (from_id TEXT NOT NULL, to_id TEXT NOT NULL);
+-- Versioned read-only projection for consumers. These views contain no copy
+-- of the graph; indexes on the underlying endpoint/id columns still apply.
+CREATE VIEW brain_symbols_v1 AS SELECT id, kind, name, qualified_name, file_path,
+ coalesce(json_extract(record,'$.start_line'),0) start_line,
+ coalesce(json_extract(record,'$.end_line'),0) end_line,
+ coalesce(json_extract(record,'$.signature'),'') signature,
+ coalesce(json_extract(record,'$.language'),'') language,
+ coalesce(json_extract(record,'$.stable_id_version'),'') stable_id_version FROM symbols;
+CREATE VIEW brain_relations_v1 AS SELECT rowid id, from_id, to_id, type, confidence, reason,
+ coalesce(json_extract(extra,'$.warning_codes'),'[]') warning_codes FROM relations;
+CREATE VIEW brain_files_v1 AS SELECT path,
+ coalesce(json_extract(record,'$.blob'),'') blob,
+ coalesce(json_extract(record,'$.content_hash'),'') content_hash,
+ coalesce(json_extract(record,'$.language'),'') language FROM files;
+CREATE VIEW brain_reverse_relations_v1 AS SELECT to_id, from_id, type FROM relations;
+CREATE VIEW brain_symbol_fts_v1 AS SELECT id,
+ name || ' ' || qualified_name || ' ' || coalesce(json_extract(record,'$.signature'),'') || ' ' || file_path || ' ' || kind || ' ' || coalesce(json_extract(record,'$.language'),'') text FROM symbols;
+
 `
 
 // Secondary indexes land WITH their first reader, never speculatively: the
