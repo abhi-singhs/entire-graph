@@ -140,7 +140,7 @@ const graphCommands = `    entire graph query --repo . --profile full --head --f
 // graphObligation is SHIPPED text, shared by graphWorkflow and combinedWorkflow.
 //
 // It replaced "Your FIRST action ... MUST be ONE Graph query". That sentence was obeyed to the
-// letter and no further: in a fresh-environment baseline (Claude Code, init-agents installed)
+// letter and no further: in a fresh-environment baseline (Claude Code, agent guide installed)
 // agents ran exactly one query, said so ("I ran the graph query once as the repo guidance
 // asked"), and answered every later locate and relationship question with grep and sed, with
 // zero def/neighbors/impact calls even on a blast-radius task. "ONE" read as a quota, so the
