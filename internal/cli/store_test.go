@@ -7,13 +7,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
 func TestStoreDescriptorUsesCurrentTreeAndRequiresBuild(t *testing.T) {
 	t.Setenv("ENTIRE_GRAPH_SEARCH_STORE", "1")
 	repo := t.TempDir()
-	cache := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "cache-\u009b")
 	git := func(args ...string) {
 		t.Helper()
 		cmd := exec.Command("git", args...)
@@ -50,6 +51,9 @@ func TestStoreDescriptorUsesCurrentTreeAndRequiresBuild(t *testing.T) {
 	if err := runStore(context.Background(), opts, args); err != nil {
 		t.Fatal(err)
 	}
+	if strings.ContainsRune(out.String(), '\u009b') {
+		t.Fatalf("descriptor emitted a raw C1 control: %q", out.String())
+	}
 	var d struct {
 		Version int    `json:"contract_version"`
 		Path    string `json:"path"`
@@ -61,6 +65,9 @@ func TestStoreDescriptorUsesCurrentTreeAndRequiresBuild(t *testing.T) {
 	}
 	if d.Version != 1 || d.Commit == "" || d.Symbols == 0 || !filepath.IsAbs(d.Path) {
 		t.Fatalf("descriptor=%s", out.String())
+	}
+	if !strings.ContainsRune(d.Path, '\u009b') {
+		t.Fatalf("JSON escaping changed the decoded cache path: %q", d.Path)
 	}
 	if _, err := os.Stat(d.Path); err != nil {
 		t.Fatal(err)

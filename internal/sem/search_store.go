@@ -35,7 +35,8 @@ import (
 // v2 adds the relations_from/relations_to indexes with their first reader
 // (the store context query's fan-out); v1 entries lack them and are rebuilt.
 // v3 adds the versioned read-only projection used by Brain inspection.
-const searchStoreVersion = "search-store-sqlite-v3"
+// v4 fixes the file content identity projection to use the indexed Git blob.
+const searchStoreVersion = "search-store-sqlite-v4"
 
 // searchStoreEnv gates the READ path while the store rolls out: the artifact
 // is written beside complete JSON entries, but it is only served when the
@@ -108,7 +109,8 @@ CREATE VIEW brain_relations_v1 AS SELECT rowid id, from_id, to_id, type, confide
  coalesce(json_extract(extra,'$.warning_codes'),'[]') warning_codes FROM relations;
 CREATE VIEW brain_files_v1 AS SELECT path,
  coalesce(json_extract(record,'$.blob'),'') blob,
- coalesce(json_extract(record,'$.content_hash'),'') content_hash,
+ CASE WHEN coalesce(json_extract(record,'$.blob'),'') = '' THEN ''
+ ELSE 'git-blob:' || json_extract(record,'$.blob') END content_hash,
  coalesce(json_extract(record,'$.language'),'') language FROM files;
 CREATE VIEW brain_reverse_relations_v1 AS SELECT to_id, from_id, type FROM relations;
 CREATE VIEW brain_symbol_fts_v1 AS SELECT id,

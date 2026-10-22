@@ -9,6 +9,7 @@ import (
 	"io"
 
 	"github.com/entireio/entire-graph/internal/sem"
+	"github.com/entireio/entire-graph/internal/termsafe"
 )
 
 // store resolves the read-only compatibility surface without building it.
@@ -38,12 +39,12 @@ func runStore(ctx context.Context, opts Options, args []string) error {
 	}
 	result, err := sem.DescribeSearchStore(ctx, resolved, opts.Version, resolveCacheDir(cacheDir, opts.Env.PluginDataDir), sem.ProviderSnapshotOptions{NoNetwork: true, Profile: parsed, IgnoreFiles: ignores, IncludeFiles: includes})
 	if errors.Is(err, sem.ErrSearchStoreMissing) {
-		return json.NewEncoder(opts.Stdout).Encode(map[string]any{"contract_version": 1, "store_unavailable": true, "detail": err.Error()})
+		return json.NewEncoder(termsafe.NewJSONWriter(opts.Stdout)).Encode(map[string]any{"contract_version": 1, "store_unavailable": true, "detail": err.Error()})
 	}
 	if err != nil {
 		return err
 	}
-	return json.NewEncoder(opts.Stdout).Encode(result)
+	return json.NewEncoder(termsafe.NewJSONWriter(opts.Stdout)).Encode(result)
 }
 
 type storeStringList []string

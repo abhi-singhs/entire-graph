@@ -228,6 +228,22 @@ func TestSearchStoreReadProjectionMatchesCanonicalRecords(t *testing.T) {
 			t.Fatalf("search projection %q != %q", search, want)
 		}
 	}
+	if len(snapshot.Files) == 0 {
+		t.Fatal("fixture has no file records")
+	}
+	for _, file := range snapshot.Files {
+		var blob, contentHash, language string
+		err = db.QueryRow("SELECT blob,content_hash,language FROM brain_files_v1 WHERE path=?", file.Path).Scan(&blob, &contentHash, &language)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if file.Blob == "" {
+			t.Fatalf("fixture file %q has no blob", file.Path)
+		}
+		if blob != file.Blob || contentHash != "git-blob:"+file.Blob || language != file.Language {
+			t.Fatalf("file projection %q: blob=%q content_hash=%q language=%q", file.Path, blob, contentHash, language)
+		}
+	}
 	var count int
 	if err = db.QueryRow("SELECT count(*) FROM brain_relations_v1").Scan(&count); err != nil || count != len(snapshot.Relations) {
 		t.Fatalf("relations=%d err=%v", count, err)

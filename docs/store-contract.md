@@ -22,6 +22,10 @@ Consumers may create connection-local TEMP aliases and join their own runtime
 observations, but must not modify Graph tables. Contract changes require a new
 version; internal table changes remain Graph's responsibility.
 
-The search-store cache format is v3 so older stores are rebuilt with the views.
+The file view exposes content_hash as git-blob:<blob> from the indexed file record,
+or an empty string when no blob is available. It never hashes the live working
+tree, which may differ from the committed source.
+
+The search-store cache format is v4 so older stores are rebuilt with the views.
 This does not change provider schema 1.x or symbol identity. Release this contract
 before the Brain consumer that retires its duplicate code graph.
