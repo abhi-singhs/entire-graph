@@ -1,0 +1,46 @@
+{
+  "cli_version": "0.12.0",
+  "checkpoint_id": "615db1ee1d38",
+  "strategy": "manual-commit",
+  "branch": "fix/julia-signature-module-dataflow",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "NOTICES",
+    "bench/memory/FAIR-CONFIG.md",
+    "bench/memory/UPSTREAM.md",
+    "bench/memory/requirements-lock-py312.txt",
+    "go.mod",
+    "go.sum",
+    "internal/sem/cache_encode_jsonv2.go",
+    "internal/sem/cache_encode_legacy.go",
+    "internal/sem/cache_entry.go",
+    "internal/sem/flow_syntax.go",
+    "internal/sem/flow_syntax_test.go",
+    "internal/sem/golden_test.go",
+    "internal/sem/provider.go",
+    "internal/sem/provider_parallel_stream.go",
+    "internal/sem/provider_parallel_stream_test.go",
+    "internal/sem/records_cache.go",
+    "internal/sem/records_spool.go",
+    "internal/sem/search_cache.go",
+    "internal/sem/search_store.go",
+    "internal/sem/search_store_test.go",
+    "internal/sem/types.go"
+  ],
+  "sessions": [
+    {
+      "metadata": "/61/5db1ee1d38/0/metadata.json",
+      "transcript": "/61/5db1ee1d38/0/full.jsonl",
+      "compact_transcript": "/61/5db1ee1d38/0/transcript.jsonl",
+      "content_hash": "/61/5db1ee1d38/0/content_hash.txt",
+      "prompt": "/61/5db1ee1d38/0/prompt.txt"
+    }
+  ],
+  "token_usage": {
+    "input_tokens": 28,
+    "cache_creation_tokens": 46241,
+    "cache_read_tokens": 870281,
+    "output_tokens": 4921,
+    "api_call_count": 14
+  }
+}

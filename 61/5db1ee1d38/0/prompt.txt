@@ -1,0 +1,1 @@
+resolve conflicts https://github.com/entireio/entire-graph/pull/351
