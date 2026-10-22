@@ -32,7 +32,9 @@ import (
 // searchStoreVersion follows the same rules as the other cache versions: bump
 // it whenever the stored shape or the producer's rules change. The store is a
 // derived sibling of the search snapshot entry and shares its key.
-const searchStoreVersion = "search-store-sqlite-v1"
+// v2 adds the relations_from/relations_to indexes with their first reader
+// (the store context query's fan-out); v1 entries lack them and are rebuilt.
+const searchStoreVersion = "search-store-sqlite-v2"
 
 // searchStoreEnv gates the READ path while the store rolls out: the artifact
 // is written beside complete JSON entries, but it is only served when the
@@ -90,14 +92,16 @@ CREATE TABLE relations (
 	evidence_dropped INTEGER NOT NULL,
 	extra TEXT
 );
+CREATE INDEX relations_from ON relations(from_id);
+CREATE INDEX relations_to ON relations(to_id);
 CREATE TABLE unmerged_data_flow_edges (from_id TEXT NOT NULL, to_id TEXT NOT NULL);
 `
 
-// No secondary indexes yet, deliberately: the full load below reads rows in
-// rowid order and nothing selects by name, path, or endpoint. Each index is
-// one line plus a version bump away, and lands with the first reader that
-// needs it — building six B-trees on every snapshot persist for a speculative
-// consumer was the cost without the benefit.
+// Secondary indexes land WITH their first reader, never speculatively: the
+// relation endpoint indexes serve the store context query's fan-out
+// (searchStoreRelationsForIDs). The symbol name/path columns stay unindexed —
+// their reader scans with Go-side scoring, and a B-tree cannot serve the
+// substring match it does.
 
 // searchStoreRelationExtra carries the two composite RelationRecord fields.
 // WarningCodes is deliberately NOT omitempty: production relations always

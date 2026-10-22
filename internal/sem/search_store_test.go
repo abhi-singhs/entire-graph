@@ -1,6 +1,7 @@
 package sem
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -96,4 +97,76 @@ func diffSearchStoreCaches(t *testing.T, g, w cachedSearchSnapshot) string {
 func validTestCacheKey(t *testing.T) string {
 	t.Helper()
 	return "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}
+
+// The context query is the delegation surface a downstream consumer calls
+// instead of keeping its own graph copy. Pinned: task tokens rank the matching
+// symbol first, the relation fan-out covers the returned symbols, symbols in
+// test files land in tests (not symbols), and a stale store reads as
+// ErrSearchStoreMissing so consumers degrade rather than error.
+func TestSearchStoreContextServesTaskContext(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("widget.go", "package sample\n\ntype Widget struct{ Name string }\n\nfunc NewWidget(name string) *Widget { return &Widget{Name: name} }\n\nfunc RenderWidget(w *Widget) string {\n\treturn w.Name\n}\n")
+	write("other.go", "package sample\n\nfunc Unrelated() int { return 1 }\n")
+	write("widget_test.go", "package sample\n\nimport \"testing\"\n\nfunc TestRenderWidget(t *testing.T) {\n\tif RenderWidget(NewWidget(\"x\")) != \"x\" {\n\t\tt.Fatal(\"render\")\n\t}\n}\n")
+
+	snapshot, err := BuildProviderSnapshotWithOptions(t.Context(), dir, "store-test", ProviderSnapshotOptions{Worktree: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := newCachedSearchSnapshot("store-test", "commit-a", "tree-a", ProviderSnapshotOptions{}, snapshot, t.Context())
+	storePath := filepath.Join(t.TempDir(), "store.sqlite")
+	if err := buildSearchStore(t.Context(), storePath, "digest-a", &cache); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := QuerySearchStoreContext(t.Context(), storePath, "digest-a", "render the widget name", 5, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Symbols) == 0 || got.Symbols[0].Name != "RenderWidget" {
+		t.Fatalf("expected RenderWidget ranked first, got %+v", got.Symbols)
+	}
+	for _, symbol := range got.Symbols {
+		if symbol.FilePath == "widget_test.go" {
+			t.Fatalf("test-file symbol leaked into symbols: %+v", symbol)
+		}
+		if symbol.StartLine == 0 {
+			t.Fatalf("symbol %s lost its line range", symbol.ID)
+		}
+	}
+	returned := map[string]bool{}
+	for _, symbol := range got.Symbols {
+		returned[symbol.ID] = true
+	}
+	touchesReturned := false
+	for _, relation := range got.Relations {
+		if returned[relation.FromID] || returned[relation.ToID] {
+			touchesReturned = true
+			break
+		}
+	}
+	if len(got.Relations) > 0 && !touchesReturned {
+		t.Fatalf("relation fan-out does not touch returned symbols: %+v", got.Relations)
+	}
+	foundTest := false
+	for _, test := range got.Tests {
+		if test.Name == "TestRenderWidget" {
+			foundTest = true
+		}
+	}
+	if !foundTest {
+		t.Fatalf("expected TestRenderWidget in tests, got %+v", got.Tests)
+	}
+
+	// Stale store (wrong digest) must degrade, not error arbitrarily.
+	if _, err := QuerySearchStoreContext(t.Context(), storePath, "digest-b", "render the widget name", 5, 3); !errors.Is(err, ErrSearchStoreMissing) {
+		t.Fatalf("stale store should read as ErrSearchStoreMissing, got %v", err)
+	}
 }
