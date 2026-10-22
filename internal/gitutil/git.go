@@ -2385,7 +2385,15 @@ func treePathsOverlap(left, right string) bool {
 		strings.HasPrefix(right, left+"/")
 }
 
-func treeEntryMetadataBatch(ctx context.Context, repo, rev string, paths []string) (map[string]primedLimitedFile, error) {
+func treeEntryMetadataBatch(ctx context.Context, repo, rev string, paths []string) (result map[string]primedLimitedFile, err error) {
+	// Killing Git can surface as an exit status or a truncated pipe read,
+	// especially on Windows. Preserve the cancellation identity at this
+	// subprocess boundary, as runWithStderr does for ordinary Git commands.
+	defer func() {
+		if err != nil && ctx.Err() != nil {
+			err = ctx.Err()
+		}
+	}()
 	if rev == "" || strings.HasPrefix(rev, "-") || strings.ContainsRune(rev, 0) {
 		return nil, fmt.Errorf("invalid treeish %q", rev)
 	}
