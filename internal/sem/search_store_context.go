@@ -280,45 +280,12 @@ var ErrSearchStoreMissing = fmt.Errorf(
 // missing sidecar (or one that does not match the current entry) returns
 // ErrSearchStoreMissing so the caller can degrade instead of paying a parse.
 func LoadSearchStoreContext(ctx context.Context, repo, providerVersion, cacheDir, task string, options ProviderSnapshotOptions, limit, testsLimit, relationsLimit int) (SearchStoreContext, error) {
-	if cacheDir == "" {
-		return SearchStoreContext{}, fmt.Errorf("store context requires a cache directory")
-	}
-	options.Worktree = false
-	options.OnlyFiles = nil
-	if options.Profile == "" {
-		options.Profile = ProfileFull
-	}
-	absRepo, err := filepath.Abs(repo)
+	descriptor, err := DescribeSearchStore(ctx, repo, providerVersion, cacheDir, options)
 	if err != nil {
 		return SearchStoreContext{}, err
 	}
-	options, err = CaptureProviderCachePolicy(absRepo, options)
-	if err != nil {
-		return SearchStoreContext{}, err
-	}
-	_, tree, err := resolveCommittedHEAD(ctx, absRepo)
-	if err != nil {
-		return SearchStoreContext{}, fmt.Errorf("resolve committed HEAD for store context: %w", err)
-	}
-	repositoryKey := repoKey(ctx, absRepo)
-	key, err := searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, options, ctx)
-	if err != nil {
-		return SearchStoreContext{}, err
-	}
-	entry, err := newCacheEntry(cacheDir, "search", searchSnapshotCacheVersion, key)
-	if err != nil {
-		return SearchStoreContext{}, err
-	}
-	store := searchStoreEntryFor(entry)
-	path := filepath.Join(store.root, store.relative)
-	if _, err := os.Stat(path); err != nil {
-		return SearchStoreContext{}, ErrSearchStoreMissing
-	}
-	digest, err := entry.digest()
-	if err != nil {
-		return SearchStoreContext{}, ErrSearchStoreMissing
-	}
-	result, err := QuerySearchStoreContext(ctx, path, digest.String(), task, limit, testsLimit, relationsLimit)
+	path, digest := descriptor.Path, descriptor.EntryDigest
+	result, err := QuerySearchStoreContext(ctx, path, digest, task, limit, testsLimit, relationsLimit)
 	if err != nil {
 		return SearchStoreContext{}, err
 	}
@@ -444,4 +411,91 @@ func searchStoreSymbolsByIDs(ctx context.Context, db *sql.DB, ids map[string]str
 		})
 	}
 	return out, nil
+}
+
+// SearchStoreDescriptor identifies an immutable Graph-owned store. Consumers
+// may open it mode=ro, use only the versioned views, and must re-resolve it per
+// operation. Paths are local capabilities, not portable manifest entries.
+type SearchStoreDescriptor struct {
+	ContractVersion int             `json:"contract_version"`
+	Path            string          `json:"path"`
+	EntryDigest     string          `json:"entry_digest"`
+	Commit          string          `json:"commit"`
+	Tree            string          `json:"tree"`
+	Header          json.RawMessage `json:"header"`
+	Files           int             `json:"files"`
+	Symbols         int             `json:"symbols"`
+	Relations       int             `json:"relations"`
+	Externals       int             `json:"externals"`
+}
+
+// DescribeSearchStore never builds or scans a snapshot. It verifies the same
+// cache identity as context before handing out a read-only store capability.
+func DescribeSearchStore(ctx context.Context, repo, providerVersion, cacheDir string, options ProviderSnapshotOptions) (SearchStoreDescriptor, error) {
+	if cacheDir == "" {
+		return SearchStoreDescriptor{}, fmt.Errorf("store context requires a cache directory")
+	}
+	options.Worktree = false
+	options.OnlyFiles = nil
+	if options.Profile == "" {
+		options.Profile = ProfileFull
+	}
+	absRepo, err := filepath.Abs(repo)
+	if err != nil {
+		return SearchStoreDescriptor{}, err
+	}
+	options, err = CaptureProviderCachePolicy(absRepo, options)
+	if err != nil {
+		return SearchStoreDescriptor{}, err
+	}
+	_, tree, err := resolveCommittedHEAD(ctx, absRepo)
+	if err != nil {
+		return SearchStoreDescriptor{}, fmt.Errorf("resolve committed HEAD for store context: %w", err)
+	}
+	repositoryKey := repoKey(ctx, absRepo)
+	key, err := searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree, options, ctx)
+	if err != nil {
+		return SearchStoreDescriptor{}, err
+	}
+	entry, err := newCacheEntry(cacheDir, "search", searchSnapshotCacheVersion, key)
+	if err != nil {
+		return SearchStoreDescriptor{}, err
+	}
+	store := searchStoreEntryFor(entry)
+	path := filepath.Join(store.root, store.relative)
+	if _, err := os.Stat(path); err != nil {
+		return SearchStoreDescriptor{}, ErrSearchStoreMissing
+	}
+	digest, err := entry.digest()
+	if err != nil {
+		return SearchStoreDescriptor{}, ErrSearchStoreMissing
+	}
+
+	db, err := sql.Open("sqlite", "file:"+sqliteURLPath(path)+"?immutable=1&mode=ro")
+	if err != nil {
+		return SearchStoreDescriptor{}, err
+	}
+	defer db.Close()
+	var version, storedDigest string
+	if err := readSearchStoreMetaKey(ctx, db, "store_version", &version); err != nil {
+		return SearchStoreDescriptor{}, err
+	}
+	if err := readSearchStoreMetaKey(ctx, db, "entry_digest", &storedDigest); err != nil {
+		return SearchStoreDescriptor{}, err
+	}
+	if version != searchStoreVersion || storedDigest != digest.String() {
+		return SearchStoreDescriptor{}, ErrSearchStoreMissing
+	}
+	var meta searchStoreMeta
+	if err := readSearchStoreMetaKey(ctx, db, "envelope", &meta); err != nil {
+		return SearchStoreDescriptor{}, err
+	}
+	result := SearchStoreDescriptor{ContractVersion: 1, Path: path, EntryDigest: storedDigest, Commit: meta.Commit, Tree: meta.Tree}
+	if err := readSearchStoreMetaKey(ctx, db, "header", &result.Header); err != nil {
+		return SearchStoreDescriptor{}, err
+	}
+	if err := db.QueryRowContext(ctx, "SELECT (SELECT count(*) FROM files), (SELECT count(*) FROM symbols), (SELECT count(*) FROM relations), (SELECT count(*) FROM externals)").Scan(&result.Files, &result.Symbols, &result.Relations, &result.Externals); err != nil {
+		return SearchStoreDescriptor{}, err
+	}
+	return result, nil
 }

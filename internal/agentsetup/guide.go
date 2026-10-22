@@ -171,6 +171,14 @@ A Coverage or Completeness line lists files Graph could not parse, often minifie
 generated ones. It does not mean the results are partial; only a failure in the
 language you asked about can hide a fact, and then you check that one relation in
 source. Static relations can be incomplete: an empty result is not proof of no callers.
+
+For local integrations, entire graph store resolves the committed-tree SQLite
+store as JSON without building it. Consumers open read-only and verify the entry
+digest. entire graph context --task "<task text>" returns bounded task context
+from that store. Both accept --repo, --profile, --cache-dir, and repeatable
+--ignore-file / --include-file paths matching the indexed policy. Missing stores
+report store_unavailable=true; build the matching index with
+ENTIRE_GRAPH_SEARCH_STORE=1 entire graph index --head.
 `
 
 // graphWorkflow is SHIPPED text. Its obligation is graphObligation; see there before softening.

@@ -158,14 +158,31 @@ var commandDocs = []commandDoc{
 
 	// ── Inspect the graph ────────────────────────────────────────────────
 	{
+		name:    "store",
+		group:   groupInspect,
+		summary: "Resolve the read-only committed-tree code store for local consumers",
+		usage:   []string{`entire graph store [--repo path] [--profile full] [--cache-dir path] [--ignore-file path] [--include-file path]`},
+		long:    "Returns a JSON descriptor containing the current committed-tree SQLite path, entry digest, provider metadata and counts. It never builds an index. A missing or incompatible store returns store_unavailable=true. Build the matching cache variant with ENTIRE_GRAPH_SEARCH_STORE=1 entire graph index --head. Consumers must open read-only and verify the entry digest; see docs/store-contract.md.",
+		flags: []flagDoc{
+			{name: "--repo", arg: "path", desc: "Repository (default: current repo)"},
+			{name: "--profile", arg: "syntax-only|fast|full", def: "full", desc: "Indexing profile of the store to read (match the index that built it)"},
+			{name: "--cache-dir", arg: "path", desc: "Cache directory holding the store (default: plugin data dir, else user cache dir)"},
+			{name: "--ignore-file", arg: "path", desc: "Additional ignore file; repeatable, must match the indexed policy"},
+			{name: "--include-file", arg: "path", desc: "Additional include file; repeatable, must match the indexed policy"},
+		},
+		examples: []string{`entire graph store --repo . --profile full`},
+	},
+	{
 		name:    "context",
 		group:   groupSetup,
 		summary: "Task-relevant symbols, relations, and test suggestions from the committed-tree store (JSON)",
-		usage:   []string{`entire graph context --repo . --task "<task text>" [--limit N] [--tests-limit N] [--relations-limit N] [--profile full] [--cache-dir path]`},
+		usage:   []string{`entire graph context --repo . --task "<task text>" [--limit N] [--tests-limit N] [--relations-limit N] [--profile full] [--cache-dir path] [--ignore-file path] [--include-file path]`},
 		long: "The delegation surface for downstream consumers such as Entire Brain's brief: task text in, the store's ranked task-relevant symbols plus their relation fan-out and test suggestions out, as one JSON document. It reads ONLY the committed tree's sqlite store sidecar — it never parses and never builds — so latency is bounded by indexed reads (measured ~0.5s on a 52k-symbol repository).\n\n" +
 			"The store sidecar exists when the cache variant was built with ENTIRE_GRAPH_SEARCH_STORE=1 (`entire graph index --head`). Without one (or with a stale one), the response carries store_unavailable=true with empty lists, so a consumer degrades exactly as it would with the plugin absent instead of paying a parse.",
 		flags: []flagDoc{
 			{name: "--repo", arg: "path", desc: "Repository (default: current repo)"},
+			{name: "--ignore-file", arg: "path", desc: "Additional ignore file; repeatable, must match the indexed policy"},
+			{name: "--include-file", arg: "path", desc: "Additional include file; repeatable, must match the indexed policy"},
 			{name: "--task", arg: "text", desc: "Task text to find context for (required)"},
 			{name: "--limit", arg: "N", def: "12", desc: "Maximum symbols returned"},
 			{name: "--tests-limit", arg: "N", def: "6", desc: "Maximum test suggestions returned"},

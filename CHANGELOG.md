@@ -14,6 +14,10 @@ auto-generated notes on
 
 ### Added
 
+- `graph store` resolves the current committed-tree search store without building
+  it, exposing a versioned read-only SQL projection for Brain code inspection.
+  Brain can reuse Graph's database instead of maintaining a second copy.
+
 - Added an experimental SCIP snapshot export, and versioned persisted diff and analyze output with schema-major enforcement, cache-validity binding, and a wire-shape regression freeze.
 - Added a `graph health` command with per-source-file health accounting, and made `graph query` the canonical search command with support for trailing free-text queries.
 - Added a persistent strict agent guidance mode, with Graph and Brain agent instructions coordinated to stay consistent.
