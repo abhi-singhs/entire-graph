@@ -626,17 +626,6 @@ func preindexProviderSnapshotWithPersistenceVerifier(
 			commit, tree, err,
 		)
 	}
-	if cacheHit {
-		// A hit is returned only after the persisted entry has been fully decoded
-		// and validated, so reading the same artifact again cannot strengthen the
-		// durability guarantee.
-		return snapshot, true, nil
-	}
-	if options.ForceRebuild {
-		// Match loadOrBuildSearchSnapshot's re-stamp: report the commit this call
-		// serves, not whatever HEAD happened to be mid-build on a same-tree race.
-		snapshot.Header.Commit = commit
-	}
 	// Query-time caching is deliberately best effort, but an explicit preindex
 	// command promises a durable artifact: persist it here with any error
 	// surfaced, then prove the entry a later query will open holds exactly those
@@ -648,6 +637,24 @@ func preindexProviderSnapshotWithPersistenceVerifier(
 	entry, err := newCacheEntry(cacheDir, "search", searchSnapshotCacheVersion, key)
 	if err != nil {
 		return ProviderSnapshot{}, false, err
+	}
+	if cacheHit {
+		// A hit is returned only after the persisted entry has been fully decoded
+		// and validated, so reading the same artifact again cannot strengthen the
+		// durability guarantee. The store sidecar, though, may be missing when
+		// the entry was persisted by a run without the store flag; the explicit
+		// prebuild is the documented remedy for that, so it repairs the sidecar
+		// rather than no-op on the hit. Surfaced, not best effort: the operator
+		// asked for the store and would otherwise retry forever.
+		if err := repairSearchStoreSidecarForEntry(ctx, entry); err != nil {
+			return ProviderSnapshot{}, false, fmt.Errorf("build store sidecar for cached preindex entry: %w", err)
+		}
+		return snapshot, true, nil
+	}
+	if options.ForceRebuild {
+		// Match loadOrBuildSearchSnapshot's re-stamp: report the commit this call
+		// serves, not whatever HEAD happened to be mid-build on a same-tree race.
+		snapshot.Header.Commit = commit
 	}
 	cache := newCachedSearchSnapshot(providerVersion, commit, tree, options, snapshot, ctx)
 	if err := persistVerifiedSearchSnapshot(ctx, entry, cache, readPersistedDigest); err != nil {

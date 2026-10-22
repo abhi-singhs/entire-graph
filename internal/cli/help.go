@@ -161,7 +161,7 @@ var commandDocs = []commandDoc{
 		name:    "context",
 		group:   groupSetup,
 		summary: "Task-relevant symbols, relations, and test suggestions from the committed-tree store (JSON)",
-		usage:   []string{`entire graph context --repo . --task "<task text>" [--limit N] [--tests-limit N] [--profile full] [--cache-dir path]`},
+		usage:   []string{`entire graph context --repo . --task "<task text>" [--limit N] [--tests-limit N] [--relations-limit N] [--profile full] [--cache-dir path]`},
 		long: "The delegation surface for downstream consumers such as Entire Brain's brief: task text in, the store's ranked task-relevant symbols plus their relation fan-out and test suggestions out, as one JSON document. It reads ONLY the committed tree's sqlite store sidecar — it never parses and never builds — so latency is bounded by indexed reads (measured ~0.5s on a 52k-symbol repository).\n\n" +
 			"The store sidecar exists when the cache variant was built with ENTIRE_GRAPH_SEARCH_STORE=1 (`entire graph index --head`). Without one (or with a stale one), the response carries store_unavailable=true with empty lists, so a consumer degrades exactly as it would with the plugin absent instead of paying a parse.",
 		flags: []flagDoc{
@@ -169,6 +169,7 @@ var commandDocs = []commandDoc{
 			{name: "--task", arg: "text", desc: "Task text to find context for (required)"},
 			{name: "--limit", arg: "N", def: "12", desc: "Maximum symbols returned"},
 			{name: "--tests-limit", arg: "N", def: "6", desc: "Maximum test suggestions returned"},
+			{name: "--relations-limit", arg: "N", def: "200", desc: "Maximum relations returned; highest confidence kept, relations_truncated signals a cut"},
 			{name: "--profile", arg: "syntax-only|fast|full", def: "full", desc: "Indexing profile of the store to read (match the index that built it)"},
 			{name: "--cache-dir", arg: "path", desc: "Cache directory holding the store (default: plugin data dir, else user cache dir)"},
 		},

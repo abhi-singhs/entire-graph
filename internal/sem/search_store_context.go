@@ -48,8 +48,17 @@ type SearchStoreContext struct {
 	Tree      string                 `json:"tree"`
 	Symbols   []StoreContextSymbol   `json:"symbols"`
 	Relations []StoreContextRelation `json:"relations"`
-	Tests     []StoreContextSymbol   `json:"tests"`
+	// RelationsTruncated reports that the relation fan-out was cut at the
+	// caller's cap: the kept rows are the highest-confidence ones, and an
+	// absent relation is not evidence of no relation.
+	RelationsTruncated bool                 `json:"relations_truncated,omitempty"`
+	Tests              []StoreContextSymbol `json:"tests"`
 }
+
+// defaultStoreContextRelationsLimit bounds the relation fan-out of one context
+// response. Observed fan-out for 12 symbols on this repository is 120-170
+// rows; the cap exists for hub symbols, whose fan-out is unbounded.
+const defaultStoreContextRelationsLimit = 200
 
 // storeContextStopwords are prose function words a task sentence carries that
 // say nothing about code ("add a kind filter flag to the recall command" —
@@ -99,12 +108,15 @@ func storeContextTokens(task string) []string {
 // Go-side scoring (52k short rows scan in tens of milliseconds); the relation
 // fan-out is indexed. wantEntryDigest carries the same coherence contract as
 // loadSearchStore.
-func QuerySearchStoreContext(ctx context.Context, path, wantEntryDigest, task string, limit, testsLimit int) (SearchStoreContext, error) {
+func QuerySearchStoreContext(ctx context.Context, path, wantEntryDigest, task string, limit, testsLimit, relationsLimit int) (SearchStoreContext, error) {
 	if limit <= 0 {
 		limit = 12
 	}
 	if testsLimit < 0 {
 		testsLimit = 0
+	}
+	if relationsLimit <= 0 {
+		relationsLimit = defaultStoreContextRelationsLimit
 	}
 	tokens := storeContextTokens(task)
 	if len(tokens) == 0 {
@@ -224,11 +236,12 @@ func QuerySearchStoreContext(ctx context.Context, path, wantEntryDigest, task st
 	for _, symbol := range result.Symbols {
 		ids = append(ids, symbol.ID)
 	}
-	relations, err := searchStoreRelationsForIDs(ctx, db, ids)
+	relations, relationsTruncated, err := searchStoreRelationsForIDs(ctx, db, ids, relationsLimit)
 	if err != nil {
 		return SearchStoreContext{}, err
 	}
 	result.Relations = relations
+	result.RelationsTruncated = relationsTruncated
 
 	// A test that exercises a returned symbol belongs in the suggestions even
 	// when the task text never names it: TESTS edges and test-file callers of
@@ -266,7 +279,7 @@ var ErrSearchStoreMissing = fmt.Errorf(
 // and answers the context query from its sqlite sidecar. It never builds: a
 // missing sidecar (or one that does not match the current entry) returns
 // ErrSearchStoreMissing so the caller can degrade instead of paying a parse.
-func LoadSearchStoreContext(ctx context.Context, repo, providerVersion, cacheDir, task string, options ProviderSnapshotOptions, limit, testsLimit int) (SearchStoreContext, error) {
+func LoadSearchStoreContext(ctx context.Context, repo, providerVersion, cacheDir, task string, options ProviderSnapshotOptions, limit, testsLimit, relationsLimit int) (SearchStoreContext, error) {
 	if cacheDir == "" {
 		return SearchStoreContext{}, fmt.Errorf("store context requires a cache directory")
 	}
@@ -305,7 +318,7 @@ func LoadSearchStoreContext(ctx context.Context, repo, providerVersion, cacheDir
 	if err != nil {
 		return SearchStoreContext{}, ErrSearchStoreMissing
 	}
-	result, err := QuerySearchStoreContext(ctx, path, digest.String(), task, limit, testsLimit)
+	result, err := QuerySearchStoreContext(ctx, path, digest.String(), task, limit, testsLimit, relationsLimit)
 	if err != nil {
 		return SearchStoreContext{}, err
 	}
@@ -321,54 +334,81 @@ func storeContextTestPath(lowerPath string) bool {
 		strings.Contains(base, ".spec.") || strings.Contains(base, ".test.")
 }
 
-// searchStoreRelationsForIDs returns every relation touching one of ids, in
-// rowid order, chunked to stay under sqlite's bind-variable ceiling. This is
-// the read the relations_from/relations_to indexes exist for: O(fan-out), not
-// O(total relations).
-func searchStoreRelationsForIDs(ctx context.Context, db *sql.DB, ids []string) ([]StoreContextRelation, error) {
-	if len(ids) == 0 {
-		return nil, nil
+// searchStoreRelationsForIDs returns the relations touching one of ids,
+// chunked to stay under sqlite's bind-variable ceiling. This is the read the
+// relations_from/relations_to indexes exist for: O(fan-out), not O(total
+// relations).
+//
+// The fan-out is capped at limit, highest confidence first (rowid breaks
+// ties, so the order is deterministic for a given store), and the bool
+// reports whether anything was cut: a hub symbol — a widely called helper, a
+// ubiquitous type — can touch thousands of relations, and an uncapped list
+// would make the response unbounded. Each chunk's SQL carries the same order
+// and a limit+1 bound, which keeps memory bounded per chunk and is lossless:
+// a relation in the global top-limit ranks within the top limit+1 of every
+// chunk that matches it.
+func searchStoreRelationsForIDs(ctx context.Context, db *sql.DB, ids []string, limit int) ([]StoreContextRelation, bool, error) {
+	if len(ids) == 0 || limit <= 0 {
+		return nil, false, nil
+	}
+	type rankedRelation struct {
+		relation StoreContextRelation
+		rowid    int64
 	}
 	const chunkSize = 400
-	seen := map[string]struct{}{}
-	var out []StoreContextRelation
+	seen := map[int64]struct{}{}
+	var out []rankedRelation
 	for start := 0; start < len(ids); start += chunkSize {
 		chunk := ids[start:min(start+chunkSize, len(ids))]
 		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
-		binds := make([]any, 0, len(chunk)*2)
+		binds := make([]any, 0, len(chunk)*2+1)
 		for _, id := range chunk {
 			binds = append(binds, id)
 		}
 		for _, id := range chunk {
 			binds = append(binds, id)
 		}
+		binds = append(binds, limit+1)
 		query := `SELECT from_id, to_id, type, confidence, rowid FROM relations WHERE from_id IN (` +
-			placeholders + `) OR to_id IN (` + placeholders + `) ORDER BY rowid`
+			placeholders + `) OR to_id IN (` + placeholders + `) ORDER BY confidence DESC, rowid LIMIT ?`
 		rows, err := db.QueryContext(ctx, query, binds...)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		for rows.Next() {
-			var relation StoreContextRelation
-			var rowid int64
-			if err := rows.Scan(&relation.FromID, &relation.ToID, &relation.Type, &relation.Confidence, &rowid); err != nil {
+			var ranked rankedRelation
+			if err := rows.Scan(&ranked.relation.FromID, &ranked.relation.ToID,
+				&ranked.relation.Type, &ranked.relation.Confidence, &ranked.rowid); err != nil {
 				rows.Close()
-				return nil, err
+				return nil, false, err
 			}
-			key := fmt.Sprintf("%d", rowid)
-			if _, ok := seen[key]; ok {
+			if _, ok := seen[ranked.rowid]; ok {
 				continue
 			}
-			seen[key] = struct{}{}
-			out = append(out, relation)
+			seen[ranked.rowid] = struct{}{}
+			out = append(out, ranked)
 		}
 		if err := rows.Err(); err != nil {
 			rows.Close()
-			return nil, err
+			return nil, false, err
 		}
 		rows.Close()
 	}
-	return out, nil
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].relation.Confidence != out[j].relation.Confidence {
+			return out[i].relation.Confidence > out[j].relation.Confidence
+		}
+		return out[i].rowid < out[j].rowid
+	})
+	truncated := len(out) > limit
+	if truncated {
+		out = out[:limit]
+	}
+	relations := make([]StoreContextRelation, 0, len(out))
+	for _, ranked := range out {
+		relations = append(relations, ranked.relation)
+	}
+	return relations, truncated, nil
 }
 
 func searchStoreSymbolsByIDs(ctx context.Context, db *sql.DB, ids map[string]struct{}, exclude map[string]struct{}, limit int) ([]StoreContextSymbol, error) {

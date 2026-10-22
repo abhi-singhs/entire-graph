@@ -19,12 +19,13 @@ import (
 // its latency is bounded by indexed reads, and a missing store is a clean
 // machine-readable degradation signal rather than a multi-second surprise.
 type contextFlags struct {
-	Repo       string
-	Task       string
-	Limit      int
-	TestsLimit int
-	Profile    string
-	CacheDir   string
+	Repo           string
+	Task           string
+	Limit          int
+	TestsLimit     int
+	RelationsLimit int
+	Profile        string
+	CacheDir       string
 }
 
 func parseContextFlags(args []string) (contextFlags, error) {
@@ -35,6 +36,7 @@ func parseContextFlags(args []string) (contextFlags, error) {
 	set.StringVar(&flags.Task, "task", "", "task text to find context for (required)")
 	set.IntVar(&flags.Limit, "limit", 12, "maximum symbols returned")
 	set.IntVar(&flags.TestsLimit, "tests-limit", 6, "maximum test suggestions returned")
+	set.IntVar(&flags.RelationsLimit, "relations-limit", 200, "maximum relations returned (highest confidence kept; relations_truncated signals a cut)")
 	set.StringVar(&flags.Profile, "profile", "full", "indexing profile of the store to read")
 	set.StringVar(&flags.CacheDir, "cache-dir", "", "cache directory holding the store (default: plugin data dir, else user cache dir)")
 	if err := set.Parse(args); err != nil {
@@ -55,8 +57,12 @@ type contextResponse struct {
 	Tree          string                     `json:"tree"`
 	Symbols       []sem.StoreContextSymbol   `json:"symbols"`
 	Relations     []sem.StoreContextRelation `json:"relations"`
-	Tests         []sem.StoreContextSymbol   `json:"tests"`
-	LatencyMS     int64                      `json:"latency_ms"`
+	// RelationsTruncated reports the fan-out hit --relations-limit: the kept
+	// rows are the highest-confidence ones, and an absent relation is not
+	// evidence of no relation.
+	RelationsTruncated bool                     `json:"relations_truncated,omitempty"`
+	Tests              []sem.StoreContextSymbol `json:"tests"`
+	LatencyMS          int64                    `json:"latency_ms"`
 	// StoreUnavailable is the machine-readable degradation signal: true means
 	// the committed tree has no (or a stale) store sidecar and every list is
 	// empty. Consumers degrade exactly as they would with the plugin absent.
@@ -82,15 +88,16 @@ func runContext(ctx context.Context, opts Options, args []string) error {
 	result, err := sem.LoadSearchStoreContext(ctx, repo, opts.Version, cacheDir, flags.Task, sem.ProviderSnapshotOptions{
 		NoNetwork: true,
 		Profile:   profile,
-	}, flags.Limit, flags.TestsLimit)
+	}, flags.Limit, flags.TestsLimit, flags.RelationsLimit)
 	response := contextResponse{
-		SchemaVersion: sem.SchemaVersion,
-		Commit:        result.Commit,
-		Tree:          result.Tree,
-		Symbols:       result.Symbols,
-		Relations:     result.Relations,
-		Tests:         result.Tests,
-		LatencyMS:     time.Since(started).Milliseconds(),
+		SchemaVersion:      sem.SchemaVersion,
+		Commit:             result.Commit,
+		Tree:               result.Tree,
+		Symbols:            result.Symbols,
+		Relations:          result.Relations,
+		RelationsTruncated: result.RelationsTruncated,
+		Tests:              result.Tests,
+		LatencyMS:          time.Since(started).Milliseconds(),
 	}
 	if err != nil {
 		if !errors.Is(err, sem.ErrSearchStoreMissing) {

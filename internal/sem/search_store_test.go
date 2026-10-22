@@ -126,12 +126,15 @@ func TestSearchStoreContextServesTaskContext(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := QuerySearchStoreContext(t.Context(), storePath, "digest-a", "render the widget name", 5, 3)
+	got, err := QuerySearchStoreContext(t.Context(), storePath, "digest-a", "render the widget name", 5, 3, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got.Symbols) == 0 || got.Symbols[0].Name != "RenderWidget" {
 		t.Fatalf("expected RenderWidget ranked first, got %+v", got.Symbols)
+	}
+	if got.RelationsTruncated {
+		t.Fatalf("default relations limit truncated a %d-relation fan-out", len(got.Relations))
 	}
 	for _, symbol := range got.Symbols {
 		if symbol.FilePath == "widget_test.go" {
@@ -165,8 +168,26 @@ func TestSearchStoreContextServesTaskContext(t *testing.T) {
 		t.Fatalf("expected TestRenderWidget in tests, got %+v", got.Tests)
 	}
 
+	// A hub symbol's fan-out must not make the response unbounded: the cap
+	// keeps the highest-confidence relations, deterministically, and says so.
+	if len(got.Relations) < 2 {
+		t.Fatalf("fixture no longer produces a multi-relation fan-out: %+v", got.Relations)
+	}
+	capped, err := QuerySearchStoreContext(t.Context(), storePath, "digest-a", "render the widget name", 5, 3, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capped.Relations) != 1 || !capped.RelationsTruncated {
+		t.Fatalf("relations limit 1 returned %d relations (truncated=%v)", len(capped.Relations), capped.RelationsTruncated)
+	}
+	for _, relation := range got.Relations {
+		if relation.Confidence > capped.Relations[0].Confidence {
+			t.Fatalf("cap kept confidence %v while %v existed", capped.Relations[0].Confidence, relation.Confidence)
+		}
+	}
+
 	// Stale store (wrong digest) must degrade, not error arbitrarily.
-	if _, err := QuerySearchStoreContext(t.Context(), storePath, "digest-b", "render the widget name", 5, 3); !errors.Is(err, ErrSearchStoreMissing) {
+	if _, err := QuerySearchStoreContext(t.Context(), storePath, "digest-b", "render the widget name", 5, 3, 0); !errors.Is(err, ErrSearchStoreMissing) {
 		t.Fatalf("stale store should read as ErrSearchStoreMissing, got %v", err)
 	}
 }

@@ -663,6 +663,32 @@ func writeSearchStoreSidecar(ctx context.Context, entry cacheEntry, entryDigest 
 	return nil
 }
 
+// repairSearchStoreSidecarForEntry builds the sidecar for an ALREADY-persisted
+// entry when it is missing or does not match the entry. The explicit prebuild
+// needs this: a gz entry persisted by a run without the store flag (a plain
+// query, or an index before the operator opted in) would otherwise make
+// `entire graph index` with the flag a cache-hit no-op that never creates the
+// store its own degradation message tells the operator to build. The sidecar
+// is built from the raw persisted bytes, not from the request-bound snapshot
+// in memory, so it mirrors the entry exactly as the fidelity contract demands.
+func repairSearchStoreSidecarForEntry(ctx context.Context, entry cacheEntry) error {
+	if !searchStoreEnabled() {
+		return nil
+	}
+	if _, ok := loadSearchStoreForEntry(ctx, entry); ok {
+		return nil
+	}
+	digest, err := entry.digest()
+	if err != nil {
+		return err
+	}
+	raw, err := readSearchSnapshot(entry)
+	if err != nil {
+		return err
+	}
+	return writeSearchStoreSidecar(ctx, entry, digest.String(), &raw)
+}
+
 // loadSearchStoreForEntry serves the entry's snapshot from the sqlite sidecar
 // when the operator opted in and the sidecar matches the entry on disk. The
 // bool reports whether the store answered; every failure is a quiet miss so
