@@ -129,8 +129,8 @@ func Run(ctx context.Context, opts Options, args []string) error {
 		return runStats(ctx, opts, args[1:])
 	case "agent-guide":
 		return runAgentGuide(opts, args[1:])
-	case "init-agents":
-		return runInitAgents(opts, args[1:])
+	case "setup":
+		return runSetup(opts, args[1:])
 	case "hook":
 		return runHook(opts, args[1:])
 	case "version", "--version", "-v":

@@ -12,13 +12,23 @@ auto-generated notes on
 
 ## [0.5.0] - unreleased
 
+### Removed
+
+- The `init-agents` command, renamed to `setup` to match `entire brain setup`.
+  The behavior is unchanged: `setup` installs the agent guide and managed
+  `AGENTS.md`/`CLAUDE.md` blocks, `--strict` / `--normal` save the guidance
+  mode and a bare re-run inherits the saved one, and `--no-claude-hook` skips
+  the Claude Code hook. It also now warns up front, before any write, when the
+  target repository is nested inside another one and no explicit `--repo` was
+  given. `agent-guide` remains the read-only preview.
+
 ### Added
 
 - Added an experimental SCIP snapshot export, and versioned persisted diff and analyze output with schema-major enforcement, cache-validity binding, and a wire-shape regression freeze.
 - Added a `graph health` command with per-source-file health accounting, and made `graph query` the canonical search command with support for trailing free-text queries.
 - Added a persistent strict agent guidance mode, with Graph and Brain agent instructions coordinated to stay consistent.
 - Added nightly LoCoMo benchmark CI for the entire-graph arm, authenticated via OIDC with no stored credentials.
-- `init-agents` now registers a Claude Code `SubagentStart` hook (`entire graph hook claude-subagent-start`) in the per-user `.claude/settings.local.json`, merged into existing settings and added once, so Explore and Plan subagents, which do not load `CLAUDE.md`, are told to use the graph. `--no-claude-hook` skips it.
+- `setup` (then `init-agents`) now registers a Claude Code `SubagentStart` hook (`entire graph hook claude-subagent-start`) in the per-user `.claude/settings.local.json`, merged into existing settings and added once, so Explore and Plan subagents, which do not load `CLAUDE.md`, are told to use the graph. `--no-claude-hook` skips it.
 - Added a `NOTICES` file to every release archive, covering the third-party parser sources and Go modules statically linked into the binary.
 
 ### Changed
