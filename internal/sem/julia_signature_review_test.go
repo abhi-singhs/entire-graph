@@ -2,6 +2,8 @@ package sem
 
 import "testing"
 
+const juliaRenameTypedParams = "(x::AbstractArray{Float64,3}, y::Dict{Symbol,Vector{Int}}, z::Tuple{String,Bool}, a::Set{UInt8}, b::Ref{ComplexF64}, c::IOBuffer)::Nothing"
+
 func TestJuliaHeaderSignatureIdentityIsRevisioned(t *testing.T) {
 	parse := func(source string) []SymbolRecord {
 		t.Helper()
@@ -36,11 +38,16 @@ func TestJuliaHeaderSignatureIdentityIsRevisioned(t *testing.T) {
 }
 
 func TestJuliaOneLineRenameRetainsBodyEvidence(t *testing.T) {
+	typedParams := juliaRenameTypedParams
+	typedBody := "return transform_payload_into_records(x,y,z,a,b,c)"
 	for _, form := range []struct {
 		name, before, renamed, replaced string
 	}{
 		{"short", "encode(x) = x + 1", "send(x) = x + 1", "send(x) = error(\"unavailable\")"},
 		{"long", "function encode(x); x + 1; end", "function send(x); x + 1; end", "function send(x); error(\"unavailable\"); end"},
+		{"typed_short", "encode" + typedParams + " = transform_payload_into_records(x,y,z,a,b,c)", "send" + typedParams + " = transform_payload_into_records(x,y,z,a,b,c)", "send" + typedParams + " = error(\"unavailable\")"},
+		{"typed_long", "function encode" + typedParams + "; " + typedBody + "; end", "function send" + typedParams + "; " + typedBody + "; end", "function send" + typedParams + "; error(\"unavailable\"); end"},
+		{"typed_multiline", "function encode" + typedParams + "\n    " + typedBody + "\nend", "function send" + typedParams + "\n    " + typedBody + "\nend", "function send" + typedParams + "\n    error(\"unavailable\")\nend"},
 	} {
 		t.Run(form.name, func(t *testing.T) {
 			parse := func(source string) []Entity {
@@ -59,6 +66,62 @@ func TestJuliaOneLineRenameRetainsBodyEvidence(t *testing.T) {
 			changes, removed, added = compareEntities(before, parse(form.renamed), false)
 			if len(changes) != 1 || changes[0].Type != "renamed" || len(removed) != 0 || len(added) != 0 {
 				t.Fatalf("genuine rename: changes=%#v, removed=%#v, added=%#v", changes, removed, added)
+			}
+		})
+	}
+}
+
+func TestJuliaTypedRenameFallbackRetainsSimilarBodies(t *testing.T) {
+	parse := func(source string) Entity {
+		t.Helper()
+		entities, _, status := (TreeSitterParser{}).ParseWithStatus("rename.jl", source+"\n")
+		if status.ParseError || len(entities) != 1 {
+			t.Fatalf("parse = %#v, status = %#v", entities, status)
+		}
+		return entities[0]
+	}
+	before := parse("function encode" + juliaRenameTypedParams + "; return transform_payload_into_records(x,y,z,a,b,c); end")
+	after := parse("function send" + juliaRenameTypedParams + "; return (transform_payload_into_records(x,y,z,a,b,c)); end")
+	if before.Fingerprint == after.Fingerprint || before.BodyHash == after.BodyHash {
+		t.Fatal("fixture must exercise fallback similarity, not exact hashes")
+	}
+	changes, removed, added := compareEntities([]Entity{before}, []Entity{after}, false)
+	if len(changes) != 1 || changes[0].Type != "renamed" || len(removed) != 0 || len(added) != 0 {
+		t.Fatalf("similar-body rename: changes=%#v, removed=%#v, added=%#v", changes, removed, added)
+	}
+}
+
+func TestAnalyzeJuliaTypedHeaderReplacement(t *testing.T) {
+	for _, replacementPath := range []string{"rename.jl", "other.jl"} {
+		t.Run(replacementPath, func(t *testing.T) {
+			repo := t.TempDir()
+			git(t, repo, "init")
+			git(t, repo, "config", "user.name", "Entire Graph Test")
+			git(t, repo, "config", "user.email", "graph@example.com")
+			write(t, repo, "rename.jl", "function encode"+juliaRenameTypedParams+"; return transform_payload_into_records(x,y,z,a,b,c); end\n")
+			git(t, repo, "add", ".")
+			git(t, repo, "commit", "-m", "before")
+			base := rev(t, repo, "HEAD")
+			if replacementPath != "rename.jl" {
+				git(t, repo, "rm", "rename.jl")
+			}
+			write(t, repo, replacementPath, "function send"+juliaRenameTypedParams+"; error(\"unavailable\"); end\n")
+			git(t, repo, "add", ".")
+			git(t, repo, "commit", "-m", "replace unrelated function")
+			result, err := AnalyzeGitRange(t.Context(), repo, base, "HEAD", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changes := map[string]string{}
+			count := 0
+			for _, file := range result.Files {
+				for _, change := range file.Changes {
+					changes[change.Name] = change.Type
+					count++
+				}
+			}
+			if count != 2 || changes["encode"] != "removed" || changes["send"] != "added" {
+				t.Fatalf("replacement changes = %#v", result.Files)
 			}
 		})
 	}

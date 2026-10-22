@@ -126,8 +126,9 @@ It does not change the individual symbol-ID format.
 Revision `"5"` cuts Julia signatures to declaration headers. Same-name Julia
 overloads use a `#sig:<hash>` suffix derived from the signature, so their IDs
 change even when the indexed source is unchanged. Unique-name Julia symbols keep
-their IDs. Revision `"5"` also retains the body as rename evidence for single-line
-Julia definitions; unrelated replacements no longer match on parameters alone.
+their IDs. Revision `"5"` also retains the body as rename evidence for Julia
+definitions, both in single-line fingerprints and in fallback similarity;
+unrelated replacements no longer match on parameter types alone.
 Consumers upgrading from revision `"4"` or earlier must refresh derived snapshots
 and recompute persisted entity deltas using the new parser, preserving source
 commits, checkpoint/session provenance, and authored memory. The local provider
