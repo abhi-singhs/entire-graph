@@ -1494,35 +1494,45 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 	// independent and the ordered pipeline appends in exactly the sequential
 	// loop's order, so output bytes are unchanged. Measured at 1.5s of a warm
 	// query single-threaded on entire-brain — the largest Query-stage cost.
-	indexableContents := make([]string, len(indexableFiles))
-	indexableRead := make([]bool, len(indexableFiles))
-	for index, filePath := range indexableFiles {
-		if err := ctx.Err(); err != nil {
+	// Chunked so the contents pinned for the workers stay bounded: a single
+	// whole-corpus pre-read would hold every indexable file at once and defeat
+	// the content cache's bound on large repositories. Chunks are processed in
+	// order and the ordered reduce appends in order within each, so output
+	// bytes are unchanged.
+	workers := runtime.GOMAXPROCS(0)
+	chunkSize := max(workers*8, 64)
+	for start := 0; start < len(indexableFiles); start += chunkSize {
+		chunk := indexableFiles[start:min(start+chunkSize, len(indexableFiles))]
+		chunkContents := make([]string, len(chunk))
+		chunkRead := make([]bool, len(chunk))
+		for index, filePath := range chunk {
+			if err := ctx.Err(); err != nil {
+				return SearchResponse{}, err
+			}
+			chunkContents[index], chunkRead[index] = read(filePath)
+		}
+		if err := runIndexedStreamingPipeline(ctx, len(chunk), workers,
+			func(_ context.Context, index int, emitCandidate func(searchCandidate)) struct{} {
+				if !chunkRead[index] {
+					return struct{}{}
+				}
+				filePath := chunk[index]
+				lines := strings.Split(chunkContents[index], "\n")
+				for _, candidate := range candidatesForFile(
+					q, filePath, fileLanguages[filePath], lines, symbolsByFile[filePath], options,
+				) {
+					emitCandidate(candidate)
+				}
+				return struct{}{}
+			},
+			func(_ int, candidate searchCandidate) error {
+				candidates = append(candidates, candidate)
+				return nil
+			},
+			func(int, struct{}) error { return nil },
+		); err != nil {
 			return SearchResponse{}, err
 		}
-		indexableContents[index], indexableRead[index] = read(filePath)
-	}
-	if err := runIndexedStreamingPipeline(ctx, len(indexableFiles), runtime.GOMAXPROCS(0),
-		func(_ context.Context, index int, emitCandidate func(searchCandidate)) struct{} {
-			if !indexableRead[index] {
-				return struct{}{}
-			}
-			filePath := indexableFiles[index]
-			lines := strings.Split(indexableContents[index], "\n")
-			for _, candidate := range candidatesForFile(
-				q, filePath, fileLanguages[filePath], lines, symbolsByFile[filePath], options,
-			) {
-				emitCandidate(candidate)
-			}
-			return struct{}{}
-		},
-		func(_ int, candidate searchCandidate) error {
-			candidates = append(candidates, candidate)
-			return nil
-		},
-		func(int, struct{}) error { return nil },
-	); err != nil {
-		return SearchResponse{}, err
 	}
 	// Re-reading a file the content cache had to drop pulls in the same file, not another
 	// one, so it must not inflate what the query is reported to have read.
