@@ -109,6 +109,8 @@ func Run(ctx context.Context, opts Options, args []string) error {
 		return runProviderRecords(ctx, opts, args[1:], "edges")
 	case "query", "search":
 		return runSearch(ctx, opts, args[1:])
+	case "context":
+		return runContext(ctx, opts, args[1:])
 	case "index":
 		return runIndex(ctx, opts, args[1:])
 	case "health":
