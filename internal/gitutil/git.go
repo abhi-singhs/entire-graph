@@ -1836,6 +1836,12 @@ func NewBatchFileReader(ctx context.Context, repo, rev string) (*BatchFileReader
 	if _, _, _, found, probeErr := reader.objectInfoLocked(probeOID); probeErr != nil || found {
 		_ = stdin.Close()
 		waitErr := cmd.Wait()
+		// A context expiring mid-probe kills the child, and its EOF would read
+		// as version skew below. The cancellation is the cause; report it so a
+		// cancelled caller sees its own deadline, not a Git-version diagnosis.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("git cat-file --batch-command: %w", ctxErr)
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			if probeErr != nil {
