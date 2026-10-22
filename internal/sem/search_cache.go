@@ -459,7 +459,7 @@ func loadOrBuildSearchSnapshotPersisting(
 					full.Header.Commit = commit
 					// Best effort, like every query-time store: an unwritable cache
 					// still serves this query from the snapshot in memory.
-					_ = writeSearchSnapshotAndStore(fullEntry, newCachedSearchSnapshot(providerVersion, commit, tree, completeOptions, full, ctx))
+					_ = writeSearchSnapshotAndStore(ctx, fullEntry, newCachedSearchSnapshot(providerVersion, commit, tree, completeOptions, full, ctx))
 					if selective, ok := deriveFromFull(full); ok {
 						return selective, false, true, nil
 					}
@@ -650,7 +650,7 @@ func preindexProviderSnapshotWithPersistenceVerifier(
 		return ProviderSnapshot{}, false, err
 	}
 	cache := newCachedSearchSnapshot(providerVersion, commit, tree, options, snapshot, ctx)
-	if err := persistVerifiedSearchSnapshot(entry, cache, readPersistedDigest); err != nil {
+	if err := persistVerifiedSearchSnapshot(ctx, entry, cache, readPersistedDigest); err != nil {
 		return ProviderSnapshot{}, false, fmt.Errorf("persist preindex snapshot: %w", err)
 	}
 	if options.ForceRebuild {
@@ -696,6 +696,7 @@ func preindexProviderSnapshotWithPersistenceVerifier(
 // A mismatch is retried once, because a concurrent `index` of the same tree may legitimately
 // have replaced the entry between rename and re-read; a second mismatch is reported.
 func persistVerifiedSearchSnapshot(
+	ctx context.Context,
 	entry cacheEntry,
 	cache cachedSearchSnapshot,
 	readPersistedDigest func(cacheEntry) (cacheDigest, error),
@@ -715,7 +716,7 @@ func persistVerifiedSearchSnapshot(
 		default:
 			// The explicit prebuild is exactly where a reader expects the
 			// sidecar to exist; best effort, like writeSearchSnapshot's.
-			_ = writeSearchStoreSidecar(context.Background(), entry, written.String(), &cache)
+			_ = writeSearchStoreSidecar(ctx, entry, written.String(), &cache)
 			return nil
 		}
 	}
@@ -1313,7 +1314,7 @@ func loadCachedSearchSnapshot(
 
 	contexts ...context.Context,
 ) (cachedSearchSnapshot, bool) {
-	cached, err := readSearchSnapshotPreferringStore(entry)
+	cached, err := readSearchSnapshotPreferringStore(entry, contexts...)
 	if err != nil {
 		return cachedSearchSnapshot{}, false
 	}
@@ -1458,8 +1459,12 @@ func readSearchSnapshot(entry cacheEntry) (cachedSearchSnapshot, error) {
 // entry, and otherwise from the gz JSON entry. The sidecar exists because the
 // monolithic JSON decode is the single largest cost of a warm query; the gz
 // entry remains authoritative and every sidecar problem is a silent fallback.
-func readSearchSnapshotPreferringStore(entry cacheEntry) (cachedSearchSnapshot, error) {
-	if cache, ok := loadSearchStoreForEntry(context.Background(), entry); ok {
+func readSearchSnapshotPreferringStore(entry cacheEntry, contexts ...context.Context) (cachedSearchSnapshot, error) {
+	ctx := context.Background()
+	if len(contexts) > 0 && contexts[0] != nil {
+		ctx = contexts[0]
+	}
+	if cache, ok := loadSearchStoreForEntry(ctx, entry); ok {
 		return cache, nil
 	}
 	return readSearchSnapshot(entry)
@@ -1477,11 +1482,11 @@ func writeSearchSnapshot(entry cacheEntry, cache cachedSearchSnapshot) error {
 // authoritative, and writeSearchStoreSidecar removes any previous sidecar on
 // failure so a stale one cannot outlive the entry it mirrored (readers also
 // verify the embedded digest).
-func writeSearchSnapshotAndStore(entry cacheEntry, cache cachedSearchSnapshot) error {
+func writeSearchSnapshotAndStore(ctx context.Context, entry cacheEntry, cache cachedSearchSnapshot) error {
 	digest, err := entry.writeDigest("snapshot", cache)
 	if err != nil {
 		return err
 	}
-	_ = writeSearchStoreSidecar(context.Background(), entry, digest.String(), &cache)
+	_ = writeSearchStoreSidecar(ctx, entry, digest.String(), &cache)
 	return nil
 }

@@ -613,6 +613,13 @@ func searchStoreEntryFor(entry cacheEntry) cacheEntry {
 // the same call that wrote the current entry (the digest check backstops the
 // crash window between the two renames).
 func writeSearchStoreSidecar(ctx context.Context, entry cacheEntry, entryDigest string, cache *cachedSearchSnapshot) error {
+	if !searchStoreEnabled() {
+		// The write is gated by the same flag as the read: with no reader, an
+		// unconditional sidecar taxed every complete persist with the build
+		// plus ~144MB per cache variant. Enabling the flag costs one rebuild
+		// (`graph index`, or the next cold build) instead.
+		return nil
+	}
 	directory, err := openCacheEntryDirectory(entry)
 	if err != nil {
 		return err
