@@ -104,7 +104,7 @@ dependency in the patched upstream `requirements.txt` to one exact version and r
 published for that release. Its source `requirements.txt` must have MD5
 `51c617883adf40e4ca22b79533f4662a` (Git blob
 `9f246fa9aee1d635304a2f151a80996ef4a499fb`); the committed lock has SHA-256
-`be938c7db3329662071487394ca123e04581322229fbe405bb1103bcc624203f`.
+`34e94dc81c24a38f45f7d2523dbbab82bd53de4b3057030b8b00bfdac0283318`.
 
 Regenerate it only after reconstructing the pinned harness and applying patches `0001` through
 `0004` plus `0006` as above. From that reconstructed harness checkout:
@@ -152,7 +152,7 @@ Written by us; no upstream code involved.
 | `benchmarks/common/test_bm25_client.py` | 40 |
 | `benchmarks/common/entra_auth.py` | 94 |
 | `benchmarks/common/test_entra_auth.py` | 166 |
-| `requirements-lock-py312.txt` | 1418 |
+| `requirements-lock-py312.txt` | 1519 |
 
 ### Ours but not vendored
 
