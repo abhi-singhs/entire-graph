@@ -69,13 +69,37 @@ func graphAgentCommand(opts Options, args []string, install bool) error {
 				return err
 			}
 		}
-		if err := agentsetup.Install(root, render, opts.Stdout); err != nil {
+		// InstallChanged rather than Install: the installer's own line-per-write
+		// output is replaced by one settled row per phase, composed here the way
+		// brain's setup composes its rows.
+		changed, err := agentsetup.InstallChanged(root, render)
+		if err != nil {
 			return err
 		}
+		ui := newSetupUI(opts.Stdout)
+		if len(changed) == 0 {
+			targets := strings.Join([]string{agentsetup.Path, "AGENTS.md", "CLAUDE.md"}, ", ")
+			ui.Row(setupMarkDone, "agent instructions", "already current ("+targets+")")
+		} else {
+			ui.Row(setupMarkDone, "agent instructions", "written ("+strings.Join(changed, ", ")+")")
+		}
 		if *noClaudeHook {
+			ui.Row(setupMarkSkipped, "Claude hook", "skipped (--no-claude-hook)")
 			return nil
 		}
-		return agentsetup.InstallClaudeSubagentHook(root, opts.Stdout)
+		path, created, hookChanged, err := agentsetup.InstallClaudeSubagentHookChanged(root)
+		if err != nil {
+			return err
+		}
+		switch {
+		case !hookChanged:
+			ui.Row(setupMarkDone, "Claude hook", "unchanged "+path+" (Claude Code SubagentStart hook already present)")
+		case created:
+			ui.Row(setupMarkDone, "Claude hook", "wrote "+path+" (Claude Code SubagentStart hook; per-user, keep it untracked)")
+		default:
+			ui.Row(setupMarkDone, "Claude hook", "updated "+path+" (Claude Code SubagentStart hook; per-user, keep it untracked)")
+		}
+		return nil
 	}
 	guide, err := render()
 	if err != nil {
@@ -87,14 +111,6 @@ func graphAgentCommand(opts Options, args []string, install bool) error {
 func runAgentGuide(opts Options, args []string) error { return graphAgentCommand(opts, args, false) }
 func runSetup(opts Options, args []string) error      { return graphAgentCommand(opts, args, true) }
 
-// shellQuotedRepoDir makes the nested-repo remedy copy-pasteable when the
-// repository path contains anything a shell would act on. Spaces and quotes are
-// not the whole set: $, a backtick, ;, |, &, a glob or a newline is equally
-// hostile to a copy-pasted command, and $ and backtick still EXPAND inside the
-// double quotes a naive fix would reach for. Single quotes suppress all of it,
-// with '\” to carry an embedded single quote through. Quoting more than
-// strictly necessary is free: a single-quoted token is valid wherever a bare
-// one was.
 // isHomeDir reports whether dir is the user's home directory. Compared as
 // cleaned absolute paths: OuterRepo already returns an absolute path, and the
 // two spellings meet here only through filepath.Abs, so no symlink resolution
@@ -119,6 +135,14 @@ func isHomeDir(dir string) bool {
 	return absHome == absDir
 }
 
+// shellQuotedRepoDir makes the nested-repo remedy copy-pasteable when the
+// repository path contains anything a shell would act on. Spaces and quotes are
+// not the whole set: $, a backtick, ;, |, &, a glob or a newline is equally
+// hostile to a copy-pasted command, and $ and backtick still EXPAND inside the
+// double quotes a naive fix would reach for. Single quotes suppress all of it,
+// with '\” to carry an embedded single quote through. Quoting more than
+// strictly necessary is free: a single-quoted token is valid wherever a bare
+// one was.
 func shellQuotedRepoDir(repoDir string) string {
 	if strings.TrimSpace(repoDir) == "" {
 		return "."

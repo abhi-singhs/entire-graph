@@ -252,29 +252,45 @@ func CheckClaudeSubagentHook(root string) error {
 	return nil
 }
 
-// InstallClaudeSubagentHook registers the SubagentStart hook in .claude/settings.local.json,
-// creating the file (and .claude) when absent, and reports the path on out when it changed. A
-// second run finds the hook and writes nothing.
-func InstallClaudeSubagentHook(root string, out io.Writer) error {
+// InstallClaudeSubagentHookChanged registers the SubagentStart hook in
+// .claude/settings.local.json, creating the file (and .claude) when absent. It
+// prints nothing: it reports the settings path, whether the file had to be
+// created, and whether anything changed, so the caller owns the rendering —
+// setup composes a styled row, while InstallClaudeSubagentHook below keeps the
+// plain-line form.
+func InstallClaudeSubagentHookChanged(root string) (path string, created, changed bool, err error) {
 	repo, err := os.OpenRoot(root)
 	if err != nil {
-		return fmt.Errorf("setup: %w", err)
+		return "", false, false, fmt.Errorf("setup: %w", err)
 	}
 	defer repo.Close()
 	state, rendered, changed, err := planClaudeSubagentHook(repo)
 	if err != nil {
-		return fmt.Errorf("setup: %w (fix it, or pass --no-claude-hook)", err)
+		return "", false, false, fmt.Errorf("setup: %w (fix it, or pass --no-claude-hook)", err)
 	}
-	path := filepath.Join(root, filepath.FromSlash(ClaudeLocalSettings))
+	path = filepath.Join(root, filepath.FromSlash(ClaudeLocalSettings))
+	if !changed {
+		return path, false, false, nil
+	}
+	if err := writeClaudeSettings(repo, state, rendered); err != nil {
+		return path, false, false, fmt.Errorf("setup: %s: %w", ClaudeLocalSettings, err)
+	}
+	return path, state.file == nil, true, nil
+}
+
+// InstallClaudeSubagentHook registers the SubagentStart hook and reports the
+// path on out when it changed. A second run finds the hook and writes nothing.
+func InstallClaudeSubagentHook(root string, out io.Writer) error {
+	path, created, changed, err := InstallClaudeSubagentHookChanged(root)
+	if err != nil {
+		return err
+	}
 	if !changed {
 		fmt.Fprintf(out, "unchanged %s (Claude Code SubagentStart hook already present)\n", path)
 		return nil
 	}
-	if err := writeClaudeSettings(repo, state, rendered); err != nil {
-		return fmt.Errorf("setup: %s: %w", ClaudeLocalSettings, err)
-	}
 	verb := "updated"
-	if state.file == nil {
+	if created {
 		verb = "wrote"
 	}
 	fmt.Fprintf(out, "%s %s (Claude Code SubagentStart hook; per-user, keep it untracked)\n", verb, path)
