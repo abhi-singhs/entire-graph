@@ -5,10 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -461,7 +459,7 @@ func loadOrBuildSearchSnapshotPersisting(
 					full.Header.Commit = commit
 					// Best effort, like every query-time store: an unwritable cache
 					// still serves this query from the snapshot in memory.
-					_ = writeSearchSnapshot(fullEntry, newCachedSearchSnapshot(providerVersion, commit, tree, completeOptions, full, ctx))
+					_ = writeSearchSnapshotAndStore(fullEntry, newCachedSearchSnapshot(providerVersion, commit, tree, completeOptions, full, ctx))
 					if selective, ok := deriveFromFull(full); ok {
 						return selective, false, true, nil
 					}
@@ -715,6 +713,9 @@ func persistVerifiedSearchSnapshot(
 		case stored != written:
 			verifyErr = errors.New("persisted entry does not match the bytes written")
 		default:
+			// The explicit prebuild is exactly where a reader expects the
+			// sidecar to exist; best effort, like writeSearchSnapshot's.
+			_ = writeSearchStoreSidecar(context.Background(), entry, written.String(), &cache)
 			return nil
 		}
 	}
@@ -1312,7 +1313,7 @@ func loadCachedSearchSnapshot(
 
 	contexts ...context.Context,
 ) (cachedSearchSnapshot, bool) {
-	cached, err := readSearchSnapshot(entry)
+	cached, err := readSearchSnapshotPreferringStore(entry)
 	if err != nil {
 		return cachedSearchSnapshot{}, false
 	}
@@ -1445,18 +1446,42 @@ func readSearchSnapshot(entry cacheEntry) (cachedSearchSnapshot, error) {
 	}
 	defer reader.Close()
 	var cache cachedSearchSnapshot
-	decoder := json.NewDecoder(reader)
-	if err := decoder.Decode(&cache); err != nil {
+	if err := decodeCacheValue(reader, &cache); err != nil {
 		return cachedSearchSnapshot{}, err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return cachedSearchSnapshot{}, errors.New("search snapshot cache has trailing data")
 	}
 	restoreCachedSearchInternals(&cache)
 	return cache, nil
 }
 
+// readSearchSnapshotPreferringStore answers from the sqlite sidecar when the
+// operator opted in (ENTIRE_GRAPH_SEARCH_STORE) and the sidecar matches the
+// entry, and otherwise from the gz JSON entry. The sidecar exists because the
+// monolithic JSON decode is the single largest cost of a warm query; the gz
+// entry remains authoritative and every sidecar problem is a silent fallback.
+func readSearchSnapshotPreferringStore(entry cacheEntry) (cachedSearchSnapshot, error) {
+	if cache, ok := loadSearchStoreForEntry(context.Background(), entry); ok {
+		return cache, nil
+	}
+	return readSearchSnapshot(entry)
+}
+
 func writeSearchSnapshot(entry cacheEntry, cache cachedSearchSnapshot) error {
 	return entry.write("snapshot", cache)
+}
+
+// writeSearchSnapshotAndStore persists a COMPLETE entry plus its sqlite
+// sidecar. Derived selective views stay on writeSearchSnapshot: they are small
+// per-query artifacts whose JSON decode was never the cost the store exists to
+// remove, so building a store there would spend the build and the disk on
+// queries that had no problem. The sidecar is best effort: the gz entry is
+// authoritative, and writeSearchStoreSidecar removes any previous sidecar on
+// failure so a stale one cannot outlive the entry it mirrored (readers also
+// verify the embedded digest).
+func writeSearchSnapshotAndStore(entry cacheEntry, cache cachedSearchSnapshot) error {
+	digest, err := entry.writeDigest("snapshot", cache)
+	if err != nil {
+		return err
+	}
+	_ = writeSearchStoreSidecar(context.Background(), entry, digest.String(), &cache)
+	return nil
 }
