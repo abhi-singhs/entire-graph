@@ -20,7 +20,9 @@ auto-generated notes on
   mode and a bare re-run inherits the saved one, and `--no-claude-hook` skips
   the Claude Code hook. It also now warns up front, before any write, when the
   target repository is nested inside another one and no explicit `--repo` was
-  given. `agent-guide` remains the read-only preview.
+  given; a git-tracked home directory does not count as an outer repository.
+  Running `init-agents` fails with a pointer to `setup`. `agent-guide` remains
+  the read-only preview.
 
 ### Added
 

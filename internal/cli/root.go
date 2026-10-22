@@ -146,6 +146,11 @@ func Run(ctx context.Context, opts Options, args []string) error {
 	case "help", "--help", "-h":
 		printHelp(opts.Stdout)
 		return nil
+	case "init-agents":
+		// Removed, not aliased: the rename should propagate to scripts and docs,
+		// but the failure has to say where the command went or every caller built
+		// against an older release is left diagnosing a typo that is not one.
+		return fmt.Errorf("init-agents was folded into \"setup\"; run \"entire graph setup\" (same flags)")
 	default:
 		return fmt.Errorf("unknown command %q; run \"entire graph help\" to list commands", args[0])
 	}

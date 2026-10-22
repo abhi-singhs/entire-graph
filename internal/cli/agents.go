@@ -3,6 +3,8 @@ package cli
 import (
 	"flag"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/entireio/entire-graph/internal/agentsetup"
@@ -48,8 +50,12 @@ func graphAgentCommand(opts Options, args []string, install bool) error {
 		// the prose are not, because they are prose. An unquoted path with a
 		// space — ordinary on macOS — made the remedy silently do the wrong thing
 		// when copied, and one with $ or a backtick would expand. See
-		// agentsetup.OuterRepo.
-		if outer := agentsetup.OuterRepo(root); outer != "" && *repo == "" {
+		// agentsetup.OuterRepo. A repository AT the user's home directory is
+		// exempted: that is dotfiles tracking, not a project anyone meant to
+		// install agent instructions into, and warning there — with a remedy
+		// pointing at $HOME — would fire on every setup run of every project
+		// under a git-tracked home.
+		if outer := agentsetup.OuterRepo(root); outer != "" && *repo == "" && !isHomeDir(outer) {
 			fmt.Fprintf(opts.Stderr,
 				"warning: %s is a git repository inside %s.\nThe guide, AGENTS.md and CLAUDE.md go to the inner one. If you meant the project, run:\n    entire graph setup --repo %s\n\n",
 				root, outer, shellQuotedRepoDir(outer))
@@ -88,6 +94,27 @@ func runSetup(opts Options, args []string) error      { return graphAgentCommand
 // with '\” to carry an embedded single quote through. Quoting more than
 // strictly necessary is free: a single-quoted token is valid wherever a bare
 // one was.
+// isHomeDir reports whether dir is the user's home directory. Compared as
+// cleaned absolute paths: OuterRepo already returns an absolute path, and the
+// two spellings meet here only through filepath.Abs, so no symlink resolution
+// is attempted — a home reached through an alias keeps the warning, which errs
+// on the side of saying something.
+func isHomeDir(dir string) bool {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return false
+	}
+	absHome, err := filepath.Abs(home)
+	if err != nil {
+		return false
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	return absHome == absDir
+}
+
 func shellQuotedRepoDir(repoDir string) string {
 	if strings.TrimSpace(repoDir) == "" {
 		return "."
