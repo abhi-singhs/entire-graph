@@ -7,7 +7,7 @@ model, so treat any single figure as scenario-dependent; the measured range and
 the conditions behind it are in the [README](README.md).
 
 Two guidance surfaces coexist here on purpose. `.entire/agent-guide.md` is the
-generated activation artifact — regenerated in full by `init-agents`, so never
+generated activation artifact — regenerated in full by `setup`, so never
 edit it by hand — and is what agents load through the managed block at the end
 of this file. This document is the maintained long-form reference; its examples
 pass flags explicitly (such as `--format text`) for readability rather than
