@@ -7,9 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"path/filepath"
 	"sort"
 
@@ -41,8 +39,11 @@ import (
 // sidecar so a producer spools them to disk as they arrive; the envelope keeps
 // the sidecar's digest. Entries written by earlier builds embed the records
 // inline and are unreadable at this version (and vice versa).
-// v21 retires body-laden Julia signatures and module DATA_FLOWS edges.
-const providerRecordsCacheVersion = "provider-records-v21-" + IdentityRevision
+// v21 retires streams carrying DATA_FLOWS edges matched by another language's
+// expression patterns (a Python conditional pattern on a Go body and the
+// like); language-routed flow extraction no longer produces them.
+// v22 retires body-laden Julia signatures and module DATA_FLOWS edges.
+const providerRecordsCacheVersion = "provider-records-v22-" + IdentityRevision
 
 // cachedProviderRecords is the on-disk envelope for a cached record stream. The
 // key alone is authoritative (sha256 over version+commit+tree+mode+profile+
@@ -401,7 +402,7 @@ func (transaction *ProviderRecordsCacheTransaction) Store(spool *ProviderRecords
 		MaxParseBytes:   transaction.options.MaxParseBytes,
 		RepoRoot:        transaction.absRepo,
 		RepoScope:       cacheCheckoutScope(transaction.absRepo, transaction.ctx),
-		RecordsDigest:   fmt.Sprintf("%x", digest[:]),
+		RecordsDigest:   digest.String(),
 		Summary:         summary,
 	}
 	return writeProviderRecords(transaction.entry, cache)
@@ -451,13 +452,8 @@ func readProviderRecords(entry cacheEntry) (cachedProviderRecords, error) {
 	}
 	defer reader.Close()
 	var cache cachedProviderRecords
-	decoder := json.NewDecoder(reader)
-	if err := decoder.Decode(&cache); err != nil {
+	if err := decodeCacheValue(reader, &cache); err != nil {
 		return cachedProviderRecords{}, err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return cachedProviderRecords{}, errors.New("provider records cache has trailing data")
 	}
 	return cache, nil
 }

@@ -6048,7 +6048,7 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 				// paid for. Revisit if a corpus shows it is not rare.
 				edgeOrder := []string{}
 				flowsByEdge := map[string]*RelationRecord{}
-				for _, flow := range returnFlowCalls(body, symbolFlowParameterNames(from)) {
+				for _, flow := range returnFlowCalls(body, symbolFlowParameterNames(from), flowSyntaxFor(file.Language)) {
 					if flow.Name == from.Name {
 						continue
 					}
@@ -26280,10 +26280,18 @@ func routeLiteralPartOfConcat(line string, start, end int) bool {
 }
 
 func staticStringConstants(content string) map[string]string {
+	// One scan collects the assignment candidates; the fixed-point passes that
+	// chase constant-to-constant references (`B = A + "/x"`) then iterate over
+	// the candidates in memory. The scan used to run INSIDE the loop,
+	// re-matching the entire file — every assignment-shaped line, not just
+	// string ones — on each pass, for a match list that cannot change between
+	// iterations: only the resolution map does. Measured at ~5% of full-profile
+	// snapshot CPU on a large Go repository before the hoist.
+	matches := staticStringAssignRe.FindAllStringSubmatch(content, -1)
 	constants := map[string]string{}
 	for i := 0; i < 5; i++ {
 		changed := false
-		for _, match := range staticStringAssignRe.FindAllStringSubmatch(content, -1) {
+		for _, match := range matches {
 			if len(match) != 3 {
 				continue
 			}
