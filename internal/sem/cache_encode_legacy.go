@@ -4,6 +4,7 @@ package sem
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 )
 
