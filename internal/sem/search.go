@@ -1488,18 +1488,41 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 	}
 	q = q.withCorpusPresence(fileDF)
 	statisticsPassFiles, statisticsPassBytes := queryReads.files, queryReads.bytes
-	for _, filePath := range indexableFiles {
+	// Candidate construction is pure per-file CPU over content the statistics
+	// pass above already read and memoized, so the reads stay serial (same
+	// memo, same telemetry) and only the computation fans out. Files are
+	// independent and the ordered pipeline appends in exactly the sequential
+	// loop's order, so output bytes are unchanged. Measured at 1.5s of a warm
+	// query single-threaded on entire-brain — the largest Query-stage cost.
+	indexableContents := make([]string, len(indexableFiles))
+	indexableRead := make([]bool, len(indexableFiles))
+	for index, filePath := range indexableFiles {
 		if err := ctx.Err(); err != nil {
 			return SearchResponse{}, err
 		}
-		content, ok := read(filePath)
-		if !ok {
-			continue
-		}
-		lines := strings.Split(content, "\n")
-		candidates = append(candidates, candidatesForFile(
-			q, filePath, fileLanguages[filePath], lines, symbolsByFile[filePath], options,
-		)...)
+		indexableContents[index], indexableRead[index] = read(filePath)
+	}
+	if err := runIndexedStreamingPipeline(ctx, len(indexableFiles), runtime.GOMAXPROCS(0),
+		func(_ context.Context, index int, emitCandidate func(searchCandidate)) struct{} {
+			if !indexableRead[index] {
+				return struct{}{}
+			}
+			filePath := indexableFiles[index]
+			lines := strings.Split(indexableContents[index], "\n")
+			for _, candidate := range candidatesForFile(
+				q, filePath, fileLanguages[filePath], lines, symbolsByFile[filePath], options,
+			) {
+				emitCandidate(candidate)
+			}
+			return struct{}{}
+		},
+		func(_ int, candidate searchCandidate) error {
+			candidates = append(candidates, candidate)
+			return nil
+		},
+		func(int, struct{}) error { return nil },
+	); err != nil {
+		return SearchResponse{}, err
 	}
 	// Re-reading a file the content cache had to drop pulls in the same file, not another
 	// one, so it must not inflate what the query is reported to have read.
