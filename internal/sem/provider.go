@@ -47,6 +47,11 @@ const (
 	// IdentityRevision is a global, opaque revision of parser identity rules across
 	// all languages. Change it when corrections re-key existing symbols.
 	//
+	// Revision 5: Julia declaration headers replace body-laden signatures.
+	// Same-name overload IDs hash the signature, so their #sig: suffixes change
+	// even for unchanged source. Consumers must refresh snapshots and recompute
+	// persisted entity deltas under the corrected parser rules.
+	//
 	// Revision 4: the same correction for Swift, Kotlin, Rust and PHP, whose
 	// nested callables are local functions / block-scoped items / namespace
 	// functions rather than members of the enclosing type. Revision 3 shipped
@@ -60,7 +65,7 @@ const (
 	// `C.helper` (kind "method"). This re-keys every Python nested-callable
 	// symbol, and it un-keys the `#sig:` suffixes that the phantom forced onto
 	// real same-named members.
-	IdentityRevision     = "4"
+	IdentityRevision     = "5"
 	defaultMaxParseBytes = 4 * 1024 * 1024
 	// defaultMaxSourceFiles bounds how many files one snapshot will list. The
 	// per-file indexes a snapshot keeps (one file record and its retained symbols)

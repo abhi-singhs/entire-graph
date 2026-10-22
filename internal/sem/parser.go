@@ -6543,7 +6543,10 @@ func entityFromNode(node *sitter.Node, src []byte, language, scope string) (Enti
 	if language == "Julia" {
 		if sig := juliaSignature(node, src); sig != "" {
 			entity.Signature = sig
-			entity.Fingerprint = hash(normalize(entityFingerprintSource(Entity{Name: name, Signature: sig}, block)))
+			// The single-line fingerprint fallback reads Signature. Give it the
+			// full definition so unrelated bodies with the same parameters do
+			// not become perfect rename matches after the header-only cut.
+			entity.Fingerprint = hash(normalize(entityFingerprintSource(Entity{Name: name, Signature: block}, block)))
 		}
 	}
 	// Dart declaration heads (function/method/getter/setter signatures) keep the
