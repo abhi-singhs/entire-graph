@@ -72,6 +72,17 @@ func TestSetupPrintsOneRowPerPhase(t *testing.T) {
 			t.Errorf("first run missing %q:\n%s", want, first)
 		}
 	}
+	// The run opens like brain's setup: blank line, one sentence saying what
+	// the product is for, blank line, the rows, and a closing blank line.
+	if !strings.HasPrefix(first, "\nEntire Graph creates a map") {
+		t.Errorf("setup must open with a blank line and the intro sentence:\n%q", first)
+	}
+	if lines := strings.Split(first, "\n"); lines[2] != "" {
+		t.Errorf("a blank line must separate the intro from the rows:\n%q", first)
+	}
+	if !strings.HasSuffix(first, "\n\n") {
+		t.Errorf("setup must close with a blank line:\n%q", first)
+	}
 	rerun := run()
 	for _, want := range []string{"already current (", "unchanged "} {
 		if !strings.Contains(rerun, want) {

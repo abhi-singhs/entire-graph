@@ -72,11 +72,12 @@ func graphAgentCommand(opts Options, args []string, install bool) error {
 		// InstallChanged rather than Install: the installer's own line-per-write
 		// output is replaced by one settled row per phase, composed here the way
 		// brain's setup composes its rows.
+		ui := newSetupUI(opts.Stdout)
+		ui.Intro("Entire Graph creates a map of your code that your coding agents query instead of grepping.")
 		changed, err := agentsetup.InstallChanged(root, render)
 		if err != nil {
 			return err
 		}
-		ui := newSetupUI(opts.Stdout)
 		if len(changed) == 0 {
 			targets := strings.Join([]string{agentsetup.Path, "AGENTS.md", "CLAUDE.md"}, ", ")
 			ui.Row(setupMarkDone, "agent instructions", "already current ("+targets+")")
@@ -85,6 +86,7 @@ func graphAgentCommand(opts Options, args []string, install bool) error {
 		}
 		if *noClaudeHook {
 			ui.Row(setupMarkSkipped, "Claude hook", "skipped (--no-claude-hook)")
+			ui.End()
 			return nil
 		}
 		path, created, hookChanged, err := agentsetup.InstallClaudeSubagentHookChanged(root)
@@ -99,6 +101,7 @@ func graphAgentCommand(opts Options, args []string, install bool) error {
 		default:
 			ui.Row(setupMarkDone, "Claude hook", "updated "+path+" (Claude Code SubagentStart hook; per-user, keep it untracked)")
 		}
+		ui.End()
 		return nil
 	}
 	guide, err := render()

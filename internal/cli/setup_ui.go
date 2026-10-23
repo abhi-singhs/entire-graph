@@ -81,3 +81,16 @@ func (u *setupUI) Row(mark setupMark, title, text string) {
 	pad := strings.Repeat(" ", max(0, setupTitleWidth-len(title)))
 	fmt.Fprintln(u.out, u.glyph(mark)+" "+title+pad+" "+termsafe.Line(text))
 }
+
+// Intro opens the run the way brain's setup does: a blank line, one sentence
+// saying what the product is for, another blank line, and then the rows.
+func (u *setupUI) Intro(sentence string) {
+	fmt.Fprintln(u.out)
+	fmt.Fprintln(u.out, sentence)
+	fmt.Fprintln(u.out)
+}
+
+// End closes the run with the blank line that separates it from the prompt.
+func (u *setupUI) End() {
+	fmt.Fprintln(u.out)
+}
