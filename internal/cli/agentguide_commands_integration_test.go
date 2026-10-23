@@ -46,6 +46,9 @@ func TestShippedGraphGuideCommandsExecuteAgainstCommittedSource(t *testing.T) {
 			seen := map[string]bool{}
 			for _, line := range strings.Split(guide, "\n") {
 				line = strings.TrimSpace(line)
+				// The combined guide ships the query inside an ordered sequence
+				// ("2. entire graph query ..."); the command is the rest of the line.
+				line = strings.TrimPrefix(strings.TrimPrefix(line, "1. "), "2. ")
 				if !strings.HasPrefix(line, "entire graph ") {
 					continue
 				}

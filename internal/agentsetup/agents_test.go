@@ -61,8 +61,6 @@ func TestInitAgentsInstallsAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("guide not written: %v", err)
 	}
-	// The marker is the first-action obligation: it is what makes the guide worth installing,
-	// and it is the sentence that went missing when adoption collapsed. See guide.go.
 	if !strings.Contains(string(guide), "MUST be a Graph query") {
 		t.Fatalf("guide content wrong:\n%s", guide)
 	}

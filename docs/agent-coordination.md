@@ -112,23 +112,29 @@ Follow-up questions use `def` for a named symbol, `neighbors` for callers or cal
 and `impact` for blast radius, each with `--head`; grep is for literal text only.
 
 Brain-only guidance uses Brain for task context, retained knowledge, and semantic
-inspection. Combined guidance begins substantive tasks needing orientation with:
+inspection. Combined guidance states one ordered sequence for tasks that require
+finding code — the brief first, then a Graph query:
 
 ```sh
 entire brain brief "<task>" --json
+entire graph query --repo . --profile full --head --format agent --max-context-bytes 4096 --query "<task>"
 ```
 
-Skip the brief when equivalent context is already available. Reuse useful locations
-without a redundant Graph query. Graph query, def, neighbors, and impact answer
+Run the brief before deciding the task does not need it. Locations from the brief
+answer where code is, not what depends on it, so neither step replaces the other.
+Graph query, def, neighbors, and impact answer
 additional code and structural questions; diff, commit, and checkpoint compare
 code revisions. Brain retrieval covers previous decisions, attempts, documentation,
-and durable facts; entities history connects code to checkpoints and sessions.
+and durable memories (recall ranks decisions and rationale first); entities history
+connects code to checkpoints and sessions.
 Use Brain memory-informed review and workspace capabilities when relevant. Do not
 ask both products the same question without an identified gap.
 
-In every normal product combination that includes Graph, the first action on a task
-that requires finding code is a Graph query, and each later locate or relationship
-question goes through Graph too; there is no one-query cap. Normal mode does not offer a
+In every normal product combination that includes Graph, a task that requires
+finding code starts with a Graph query (preceded by the brief when Brain is also
+enabled — one sequence, never two competing first-action absolutes), and each later
+locate or relationship question goes through Graph too; there is no one-query cap.
+Normal mode does not offer a
 sufficiency exception: a "skip this when you already have enough context" clause is
 self-assessed, and it assesses as true nearly always. (Graph interactive queries
 normally inspect the working tree; Brain semantic answers refer to a stored index.)
