@@ -10,7 +10,9 @@ here. Releases before 0.5.0 have no hand-written entry: their contents are the
 auto-generated notes on
 [the releases page](https://github.com/entireio/entire-graph/releases).
 
-## [0.5.0] - unreleased
+## [Unreleased]
+
+## [0.5.0] - 2026-10-23
 
 ### Removed
 
