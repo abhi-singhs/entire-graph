@@ -516,7 +516,7 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 			// Best effort: a failed cache write never fails the command, but it is
 			// said once on stderr rather than silently costing a re-parse per run.
 			if err := recordsCache.Store(spool, summary, snapshotHeader); err != nil {
-				fmt.Fprintf(opts.Stderr, "graph: provider records cache not stored: %v\n", err)
+				warnf(opts.Stderr, "provider records cache not stored: %v", err)
 			}
 			spool = nil
 		}
@@ -568,7 +568,7 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 		// Best effort: a failed cache write never fails the command, but it is
 		// said once on stderr rather than silently costing a re-parse per run.
 		if err := recordsCache.Store(spool, summary, snapshotHeader); err != nil {
-			fmt.Fprintf(opts.Stderr, "graph: provider records cache not stored: %v\n", err)
+			warnf(opts.Stderr, "provider records cache not stored: %v", err)
 		}
 		spool = nil
 	}
@@ -586,7 +586,7 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 func beginRecordsSpool(recordsCache *sem.ProviderRecordsCacheTransaction, stderr io.Writer) *sem.ProviderRecordsSpool {
 	spool, err := recordsCache.NewSpool()
 	if err != nil {
-		fmt.Fprintf(stderr, "graph: provider records cache unavailable: %v\n", err)
+		warnf(stderr, "provider records cache unavailable: %v", err)
 		return nil
 	}
 	return spool
@@ -637,9 +637,15 @@ func warnIfPartial(w io.Writer, worktree bool, s *sem.SnapshotSummary) {
 	if level == "" || level == "ok" {
 		return
 	}
-	fmt.Fprintf(w, "\n⚠️  graph is %s: parsed %d/%d files, %d symbols, %d relations (languages: %s).\n",
+	headline := fmt.Sprintf("⚠️  graph is %s: parsed %d/%d files, %d symbols, %d relations (languages: %s).",
 		strings.ToUpper(level), s.Stats.ParsedFiles, s.Stats.Files, s.Stats.Symbols,
 		s.Stats.Relations, strings.Join(s.Languages, ", "))
+	if sem.ShouldUseColor(w) {
+		// Loud warning tier: bright yellow, one slot above warnf's plain
+		// yellow (palette @ bc9a821d reserves "11" for the louder tier).
+		headline = "\x1b[93m" + headline + "\x1b[0m"
+	}
+	fmt.Fprintf(w, "\n%s\n", headline)
 	switch {
 	case s.Stats.Files <= 2 && !worktree:
 		fmt.Fprintf(w, "   Only %d file(s) were discovered — you may be indexing a subdirectory or an\n"+
