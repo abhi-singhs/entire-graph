@@ -13,6 +13,7 @@ not skip either step on the grounds that the available context feels sufficient,
 do not treat having done one as having done the other.
 Each later locate or relationship question MUST also go through Graph:
 
+    entire graph query --repo . --profile full --head --format agent --max-context-bytes 4096 --query "<task>"
     entire graph def --repo . --head --max-context-bytes 4096 <Name>
     entire graph neighbors --repo . --head --format agent --max-context-bytes 4096 --symbol <Name> --direction in
     entire graph impact --repo . --head --max-context-bytes 4096 --symbol <Name>
