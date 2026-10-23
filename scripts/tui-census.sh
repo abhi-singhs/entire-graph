@@ -102,9 +102,10 @@ cmd_plan() {
     verify)       echo "run:" ;;
     context)      echo "run:--task 'greet by name'" ;;
     snapshot|symbols|edges) echo "run:" ;;
-    stats)        echo "run:--sessions-dir $SESSIONS_DIR" ;;
+    stats)        echo "run:--sessions-dir '$SESSIONS_DIR'" ;;
     setup)        echo "run:--no-claude-hook" ;;  # writes only inside the scratch repo
     hook)         echo "skip:Claude Code hook plumbing; expects hook JSON on stdin" ;;
+    snapshot-query) echo "skip:needs a pregenerated compact snapshot (--input); output is machine NDJSON" ;;
     *) echo "unmapped:" ;;
   esac
 }
