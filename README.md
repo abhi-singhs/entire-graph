@@ -73,6 +73,10 @@ Activation is per repository:
 entire graph setup --repo .
 ```
 
+If Entire Brain is installed too, also run `entire brain setup` — each setup
+enables its own product, the two compose in either order, and both render the
+same combined guide text.
+
 Add `--strict` to save mandatory Graph/Brain tool-use rules for this repository.
 The saved mode is shared by enabled products and inherited on later runs.
 Use `setup --normal` to reset it. `agent-guide` inherits the saved mode;
