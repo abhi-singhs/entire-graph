@@ -58,8 +58,8 @@ func graphAgentCommand(opts Options, args []string, install bool) error {
 		// under a git-tracked home.
 		if outer := agentsetup.OuterRepo(root); outer != "" && *repo == "" && !isHomeDir(outer) {
 			fmt.Fprintf(opts.Stderr,
-				"warning: %s is a git repository inside %s.\nThe guide, AGENTS.md and CLAUDE.md go to the inner one. If you meant the project, run:\n    entire graph setup --repo %s\n\n",
-				root, outer, shellQuotedRepoDir(outer))
+				"%s %s is a git repository inside %s.\nThe guide, AGENTS.md and CLAUDE.md go to the inner one. If you meant the project, run:\n    entire graph setup --repo %s\n\n",
+				warnPrefix(opts.Stderr, "warning:"), root, outer, shellQuotedRepoDir(outer))
 		}
 		// Reject malformed or unsafe settings before writing the guides. This is
 		// input preflight, not a multi-file transaction: a later I/O failure or
