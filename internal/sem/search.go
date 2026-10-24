@@ -102,7 +102,17 @@ type SearchOptions struct {
 	// neither --max-indexed-files nor --index-all-files was given). preselectSearchFiles
 	// adds the one input it alone knows, the corpus size, and when that build will
 	// follow it selects with the warm Git tree grep instead of the content scan.
+	// It is a prefilter only: the snapshot loader serves that selection from a
+	// complete snapshot or refuses it (coldCompletePolicy.required).
 	coldCompleteEligible bool
+	// coldCompleteUnavailable marks the second attempt of a search whose
+	// cold-complete selection the loader refused (errColdCompleteUnavailable): it
+	// selects with the bounded content scan and does not attempt the complete
+	// build again, which is what a cold query did before the warm route existed.
+	// coldCompleteRetryLatency is the refused attempt's wall time, charged to this
+	// attempt's index and total latency.
+	coldCompleteUnavailable  bool
+	coldCompleteRetryLatency time.Duration
 	// afterCachePolicyCapture is a deterministic test seam for policy-file
 	// mutation between transaction capture and the first cache lookup. It is
 	// deliberately unexported and nil in production.
@@ -1128,6 +1138,9 @@ func SearchRepository(ctx context.Context, repo, providerVersion, query string, 
 }
 
 func searchRepository(ctx context.Context, repo, providerVersion, query string, options SearchOptions) (SearchResponse, error) {
+	// The options as the caller passed them, before the defaults below are
+	// applied: a retry after errColdCompleteUnavailable starts from these.
+	requestedOptions := options
 	q := buildSearchQuery(query)
 	if len(q.terms) == 0 {
 		return SearchResponse{}, errors.New("search query has no meaningful terms")
@@ -1170,7 +1183,7 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 		options.Profile = ProfileFast
 	}
 	sparseQuery := buildSparseSearchQueryExpanded(query, q)
-	searchStarted := time.Now()
+	searchStarted := time.Now().Add(-options.coldCompleteRetryLatency)
 	baseSnapshotOptions := ProviderSnapshotOptions{
 		NoNetwork:     true,
 		Worktree:      options.Worktree,
@@ -1221,12 +1234,14 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 	if options.afterPreindexLoad != nil {
 		options.afterPreindexLoad()
 	}
-	// The conditions loadOrBuildSearchSnapshotPersisting checks before it builds the
-	// complete snapshot on a miss (coldCompletePolicy carries the same two flags
-	// there). The corpus-size bound is applied in preselection, which owns the listing.
+	// Whether a cold-complete build can follow, as far as this search can tell
+	// before selecting; preselection adds the corpus-size bound. The loader makes
+	// the actual decision and refuses the warm selection when no complete
+	// snapshot can serve it, so this only spares a doomed grep and retry.
 	options.coldCompleteEligible = !preindexCacheHit && !options.Worktree && !searchCacheDisabled &&
-		options.CacheDir != "" && !explicitIndexedFileBound && !options.IndexAllFiles
-	preindexLoadLatency := time.Since(indexStarted)
+		options.CacheDir != "" && !explicitIndexedFileBound && !options.IndexAllFiles &&
+		!options.coldCompleteUnavailable
+	preindexLoadLatency := time.Since(indexStarted) + options.coldCompleteRetryLatency
 	preselectStarted := time.Now()
 	selection, err := preselectSearchFiles(
 		ctx, repo, q, sparseQuery, options, baseSnapshotOptions, preindexedSnapshot, preindexCacheHit,
@@ -1369,8 +1384,9 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 	snapshotOptions := baseSnapshotOptions
 	snapshotOptions.OnlyFiles = onlyFiles
 	snapshotOptions.coldComplete = coldCompletePolicy{
-		disabled:    explicitIndexedFileBound,
+		disabled:    explicitIndexedFileBound || options.coldCompleteUnavailable,
 		sourceFiles: selection.filesScanned,
+		required:    selection.coldCompleteRoute,
 	}
 	var derivedFromComplete *SnapshotHeader
 	snapshotOptions.onCompleteDerivation = func(header SnapshotHeader) {
@@ -1394,6 +1410,17 @@ func searchRepository(ctx context.Context, repo, providerVersion, query string, 
 	} else if !cacheHit {
 		indexStarted = time.Now()
 		snapshot, cacheHit, err = loadOrBuildSearchGraphSnapshot(ctx, repo, providerVersion, snapshotOptions, options.CacheDir, searchCacheDisabled)
+		if errors.Is(err, errColdCompleteUnavailable) && !options.coldCompleteUnavailable {
+			// No complete snapshot can serve the warm selection: the cache
+			// generation is unreadable, the cache policy changed, HEAD moved, or
+			// the complete build failed. Search again from the caller's options,
+			// selecting with the bounded content scan, so the fallback builds the
+			// same bounded view a cold query always built.
+			retry := requestedOptions
+			retry.coldCompleteUnavailable = true
+			retry.coldCompleteRetryLatency = time.Since(searchStarted)
+			return searchRepository(ctx, repo, providerVersion, query, retry)
+		}
 		if err != nil {
 			return SearchResponse{}, err
 		}
@@ -2514,6 +2541,10 @@ type searchFileSelection struct {
 	// re-deriving a predicate is what keeps a caller's --include-file meaning the same thing on
 	// both routes.
 	ignores ignoreMatcher
+	// coldCompleteRoute says files came from the warm Git tree grep on a cold
+	// query, so they may only be served from a complete snapshot
+	// (coldCompletePolicy.required).
+	coldCompleteRoute bool
 }
 
 type searchScanTelemetry struct {
@@ -2677,6 +2708,7 @@ func preselectSearchFiles(
 			selection.files = bridgeRegistrationHandlerFiles(ctx, source, files, searchRegistrationBridgeMaxHandlers)
 			selection.sparseFiles = append([]string(nil), selection.files...)
 			selection.preselectionBackend = "git-tree-grep"
+			selection.coldCompleteRoute = !exactFullPreindex
 			selection.preselectionPasses = 1
 			selection.preselectionFilesExamined = len(source.paths)
 			// Git scanned content but returned only paths, so the provider has no posting lists.
