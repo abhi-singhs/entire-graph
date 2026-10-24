@@ -528,7 +528,7 @@ var coldCompleteSnapshotMaxFiles = 3000
 // selective build then reports it.
 func completeSnapshotAffordableOnColdQuery(ctx context.Context, absRepo string, options ProviderSnapshotOptions) bool {
 	if known := options.coldComplete.sourceFiles; known > 0 {
-		return known <= coldCompleteSnapshotMaxFiles
+		return coldCompleteSnapshotFits(known)
 	}
 	source, err := prepareSource(ctx, absRepo, options)
 	if err != nil {
@@ -537,7 +537,13 @@ func completeSnapshotAffordableOnColdQuery(ctx context.Context, absRepo string, 
 	if source.close != nil {
 		defer source.close()
 	}
-	return len(source.paths) <= coldCompleteSnapshotMaxFiles
+	return coldCompleteSnapshotFits(len(source.paths))
+}
+
+// coldCompleteSnapshotFits is the corpus-size bound on the cold-complete build. Cold
+// preselection asks it too, so it picks the warm route exactly when the build follows.
+func coldCompleteSnapshotFits(sourceFiles int) bool {
+	return sourceFiles <= coldCompleteSnapshotMaxFiles
 }
 
 // loadOrDeriveSelectiveSearchSnapshot serves a selective query from an
