@@ -69,18 +69,17 @@ func TestTF142DeadlineInterruptsInFlightFileParse(t *testing.T) {
 // provider.go:1198. emitStructuralRelations and emitStructuralRelationsCompact
 // had no stop predicate, so once the deadline was detected the sink returned
 // immediately but the PRODUCER kept walking every remaining file and symbol -- a
-// full O(symbol-count) pass charged entirely to the overshoot.
+// full O(symbol-count) pass after the run had already stopped.
 //
 // The assertion is on records produced, not on elapsed time. An earlier version
 // of this test measured the residual with a stopwatch against a 3ms ceiling; it
 // passed on macOS and Windows and failed on the shared ubuntu runner at 3.14ms
 // (the producer HAD stopped -- one record emitted, then nothing -- the runner
-// was simply slower than the ceiling). A wall-clock bound is not a property a
-// shared CI runner can be asked to meet, and a flaky test on the check that is
-// supposed to prove the ceiling works is worse than no test. The invariant the
-// fix actually installs is "the producer stops at the next symbol", and that is
-// what is asserted here, deterministically, on any machine. The timed
-// end-to-end measurement it replaces is recorded in the PR description.
+// was simply slower than the 3ms bound). Elapsed time is not a property a
+// shared CI runner can be asked to meet, and a flaky test is worse than no
+// test. The invariant the fix actually installs is "the producer stops at the
+// next symbol", and that is what is asserted here, deterministically, on any
+// machine.
 func TestTF142DeadlineStopsStructuralRelationProducer(t *testing.T) {
 	t.Parallel()
 	const files, perFile = 40, 2000

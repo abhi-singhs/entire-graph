@@ -31,9 +31,9 @@ var unbudgetedParseAllowlist = map[string]string{
 	// Same entry point as the line above, after main factored the sidecar read
 	// out of loadCachedSearchSnapshot: both take `contexts ...context.Context`
 	// and fall back to Background only when the caller supplied none. A
-	// budgeted caller's context is forwarded through loadCachedSearchSnapshot
-	// and reaches loadSearchStoreForEntry intact, so the fallback is the
-	// no-context default, not a parse stage escaping the budget.
+	// caller's context is forwarded through loadCachedSearchSnapshot and
+	// reaches loadSearchStoreForEntry intact, so the fallback is the
+	// no-context default, not a parse stage escaping the caller's context.
 	"search_cache.go.readSearchSnapshotPreferringStore": "ctx := context.Background()",
 	"records_cache.go.providerRecordsKeyForSchema":      "ctx := context.Background()",
 }
@@ -81,7 +81,7 @@ func TestTF142R6NoUnbudgetedParseContext(t *testing.T) {
 			if unbudgetedParseAllowlist[owner(i+1)] == trimmed {
 				continue
 			}
-			t.Errorf("%s:%d starts a context the caller's wall-clock budget cannot reach: %s\n"+
+			t.Errorf("%s:%d starts a context the caller's cancellation cannot reach: %s\n"+
 				"take the caller's context instead; if this really is an unbudgeted entry point, add it to unbudgetedParseAllowlist with a reason",
 				name, i+1, trimmed)
 		}
