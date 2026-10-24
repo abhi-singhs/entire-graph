@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 )
 
 // Round thirteen. Three open review findings surfaced after round twelve
@@ -57,13 +56,13 @@ func TestTF142R13FastCFamilyEntitiesUnbudgetedAreUnchanged(t *testing.T) {
 }
 
 // TestTF142R13ProcessProviderFileStopsBetweenReadAndParse reproduces the
-// provider_parallel.go finding: a budget that expires WHILE sc.read is in
+// provider_parallel.go finding: a cancellation that lands WHILE sc.read is in
 // flight (the one synchronous step processProviderFile cannot interrupt) was
 // only caught at the post-parse check, so every populated early return in
 // between — E_FILE_TOO_LARGE, E_MINIFIED, the oversize branch — still ran and
-// still emitted a file record after the ceiling. The read function here
-// cancels the context itself, reproducing "expired during the read" without
-// a real clock race.
+// still emitted a file record after the cancellation. The read function here
+// cancels the context itself, reproducing "cancelled during the read" without
+// a real race.
 func TestTF142R13ProcessProviderFileStopsBetweenReadAndParse(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -78,15 +77,14 @@ func TestTF142R13ProcessProviderFileStopsBetweenReadAndParse(t *testing.T) {
 			return minified, true
 		},
 	}
-	gate := budgetGate{work: ctx, now: time.Now}
 	spec := resolveProfile(ProfileFast)
 
-	result := processProviderFile(ctx, gate, sc, spec, 0, 0, "pkg.js")
+	result := processProviderFile(ctx, sc, spec, 0, 0, "pkg.js")
 	if result.file != nil {
 		t.Fatalf("processProviderFile emitted a file record for a read that expired the budget in flight: %+v", result.file)
 	}
 	if len(result.failures) != 0 {
-		t.Fatalf("processProviderFile emitted failures for a budget-truncated file, want none (silent drop like the post-parse check): %+v", result.failures)
+		t.Fatalf("processProviderFile emitted failures for a file dropped by cancellation, want none (silent drop like the post-parse check): %+v", result.failures)
 	}
 }
 
@@ -100,10 +98,9 @@ func TestTF142R13ProcessProviderFileUnbudgetedStillClassifiesMinified(t *testing
 		key:  "gh/example/repo",
 		read: func(path string) (string, bool) { return minified, true },
 	}
-	gate := budgetGate{work: context.Background(), now: time.Now}
 	spec := resolveProfile(ProfileFast)
 
-	result := processProviderFile(context.Background(), gate, sc, spec, 0, 0, "pkg.js")
+	result := processProviderFile(context.Background(), sc, spec, 0, 0, "pkg.js")
 	if result.file == nil {
 		t.Fatal("processProviderFile dropped an unbudgeted minified file entirely, want a file record with E_MINIFIED")
 	}

@@ -151,8 +151,8 @@ func (p SearchReplayPolicy) AllowsReplayPaths(paths []string) bool {
 	}
 	if p.ctx == nil {
 		// Fail closed rather than root a fresh context here. The Git probes
-		// below run under the caller's wall-clock budget; a context.Background
-		// fallback would start subprocesses no deadline can reach, which is the
+		// below run under the caller's context; a context.Background fallback
+		// would start subprocesses no cancellation or deadline can reach, which is the
 		// exact shape TestTF142R6NoUnbudgetedParseContext exists to keep out of
 		// this package. ResolveSearchReplayPolicy always captures a context, so
 		// the only policies that reach this line were assembled outside it and

@@ -42,7 +42,6 @@ func boundedProviderWorkerCount(maxProcs int) int {
 // without changing the deterministic reducer.
 func processProviderFile(
 	ctx context.Context,
-	gate budgetGate,
 	sc sourceContext,
 	spec profileSpec,
 	maxParseBytes int,
@@ -50,17 +49,11 @@ func processProviderFile(
 	path string,
 ) providerFileResult {
 	result := providerFileResult{index: index, path: path}
-	// The per-file stop condition is the worker context OR the wall-clock
-	// budget. It cannot be ctx alone: context.WithDeadline reports expiry
-	// through a runtime timer, so ctx.Err() flips one timer granularity after
-	// the deadline actually passed (~15.6 ms on Windows). Inside that window
-	// the pipeline keeps handing out files and this function reads, parses and
-	// RETURNS them, so the reducer emits file and symbol records dated after
-	// the advertised ceiling. gate.expired() compares the clock to the deadline
-	// directly, so the answer is true the instant the budget is gone on every
-	// platform. ctx stays in the disjunction because the pipeline's own
-	// cancellation (a reduce error, or shutdown) travels only on it.
-	stop := func() bool { return ctx.Err() != nil || gate.expired() }
+	// The worker context carries both the caller's cancellation and the
+	// pipeline's own (a reduce error, or shutdown). Every stop below drops the
+	// file whole; the pipeline then returns the context's error, so nothing a
+	// cancelled run half-read or half-parsed is ever emitted.
+	stop := func() bool { return ctx.Err() != nil }
 	if stop() {
 		return result
 	}
@@ -103,19 +96,15 @@ func processProviderFile(
 		}
 	}
 
-	// Checked BEFORE the read, not by wrapping sc.read in gate.reader. A
+	// Checked BEFORE the read, not by wrapping sc.read in cancellableReader. A
 	// refused read is reported below as E_FILE_READ ("file listed but content
 	// was unavailable"), which is the signature of a corrupt or vanished
-	// source; routing a budget expiry into it would make a truncated run
-	// indistinguishable from a broken repository. Stopping here instead drops
-	// the file with no failure record, which is exactly what an expiry during
-	// the parse already does, and the run still carries the single
-	// E_ANALYSIS_BUDGET_EXCEEDED marker that says why files are missing.
+	// source; a cancellation is not that, so it drops the file with no failure
+	// record instead.
 	//
-	// This bounds the number of reads STARTED after expiry to zero. It does not
-	// bound a read already in flight -- sc.read is synchronous and takes no
-	// context -- which is the residual the PR discloses as one in-flight file
-	// per worker.
+	// This bounds the number of reads STARTED after cancellation to zero. It
+	// does not bound a read already in flight: sc.read is synchronous and takes
+	// no context.
 	if stop() {
 		return providerFileResult{index: index, path: path}
 	}
@@ -124,15 +113,12 @@ func processProviderFile(
 	if routedOversize == nil {
 		content, ok = sc.read(path)
 	}
-	// sc.read is the one synchronous, unbudgeted step this function cannot
-	// interrupt mid-flight (see the comment above), but once it returns,
-	// everything below it -- the oversize branch immediately following,
-	// E_FILE_TOO_LARGE, E_MINIFIED -- populates a file record and returns
-	// without touching the parser or ctx again, so none of those early
-	// returns observed a budget that expired while the read was in flight.
-	// Rechecking here, before any of them run, keeps every populated return
-	// between the read and the parse subject to the same ceiling the
-	// pre-read and post-parse checks already enforce.
+	// sc.read is the one synchronous step this function cannot interrupt
+	// mid-flight (see the comment above), but once it returns, everything below
+	// it -- the oversize branch immediately following, E_FILE_TOO_LARGE,
+	// E_MINIFIED -- populates a file record and returns without touching the
+	// parser or ctx again. Rechecking here keeps a cancellation that landed
+	// during the read from still producing one of those records.
 	if stop() {
 		return providerFileResult{index: index, path: path}
 	}
@@ -265,10 +251,9 @@ func processProviderFile(
 	}
 
 	entities, parsedLanguage, parseStatus := parseWithProfile(ctx, TreeSitterParser{}, spec, langSpec, path, content)
-	// The parse and the entity walk both observe ctx now, so a budget that
-	// expires mid-file returns a PARTIAL entity set. Truncation is file-atomic:
-	// drop the file entirely rather than let the reducer emit a file record with
-	// a silently short symbol list that reads as complete.
+	// The parse and the entity walk both observe ctx, so a cancellation that
+	// lands mid-file returns a PARTIAL entity set. Drop the file entirely rather
+	// than hand the reducer a file record with a silently short symbol list.
 	if stop() {
 		return providerFileResult{index: index, path: path}
 	}
@@ -314,10 +299,9 @@ func processProviderFile(
 	// syntheticBoundarySymbols rescans file content once per already-parsed
 	// symbol (route/tool/workflow boundary detection), which is superlinear in
 	// files with very large symbol counts. stop is polled inside its loop, so
-	// a deadline expiring mid-scan is caught within one poll stride rather
-	// than only after the whole pass finishes. A stop here truncates like the
-	// post-parse check above: the file is dropped whole rather than emitted
-	// with entity symbols but no synthetic ones, which would read as complete.
+	// a cancellation landing mid-scan is caught within one poll stride rather
+	// than only after the whole pass finishes. A stop here drops the file whole,
+	// like the post-parse check above.
 	synthetic, truncated := syntheticBoundarySymbols(sc.key, path, parsedLanguage, content, result.symbols, stop)
 	if truncated {
 		return providerFileResult{index: index, path: path}
@@ -356,16 +340,11 @@ func workerStop(ctx context.Context, overBudget func() bool) (canceled error, bu
 // of results that have not yet been reduced.
 //
 // stop is polled immediately before every reduction and may be nil, which means
-// "the context is the only ceiling". It exists because reducing is not free:
-// the provider's reducer emits one file record plus that file's entire symbol
-// list into the caller's sink, so a wall-clock budget that only governs the
-// workers can still be overrun by the results already in the pipeline when it
-// expires. The generic cancellation branch attempts an ordered buffered drain,
-// but this provider wrapper polls stop before those reductions too: after budget
-// expiry, already-parsed buffered files are deliberately not emitted. Without a
-// stop guard, generic callers can still drain them. A clock-triggered expiry is
-// not visible on ctx until its timer fires. Polling here keeps a symbol-heavy
-// file, or a slow sink, from carrying the run past the ceiling. Reduction stays
+// "the context is the only stop". It exists because reducing is not free: the
+// provider's reducer emits one file record plus that file's entire symbol list
+// into the caller's sink, and the coordinator's select can pick a ready result
+// over a closed Done channel, so without the poll a cancelled run could still
+// emit the results already buffered behind the one in flight. Reduction stays
 // atomic per file: the check is between results, never inside one.
 func runProviderFilePipeline(
 	ctx context.Context,
@@ -467,32 +446,6 @@ func runIndexedPipeline[T any](
 		}
 		select {
 		case <-ctx.Done():
-			for {
-				reduced := false
-				for {
-					ordered, ok := pending[nextReduce]
-					if !ok {
-						break
-					}
-					if err := reduce(nextReduce, ordered); err != nil {
-						return err
-					}
-					delete(pending, nextReduce)
-					nextReduce++
-					outstanding--
-					reduced = true
-				}
-				gotResult := false
-				select {
-				case out := <-results:
-					pending[out.index] = out.result
-					gotResult = true
-				default:
-				}
-				if !reduced && !gotResult {
-					break
-				}
-			}
 			return ctx.Err()
 		case submit <- job:
 			nextSubmit++

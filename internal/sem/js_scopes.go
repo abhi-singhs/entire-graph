@@ -141,7 +141,7 @@ var jsScanParseTimeout = treeSitterParseTimeout
 // is a cap on top of that context, not a fresh one rooted at
 // context.Background: the relation-phase scan is per file, so a scan rooted at
 // Background let every remaining file spend up to jsScanParseTimeout after the
-// wall-clock budget had already expired.
+// caller's context was already done.
 func buildJSScanState(ctx context.Context, grammar *sitter.Language, parseSrc []byte, content string) (*jsScanState, error) {
 	state := emptyJSScanState(content)
 	if err := ctx.Err(); err != nil {
@@ -445,7 +445,7 @@ type jsScopeWalker struct {
 	// merging namespace may be declared later in the file).
 	declarationBindings []jsDeclarationBinding
 	// budget is the caller's context, polled every jsScanPollStride nodes so a
-	// traversal of a huge tree cannot outlive the wall-clock budget. The parse
+	// traversal of a huge tree cannot outlive the caller's context. The parse
 	// that produced the tree is bounded; the walk over it was not.
 	budget  context.Context
 	visited int
@@ -478,7 +478,7 @@ func (w *jsScopeWalker) budgetGone() bool {
 }
 
 // walk descends the whole relation-phase parse tree, bounded by both the
-// caller's wall-clock budget and maxParseWalkDepth.
+// caller's context and maxParseWalkDepth.
 func (w *jsScopeWalker) walk(node *sitter.Node, ctx jsScopeContext, depth int) {
 	if w.budgetGone() {
 		return

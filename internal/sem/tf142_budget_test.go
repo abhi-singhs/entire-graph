@@ -1,6 +1,8 @@
 package sem
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,11 +13,11 @@ import (
 	"time"
 )
 
-// The three tests below all pin the same property from different angles: the
-// wall-clock ceiling has to be observable at the granularity where the work
-// actually happens, not only at phase boundaries. A guard that runs between
-// phases cannot stop work already inside one, so the advertised ceiling is
-// overshot by whatever the current phase still has left to do.
+// The three tests below all pin the same property from different angles: a
+// cancellation (or the caller's own deadline) has to be observable at the
+// granularity where the work actually happens, not only at phase boundaries. A
+// guard that runs between phases cannot stop work already inside one, so a
+// cancelled run keeps going for whatever the current phase still has left.
 
 // tf142FlatSymbolFile is a file whose parse is linear and cheap but which
 // contributes many symbols, so it stresses the relation producer's iteration
@@ -29,35 +31,37 @@ func tf142FlatSymbolFile(n int) string {
 	return sb.String()
 }
 
-// TestTF142BudgetInterruptsInFlightFileParse reproduces the finding at
-// provider.go:1126. Handing workCtx to the worker pipeline stops the pipeline
-// from handing out NEW files, but a worker already inside one file runs to
-// completion, and the pipeline's cleanup waits for every worker. The dominant
-// per-file term is not tree-sitter (13-76ms on this input) but the entity walk,
-// which is superlinear in nesting depth and, before this change, observed no
-// context at all: 1.6s at 2k nested functions, 8.9s at 4k, 36s at 8k, 3m35s at
-// 20k. So the overshoot was not "roughly the 5s parser timeout" -- it was
-// unbounded, because the 5s cap only covers the tree-sitter call.
-func TestTF142BudgetInterruptsInFlightFileParse(t *testing.T) {
+// TestTF142DeadlineInterruptsInFlightFileParse: handing the context to the
+// worker pipeline stops the pipeline from handing out NEW files, but a worker
+// already inside one file runs to completion, and the pipeline's cleanup waits
+// for every worker. The dominant per-file term is not tree-sitter (13-76ms on
+// this input) but the entity walk, which is superlinear in nesting depth and
+// used to observe no context at all: 1.6s at 2k nested functions, 8.9s at 4k,
+// 36s at 8k, 3m35s at 20k. So the residual after a caller's deadline was not
+// "roughly the 5s parser timeout" -- it was unbounded, because the 5s cap only
+// covers the tree-sitter call.
+func TestTF142DeadlineInterruptsInFlightFileParse(t *testing.T) {
 	repo := t.TempDir()
 	initRepo(t, repo)
 	writeFile(t, repo, "deep.js", nestedRelationBomb(4000))
 	git(t, repo, "add", ".")
 	git(t, repo, "commit", "-m", "nested")
 
-	const budget = 500 * time.Millisecond
+	const deadline = 500 * time.Millisecond
+	ctx, cancel := context.WithTimeout(t.Context(), deadline)
+	defer cancel()
 	start := time.Now()
-	_, err := BuildProviderSnapshotWithOptions(t.Context(), repo, "test", ProviderSnapshotOptions{MaxDuration: budget})
+	_, err := BuildProviderSnapshotWithOptions(ctx, repo, "test", ProviderSnapshotOptions{})
 	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("an explicit budget must truncate, not fail: %v", err)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a run past its caller's deadline must return context.DeadlineExceeded, got %v", err)
 	}
 	// The residual is one in-flight file's remaining work. Everything else --
 	// dispatch, reduction, the relation phase -- is already guarded.
 	const ceiling = 4 * time.Second
-	t.Logf("budget=%s elapsed=%s overshoot=%s", budget, elapsed.Round(time.Millisecond), (elapsed - budget).Round(time.Millisecond))
+	t.Logf("deadline=%s elapsed=%s residual=%s", deadline, elapsed.Round(time.Millisecond), (elapsed - deadline).Round(time.Millisecond))
 	if elapsed > ceiling {
-		t.Fatalf("budget %s was overshot to %s: the in-flight per-file parse/walk does not observe the deadline", budget, elapsed)
+		t.Fatalf("deadline %s was overrun to %s: the in-flight per-file parse/walk does not observe the context", deadline, elapsed)
 	}
 }
 
@@ -126,14 +130,12 @@ func TestTF142DeadlineStopsStructuralRelationProducer(t *testing.T) {
 	}
 }
 
-// TestTF142BudgetSkipsCoChangeSubprocess reproduces the finding at
-// provider.go:1266. fileChangesWithRelations was handed the PARENT ctx and its
-// result was checked only after it returned, so a full `git log` over the last
-// 256 commits ran even when the budget had already expired -- the whole
-// subprocess duration was charged to the overshoot. The parent ctx is the load
-// bearing part: workCtx was already expired, so passing workCtx would have made
-// exec refuse to start git at all.
-func TestTF142BudgetSkipsCoChangeSubprocess(t *testing.T) {
+// TestTF142CancellationSkipsCoChangeSubprocess: fileChangesWithRelations runs
+// a `git log` over the last 256 commits and returns a fully materialised slice,
+// and its result used to be checked only after it returned, so a run cancelled
+// during the relation phase still paid for the whole subprocess before it
+// noticed.
+func TestTF142CancellationSkipsCoChangeSubprocess(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		// The probe needs a PATH-shadowing `git` shim, which is written as a
 		// POSIX shell script; there is no portable equivalent on Windows.
@@ -157,8 +159,7 @@ func TestTF142BudgetSkipsCoChangeSubprocess(t *testing.T) {
 		t.Fatalf("locate git: %v", err)
 	}
 	// Slow ONLY the co-change `git log`. The inventory's `ls-tree --name-only`
-	// must stay fast: source preparation runs outside the budget clock, so
-	// slowing it would move the deadline instead of testing it.
+	// must stay fast, or the fixture would measure source preparation instead.
 	shim := fmt.Sprintf(`#!/bin/sh
 if [ "$1" = "log" ]; then
   sleep %d
@@ -170,33 +171,29 @@ exec %q "$@"
 	}
 	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	const budget = 500 * time.Millisecond
-	var sleptUntil time.Time
-	err = StreamSnapshot(t.Context(), repo, "test", ProviderSnapshotOptions{
-		Profile:     ProfileFull,
-		MaxDuration: budget,
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var canceledAt time.Time
+	err = StreamSnapshot(ctx, repo, "test", ProviderSnapshotOptions{
+		Profile: ProfileFull,
 	}, func(record any) error {
-		// Burn past the deadline at the first relation record, so the budget is
-		// provably expired by the time the co-change stage is reached. The sleep
-		// is a full budget wide rather than "until start+budget" because the
-		// clock starts after source preparation, not when StreamSnapshot is
-		// entered -- so sleeping one whole budget from any point inside the
-		// parse/relation phases is what guarantees expiry.
-		if _, ok := record.(RelationRecord); ok && sleptUntil.IsZero() {
-			time.Sleep(budget + 100*time.Millisecond)
-			sleptUntil = time.Now()
+		// Cancel at the first relation record, so the run is provably cancelled
+		// by the time the co-change stage is reached.
+		if _, ok := record.(RelationRecord); ok && canceledAt.IsZero() {
+			cancel()
+			canceledAt = time.Now()
 		}
 		return nil
 	})
-	if err != nil {
-		t.Fatalf("an explicit budget must truncate, not fail: %v", err)
-	}
-	if sleptUntil.IsZero() {
+	if canceledAt.IsZero() {
 		t.Fatal("fixture produced no relation records; the probe never armed")
 	}
-	residual := time.Since(sleptUntil)
-	t.Logf("budget=%s git-log shim cost=%s residual after deadline=%s", budget, gitLogCost, residual.Round(time.Millisecond))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled run must return context.Canceled, got %v", err)
+	}
+	residual := time.Since(canceledAt)
+	t.Logf("git-log shim cost=%s residual after cancel=%s", gitLogCost, residual.Round(time.Millisecond))
 	if residual >= gitLogCost {
-		t.Fatalf("the co-change `git log` ran for %s after the budget expired: fileChangesWithRelations is entered without checking the deadline and is handed the parent context", residual)
+		t.Fatalf("the co-change `git log` ran for %s after the run was cancelled: fileChangesWithRelations is entered without checking the context", residual)
 	}
 }

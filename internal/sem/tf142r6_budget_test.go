@@ -112,7 +112,7 @@ func TestTF142R6SourceMaskingObservesBudget(t *testing.T) {
 // TestTF142R6JSScanObservesBudget pins the finding at provider.go:2704. The
 // relation phase's per-file scope parse ran on a 5s timeout derived from
 // context.Background, so every remaining file could spend that much after the
-// wall-clock budget had already expired.
+// caller's context was already done.
 func TestTF142R6JSScanObservesBudget(t *testing.T) {
 	t.Parallel()
 	source := "namespace A { export function parse() {} }\nA.parse();\n"

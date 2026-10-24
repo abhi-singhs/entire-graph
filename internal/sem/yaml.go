@@ -38,7 +38,7 @@ func yamlEntities(path, content string, stop func() bool) []Entity {
 		entities = append(entities, yamlComposeServiceEntities(topLevel, lines, stop)...)
 	}
 	for i, block := range topLevel {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return nil
 		}
 		switch block.Key {
@@ -63,7 +63,7 @@ func yamlEntities(path, content string, stop func() bool) []Entity {
 func yamlKubernetesResourceEntities(lines []string, stop func() bool) []Entity {
 	var entities []Entity
 	for i, doc := range yamlDocumentRanges(lines, stop) {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return nil
 		}
 		topLevel := yamlTopLevelBlocksInRange(lines, doc.Start, doc.End, stop)
@@ -109,7 +109,7 @@ func yamlTopLevelBlocksInRange(lines []string, start, end int, stop func() bool)
 		end = len(lines)
 	}
 	for index := start; index < end; index++ {
-		if (index-start)%budgetPollStride == 0 && stopped(stop) {
+		if (index-start)%stopPollStride == 0 && stopped(stop) {
 			return blocks
 		}
 		line := lines[index]
@@ -138,7 +138,7 @@ func yamlDocumentRanges(lines []string, stop func() bool) []yamlDocumentRange {
 	start := 0
 	var split []yamlDocumentRange
 	for index, line := range lines {
-		if index%budgetPollStride == 0 && stopped(stop) {
+		if index%stopPollStride == 0 && stopped(stop) {
 			return ranges
 		}
 		if strings.TrimSpace(line) != "---" {
@@ -166,7 +166,7 @@ func yamlJobEntities(jobs yamlBlock, lines []string, stop func() bool) []Entity 
 
 	var blocks []yamlBlock
 	for index := jobs.StartLine; index < jobs.EndLine && index < len(lines); index++ {
-		if (index-jobs.StartLine)%budgetPollStride == 0 && stopped(stop) {
+		if (index-jobs.StartLine)%stopPollStride == 0 && stopped(stop) {
 			return nil
 		}
 		line := lines[index]
@@ -208,7 +208,7 @@ func yamlComposeServiceEntities(topLevel []yamlBlock, lines []string, stop func(
 	}
 	var blocks []yamlBlock
 	for index := services.StartLine; index < services.EndLine && index < len(lines); index++ {
-		if (index-services.StartLine)%budgetPollStride == 0 && stopped(stop) {
+		if (index-services.StartLine)%stopPollStride == 0 && stopped(stop) {
 			return nil
 		}
 		line := lines[index]

@@ -43,7 +43,7 @@ func TestTF142R16BuildManifestImportResolverStopsMidScan(t *testing.T) {
 	visited := 0
 	stop := func() bool { visited++; return visited > 1 }
 	stopped := buildManifestImportResolver(files, readContent, stop)
-	if visited > budgetPollStride*2 {
+	if visited > stopPollStride*2 {
 		t.Fatalf("buildManifestImportResolver polled shouldStop only %d times before stopping ('never' if this is 0): "+
 			"it must poll inside its own loops, not just rely on the caller's check before the call", visited)
 	}

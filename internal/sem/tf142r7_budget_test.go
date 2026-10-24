@@ -64,10 +64,9 @@ func itoaTF142R7(n int) string {
 // quadratic in symbols-per-file rather than the single linear pass the rest of
 // the disclosed set is: resolveTypeReference calls firstTypeLikeNamed, which
 // rescans the whole same-file slice for every identifier in every signature.
-// Measured with the real verb on one 16k-symbol TypeScript file, that charged
-// 5.2 s of work to a budget that had already expired (`snapshot --max-seconds 12`
-// finished in 17.23 s, having emitted exactly one USES_TYPE record: the slice was
-// built in full, then the per-record guard fired on the first record).
+// Measured on one 16k-symbol TypeScript file, a run stopped during that pass
+// kept working for 5.2 s and emitted exactly one USES_TYPE record: the slice was
+// built in full, then the per-record guard fired on the first record.
 //
 // The invariant: with the predicate already true, neither producer does any work.
 func TestTF142R7TypeProducersStopWhenTheBudgetIsGone(t *testing.T) {
@@ -86,9 +85,8 @@ func TestTF142R7TypeProducersStopWhenTheBudgetIsGone(t *testing.T) {
 }
 
 // TestTF142R7TypeProducersUnbudgetedAreUnchanged is the widening direction: the
-// predicate must not eat legitimate input. A nil predicate (the unbudgeted path,
-// which is what forEachRelation passes when no MaxDuration was set) and a
-// predicate that never fires must both produce the complete relation set.
+// predicate must not eat legitimate input. A nil predicate (no context to stop
+// it) and a predicate that never fires must both produce the complete relation set.
 func TestTF142R7TypeProducersUnbudgetedAreUnchanged(t *testing.T) {
 	t.Parallel()
 	const functions = 64
@@ -120,53 +118,5 @@ func TestTF142R7TypeProducersUnbudgetedAreUnchanged(t *testing.T) {
 	}
 	if len(neverSig) != len(nilSig) {
 		t.Fatalf("a live-but-unexpired predicate changed signatureTypeRelations output: %d vs %d", len(neverSig), len(nilSig))
-	}
-}
-
-// TestTF142R7SelectiveDerivationStopsBeforeThePreprocessing is the narrowing
-// direction of the search_cache.go:585 finding.
-//
-// Round five gave the warm-cache derivation a work context, but only the
-// RELATION phase observed it: the function still filtered the complete cached
-// file and symbol inventory (linear in the FULL snapshot, not in the selection)
-// and ran importsFor over every selected fast-profile file -- a content scan per
-// file -- before shouldStop existed. An already-expired budget therefore still
-// paid for the whole preprocessing pass.
-//
-// The invariant, with no stopwatch: a budget that expired before the call must
-// leave the derivation with nothing filtered in. Before the fix the same call
-// returns the complete selected symbol set.
-func TestTF142R7SelectiveDerivationStopsBeforeThePreprocessing(t *testing.T) {
-	repo := tf142r5SelectiveRepo(t)
-	cacheDir := t.TempDir()
-
-	if _, _, err := LoadOrBuildProviderSnapshot(t.Context(), repo, "test", ProviderSnapshotOptions{
-		Profile: ProfileFull,
-	}, cacheDir, false); err != nil {
-		t.Fatalf("warm the complete snapshot: %v", err)
-	}
-
-	selective := ProviderSnapshotOptions{
-		Profile:     ProfileFull,
-		OnlyFiles:   []string{"deep.js"},
-		MaxDuration: tf142r5ExpiredBudget,
-		// The duration alone is not enough to be expired on a platform whose
-		// clock cannot resolve it -- see tf142r5ExpiredClock, and the
-		// windows-latest failure of this exact test that found it.
-		nowFn: tf142r5ExpiredClock(),
-	}
-	snapshot, _, err := LoadOrBuildProviderSnapshot(t.Context(), repo, "test", selective, cacheDir, false)
-	if err != nil {
-		t.Fatalf("an explicit budget must truncate, not fail: %v", err)
-	}
-	if !partialFailuresTruncated(snapshot.Header.PartialFailures) {
-		t.Fatalf("the derivation did not report truncation: %#v", snapshot.Header.PartialFailures)
-	}
-	if len(snapshot.Symbols) != 0 || len(snapshot.Files) != 0 {
-		t.Fatalf("the derivation filtered the complete cached inventory on an expired budget: %d file(s), %d symbol(s) retained",
-			len(snapshot.Files), len(snapshot.Symbols))
-	}
-	if snapshot.Header.Stats.CompletenessLevel != "unsafe" {
-		t.Fatalf("a truncated derivation must be unsafe, got %q", snapshot.Header.Stats.CompletenessLevel)
 	}
 }

@@ -8,8 +8,8 @@ import (
 	"testing"
 )
 
-// truncatedSearchSnapshot is a cache envelope whose snapshot stopped at its
-// wall-clock ceiling.
+// truncatedSearchSnapshot is a cache envelope whose snapshot carries the
+// truncation marker.
 func truncatedSearchSnapshot() cachedSearchSnapshot {
 	var cache cachedSearchSnapshot
 	cache.Tree = strings.Repeat("c", 40)
@@ -33,11 +33,10 @@ func truncationTestEntry(t *testing.T) cacheEntry {
 // TestEverySearchSnapshotWriterRefusesATruncatedSnapshot enumerates the
 // snapshot writers so a new one cannot quietly reopen the hole.
 //
-// The search cache is keyed by tree and by the options that SHAPE the graph,
-// never by the budget, which only truncates it. A stored truncation is
-// therefore served to every later query on the same tree -- including queries
-// that passed no budget at all -- as though it were the complete index, and
-// its missing symbols read as confident negatives.
+// The search cache is keyed by tree and by the options that SHAPE the graph. A
+// stored truncation is therefore served to every later query on the same tree
+// as though it were the complete index, and its missing symbols read as
+// confident negatives.
 //
 // The refusal originally lived inside writeSearchSnapshot alone, with a
 // comment saying it sat in the writer so a new call site could not
@@ -72,7 +71,7 @@ func TestEverySearchSnapshotWriterRefusesATruncatedSnapshot(t *testing.T) {
 			entry := truncationTestEntry(t)
 			err := writer.write(entry)
 			if !errors.Is(err, ErrTruncatedSnapshotNotCacheable) {
-				t.Fatalf("%s stored a budget-truncated snapshot (err = %v)", writer.name, err)
+				t.Fatalf("%s stored a truncated snapshot (err = %v)", writer.name, err)
 			}
 			if _, err := readSearchSnapshot(entry); err == nil {
 				t.Fatalf("%s left a readable entry behind", writer.name)

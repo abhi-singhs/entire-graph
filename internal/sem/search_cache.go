@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/entireio/entire-graph/internal/gitutil"
 )
@@ -659,14 +658,7 @@ func preindexProviderSnapshotWithPersistenceVerifier(
 	}
 	cache := newCachedSearchSnapshot(providerVersion, commit, tree, options, snapshot, ctx)
 	if err := persistVerifiedSearchSnapshot(ctx, entry, cache, readPersistedDigest); err != nil {
-		// A snapshot that stopped at its wall-clock ceiling is a valid answer to
-		// THIS call and an invalid cache entry for every later one, so the
-		// refusal is not a command failure: the partial index is returned,
-		// uncached, and the next run without a budget builds the complete one.
-		if !errors.Is(err, ErrTruncatedSnapshotNotCacheable) {
-			return ProviderSnapshot{}, false, fmt.Errorf("persist preindex snapshot: %w", err)
-		}
-		return snapshot, false, nil
+		return ProviderSnapshot{}, false, fmt.Errorf("persist preindex snapshot: %w", err)
 	}
 	if options.ForceRebuild {
 		// Refreshing the complete entry is not what --force promises. A selective
@@ -889,67 +881,13 @@ func restoreCachedSearchInternals(cache *cachedSearchSnapshot) {
 	}
 }
 
-// budgetPollStride is how often the cheap per-record loops in the selective
-// derivation poll the wall-clock budget. The loops are linear in the size of the
-// COMPLETE cached snapshot, so they must be interruptible, but their bodies are
-// far cheaper than a context read; polling every stride keeps the unbudgeted
-// path's cost unchanged while bounding the residual to one stride.
-const budgetPollStride = 1024
-
-// filterFilesAndSymbolsForBudget filters fullFiles and fullSymbols down to
-// the files allowedFiles admits, in lockstep, stopping as soon as stop
-// reports true.
-//
-// full.Files and full.Symbols are filtered together, file by file, rather
-// than in two independent index-based passes: the streaming builder emits
-// one FileRecord followed immediately by every SymbolRecord for that file
-// (see the reducer in BuildProviderSnapshotWithOptions), so full.Symbols is
-// a run-length grouping in the same file order as full.Files. Filtering them
-// separately let expiry land between a file's FileRecord and the tail of
-// its SymbolRecords -- or mid-run within the Symbols pass alone -- leaving
-// selective.Files claim a file was retained while selective.Symbols held
-// none or only some of its symbols. The cold (non-cached) path never
-// produces that state: a file it cannot finish in budget is dropped whole.
-// This walks both slices in lockstep so a file crossing the boundary is
-// dropped whole here too, keeping a "retained" file's symbol set complete
-// by construction rather than by the budget's luck.
-//
-// complete reports whether the walk reached the end of fullFiles. It is NOT the
-// same question as "did the budget expire": the gate can trip later, in the
-// relation phase, long after this walk finished, and in that case the selection
-// is exactly the one an unbudgeted derivation would have produced. Only this
-// flag can say so, which is what lets the failure filter stay exact whenever the
-// truncation happened downstream of here (see selectiveFailureFiles).
-func filterFilesAndSymbolsForBudget(fullFiles []FileRecord, fullSymbols []SymbolRecord, allowedFiles map[string]bool, stop func() bool) (files []FileRecord, symbols []SymbolRecord, complete bool) {
-	symIndex := 0
-	for fileIndex, file := range fullFiles {
-		if fileIndex%budgetPollStride == 0 && stop() {
-			return files, symbols, false
-		}
-		runStart := symIndex
-		// Polled by SYMBOL, not just by file: the outer poll above only fires
-		// once per budgetPollStride FILES, so one pathological file holding
-		// far more than that many symbols (a huge generated or vendored
-		// source) let this inner run advance through all of them before the
-		// outer loop ever got another chance to check. A stop here breaks
-		// the OUTER loop too (not just this inner one), because the file
-		// this run belongs to has not reached its allowedFiles decision yet
-		// and must be dropped whole -- exactly like a stop at the outer poll
-		// above already drops the CURRENT file whole -- rather than retained
-		// with a truncated, budget-luck-sized symbol slice.
-		for symIndex < len(fullSymbols) && fullSymbols[symIndex].FilePath == file.Path {
-			if (symIndex-runStart)%budgetPollStride == 0 && stop() {
-				return files, symbols, false
-			}
-			symIndex++
-		}
-		if allowedFiles[filepath.ToSlash(filepath.Clean(file.Path))] {
-			files = append(files, file)
-			symbols = append(symbols, fullSymbols[runStart:symIndex]...)
-		}
-	}
-	return files, symbols, true
-}
+// stopPollStride is how often the cheap per-record loops in the selective
+// derivation (and the relation producers that reuse it) poll for
+// cancellation. The loops are linear in the size of the COMPLETE cached
+// snapshot, so they must be interruptible, but their bodies are far cheaper
+// than a context read; polling every stride keeps the uncancelled path's cost
+// unchanged while bounding what a cancelled run still does to one stride.
+const stopPollStride = 1024
 
 // selectiveSearchSnapshotFromFull derives the selective view of a complete
 // snapshot: the selected files, their symbols, and the complete graph's
@@ -978,76 +916,12 @@ func selectiveSearchSnapshotFromFull(
 	options ProviderSnapshotOptions,
 	full ProviderSnapshot,
 ) (ProviderSnapshot, error) {
-	// Source preparation runs on the caller's context and OUTSIDE the budget
-	// clock, exactly as the streaming build does (see StreamSnapshot), so both
-	// paths bound the same phases and MaxDuration keeps its single documented
-	// meaning: a parse-and-relation ceiling.
 	sc, err := prepareSource(ctx, repo, options)
 	if err != nil {
 		return ProviderSnapshot{}, err
 	}
 	if sc.close != nil {
 		defer sc.close()
-	}
-	// The ceiling has to be derived HERE, not only inside
-	// BuildProviderSnapshotWithOptions. On a cold cache the caller falls
-	// through to that build and is bounded; on a warm complete snapshot this
-	// derivation filters its cached files, symbols and relations instead. Observing only the
-	// caller's context therefore made the SAME call with the SAME options
-	// bounded or unbounded purely as a function of cache state -- measured on a
-	// 500-function nested fixture, a 1 ns budget still built 385,137 relations
-	// in 78 s once the complete snapshot was cached.
-	workCtx := ctx
-	var budgetDeadline time.Time
-	if options.MaxDuration > 0 {
-		var cancelBudget context.CancelFunc
-		budgetDeadline = options.now().Add(options.MaxDuration)
-		workCtx, cancelBudget = context.WithDeadline(ctx, budgetDeadline)
-		defer cancelBudget()
-	}
-	// The budget is observed against the CLOCK, not only against the context's
-	// timer. ctx.Err() flips one timer granularity after the deadline actually
-	// passed -- microseconds on Linux and macOS, up to a system tick (~15.6 ms)
-	// on Windows -- and the preprocessing below is short enough to finish
-	// inside that window, which is exactly how an already-expired budget still
-	// filtered the whole cached inventory on the Windows runner. See budgetGate.
-	gate := newBudgetGate(workCtx, budgetDeadline, options.now)
-	budgetHit := false
-	// classifyStop splits a stop reason the way the streaming build does:
-	// expiry of an OPT-IN MaxDuration is a truncation to report, anything else
-	// (a cancellation, or a deadline that came from the CALLER's own context)
-	// is returned. A caller that never asked for truncation must not receive a
-	// silently incomplete snapshot with a nil error.
-	classifyStop := func(err error) error {
-		if err == nil {
-			return nil
-		}
-		if isOptInBudgetExceeded(ctx, gate, budgetDeadline, options.MaxDuration, err) {
-			budgetHit = true
-			return nil
-		}
-		return err
-	}
-	// One stop predicate for the whole derivation, defined HERE rather than at
-	// the relation phase: everything below this point -- filtering the complete
-	// cached inventory (linear in the FULL snapshot, not the selection) and the
-	// retained record indexes -- is
-	// budgeted work that used to run unchecked, so a selective request could
-	// overshoot MaxDuration before the relation phase ever created a predicate.
-	shouldStop := func() bool { return budgetHit || gate.expired() }
-	// stopNow marks the derivation truncated the same way an expired relation
-	// phase does, so the E_ANALYSIS_BUDGET_EXCEEDED marker (and with it the
-	// "unsafe" completeness level and the cache writer's refusal) is reached by
-	// this path too. A caller cancellation or a caller-owned deadline still has
-	// to surface as an error, which classifyStop decides at the sink below.
-	stopNow := func() bool {
-		if !shouldStop() {
-			return false
-		}
-		if isOptInBudgetExceeded(ctx, gate, budgetDeadline, options.MaxDuration, gate.err()) {
-			budgetHit = true
-		}
-		return true
 	}
 	// Tree (not commit) determines whether the cached full snapshot is a valid
 	// derivation source: two different commits sharing a tree parse identically.
@@ -1058,78 +932,68 @@ func selectiveSearchSnapshotFromFull(
 		)
 	}
 
+	// One stop predicate for the whole derivation, not only the relation
+	// filter: everything below -- filtering the complete cached inventory
+	// (linear in the FULL snapshot, not the selection), grouping and indexing
+	// the retained records -- is work a cancelled caller must not keep paying
+	// for. Each stop returns the context's error; a cancelled derivation never
+	// returns a partial view.
+	shouldStop := func() bool { return ctx.Err() != nil }
+
 	spec := resolveProfile(options.Profile)
 	selective := ProviderSnapshot{Header: leanHeader(sc, providerVersion, spec)}
 	allowedFiles := make(map[string]bool, len(sc.paths))
 	for _, filePath := range sc.paths {
 		allowedFiles[filepath.ToSlash(filepath.Clean(filePath))] = true
 	}
-	selectiveFiles, selectiveSymbols, selectionComplete := filterFilesAndSymbolsForBudget(full.Files, full.Symbols, allowedFiles, stopNow)
-	selective.Files, selective.Symbols = selectiveFiles, selectiveSymbols
-
-	if stopNow() {
-		if err := classifyStop(gate.err()); err != nil {
-			return ProviderSnapshot{}, err
+	for i, file := range full.Files {
+		if i%stopPollStride == 0 && shouldStop() {
+			return ProviderSnapshot{}, ctx.Err()
 		}
-		finalizeSelectiveOrdering(&selective, nil, nil, budgetHit)
-		failures := filterSearchPartialFailures(full.Header.PartialFailures, selectiveFailureFiles(allowedFiles, selective.Files, selectionComplete))
-		if budgetHit {
-			failures = append(failures, analysisBudgetFailure(options.MaxDuration))
+		if allowedFiles[filepath.ToSlash(filepath.Clean(file.Path))] {
+			selective.Files = append(selective.Files, file)
 		}
-		populateSelectiveHeader(&selective, sc.warnings, failures, nil)
-		return selective, nil
+	}
+	for i, symbol := range full.Symbols {
+		if i%stopPollStride == 0 && shouldStop() {
+			return ProviderSnapshot{}, ctx.Err()
+		}
+		if allowedFiles[filepath.ToSlash(filepath.Clean(symbol.FilePath))] {
+			selective.Symbols = append(selective.Symbols, symbol)
+		}
 	}
 
-	// recordsByFile only feeds relation resolution below (never the reported
-	// selective.Symbols, which is already complete by this point), so
-	// stopping it early merely narrows how many of the RETAINED files get a
-	// relation pass -- the same truncation the relation phase itself is
-	// already allowed to apply per file. Without polling here, a large
-	// cached symbol inventory made this grouping and per-file transform pass
-	// linear in the number of budgeted symbols exactly like the relation
-	// phase, but with no stop check of its own.
 	recordsByFile := make(map[string][]SymbolRecord)
 	structuralByFile := make(map[string][]structuralSymbol)
 	for i, symbol := range selective.Symbols {
-		if i%budgetPollStride == 0 && stopNow() {
-			break
+		if i%stopPollStride == 0 && shouldStop() {
+			return ProviderSnapshot{}, ctx.Err()
 		}
 		recordsByFile[symbol.FilePath] = append(recordsByFile[symbol.FilePath], symbol)
 	}
 	if spec.name == ProfileSyntaxOnly {
-		i := 0
-		for _, filePath := range sortedKeysOf(recordsByFile) {
-			symbols := recordsByFile[filePath]
-			if i%budgetPollStride == 0 && stopNow() {
-				break
+		for filePath, symbols := range recordsByFile {
+			if shouldStop() {
+				return ProviderSnapshot{}, ctx.Err()
 			}
 			structuralByFile[filePath] = compactStructuralSymbols(symbols)
-			i++
 		}
 	} else {
-		i := 0
-		for _, filePath := range sortedKeysOf(recordsByFile) {
-			symbols := recordsByFile[filePath]
-			if i%budgetPollStride == 0 && stopNow() {
-				break
+		for filePath, symbols := range recordsByFile {
+			if shouldStop() {
+				return ProviderSnapshot{}, ctx.Err()
 			}
 			recordsByFile[filePath] = retainedSymbolsForProfile(symbols, spec)
-			i++
 		}
 	}
 
 	seenRelations := make(map[uint64]struct{})
 	externalsByID := make(map[string]ExternalRecord)
-	// externalOrder is the first-seen order of every external ID, tracked
-	// alongside externalsByID (not derived from it) so a budget-truncated
-	// derivation can emit externals in a deterministic order without paying
-	// for a sort: see finalizeSelectiveOrdering.
-	var externalOrder []string
 	relationsByType := make(map[string]int)
 	var symbolsByID map[string]SymbolRecord
 	var filesByID map[string]FileRecord
 	if spec.includeEvidence {
-		symbolsByID, filesByID = recordIndexes(selective.Files, recordsByFile, stopNow)
+		symbolsByID, filesByID = recordIndexes(selective.Files, recordsByFile, shouldStop)
 	}
 	emitRelation := func(relation RelationRecord) {
 		if !spec.emits(relation.Type) {
@@ -1151,9 +1015,6 @@ func selectiveSearchSnapshotFromFull(
 		seenRelations[key] = struct{}{}
 		for _, id := range []string{relation.FromID, relation.ToID} {
 			if strings.HasPrefix(id, "external:") {
-				if _, exists := externalsByID[id]; !exists {
-					externalOrder = append(externalOrder, id)
-				}
 				mergeExternalRecord(externalsByID, externalRecordFor(relation, id, symbolsByID, filesByID))
 			}
 		}
@@ -1169,14 +1030,14 @@ func selectiveSearchSnapshotFromFull(
 		// keeping the pairs whose files are both selected is exactly what a fresh
 		// selective build emits.
 		selectedIDs := make(map[string]bool, len(selective.Files)+len(selective.Symbols))
-		for _, file := range selective.Files {
-			if shouldStop() {
+		for i, file := range selective.Files {
+			if i%stopPollStride == 0 && shouldStop() {
 				break
 			}
 			selectedIDs[file.ID] = true
 		}
-		for _, symbol := range selective.Symbols {
-			if shouldStop() {
+		for i, symbol := range selective.Symbols {
+			if i%stopPollStride == 0 && shouldStop() {
 				break
 			}
 			selectedIDs[symbol.ID] = true
@@ -1200,76 +1061,37 @@ func selectiveSearchSnapshotFromFull(
 			emitRelation(relation)
 		}
 	}
-	// shouldStop deliberately returns no reason, so classify the stop once here:
-	// budget expiry marks the derived snapshot truncated, a caller cancellation
-	// or a caller deadline is returned.
-	//
-	// Classify off the GATE, not off workCtx directly. shouldStop is
-	// level-triggered against the clock, so between the deadline passing and
-	// the context timer firing it stops the derivation while workCtx.Err() is
-	// still nil. Reading the raw context here would leave budgetHit false, and
-	// a snapshot that is missing everything after the deadline would carry no
-	// E_ANALYSIS_BUDGET_EXCEEDED marker -- which is exactly what makes it
-	// cacheable, and every later unbudgeted query would be served the gap as
-	// the complete index.
-	if err := classifyStop(gate.err()); err != nil {
+	// The structural path and the loops above stop without a reason; the
+	// context supplies it.
+	if err := ctx.Err(); err != nil {
 		return ProviderSnapshot{}, err
 	}
 
-	finalizeSelectiveOrdering(&selective, externalsByID, externalOrder, budgetHit)
+	externalIDs := make([]string, 0, len(externalsByID))
+	for id := range externalsByID {
+		externalIDs = append(externalIDs, id)
+	}
+	sort.Strings(externalIDs)
+	for _, id := range externalIDs {
+		selective.Externals = append(selective.Externals, externalsByID[id])
+	}
+	sort.Slice(selective.Relations, func(i, j int) bool {
+		left := selective.Relations[i].Type + selective.Relations[i].FromID + selective.Relations[i].ToID
+		right := selective.Relations[j].Type + selective.Relations[j].FromID + selective.Relations[j].ToID
+		return left < right
+	})
 
 	warnings := append([]ProviderWarning{}, sc.warnings...)
+	// The complete graph's own W_DATA_FLOW_EVIDENCE_UNMERGED counts the whole
+	// tree; this view recounts the unmerged edges it kept, placed where a build
+	// of the view would place it, after the source warnings.
 	if len(selective.unmergedDataFlowEdges) > 0 {
 		warnings = append(warnings, unmergedDataFlowEvidenceWarning(len(selective.unmergedDataFlowEdges)))
 	}
-	failures := filterSearchPartialFailures(full.Header.PartialFailures, selectiveFailureFiles(allowedFiles, selective.Files, selectionComplete))
-	if budgetHit {
-		// The marker both tells the caller the view is partial and makes the
-		// view uncacheable: writeSearchSnapshot refuses any snapshot carrying
-		// it, so a truncated derivation can never be served to a later
-		// unbudgeted query as the complete index.
-		failures = append(failures, analysisBudgetFailure(options.MaxDuration))
-	}
-	populateSelectiveHeader(&selective, warnings, failures, relationsByType)
-	return selective, nil
-}
-
-// populateSelectiveHeader fills Languages, LanguageTiers, Warnings, PartialFailures,
-// Stats, and Completeness on a selective snapshot. Both the budget-truncated
-// early-return path and the complete derivation path call this so metadata stays
-// consistent regardless of where the gate tripped.
-//
-// It deliberately does NOT poll the budget, and takes no stop predicate.
-//
-// Both callers reach it with a gate that has already tripped whenever the
-// derivation was truncated, and a level-triggered predicate answers true from
-// the very first poll -- so the loops below broke at index 0 and the header
-// described a snapshot that is not the one being returned: Stats.Files counts
-// the retained files unconditionally, while Languages came back empty,
-// LanguageTiers nil and ParsedFiles zero beside it. A three-file selective
-// answer was reported as "0 languages / 0 files" by every consumer that reads
-// the coverage figures, and the per-language tiers a SCIP consumer decides
-// trust from vanished for a selection that was in fact retained whole.
-//
-// Polling here also could not stay confined to the truncated path. On the
-// complete path budgetHit is already false and the failure list already built,
-// so a gate that tripped between the last check and this call would break these
-// loops WITHOUT adding E_ANALYSIS_BUDGET_EXCEEDED -- leaving a snapshot with a
-// silently wrong header that the cache writer has no reason to refuse.
-//
-// Not polling costs nothing the budget was protecting: these loops walk the
-// already-materialised selection that filterFilesAndSymbolsForBudget produced
-// under the gate, so their length is bounded by work the budget already
-// admitted, and one more linear pass over it cannot outrun the ceiling that
-// bounded its construction. (The unparsed-file loop over `failures` below has
-// never been polled, for the same reason.)
-func populateSelectiveHeader(selective *ProviderSnapshot, warnings []ProviderWarning, failures []PartialFailure, relationsByType map[string]int) {
-	if warnings == nil {
-		warnings = []ProviderWarning{}
-	}
-	if relationsByType == nil {
-		relationsByType = map[string]int{}
-	}
+	// The complete build already folded its relation-phase failures into these
+	// records (mergePartialFailures), so filtering them by file is the selective
+	// view's whole failure set: the filter itself resolves nothing and cannot fail.
+	failures := filterSearchPartialFailures(full.Header.PartialFailures, allowedFiles)
 	languageSet := make(map[string]struct{})
 	completenessLanguages := make(map[string]LanguageCompleteness)
 	for _, file := range selective.Files {
@@ -1312,91 +1134,7 @@ func populateSelectiveHeader(selective *ProviderSnapshot, warnings []ProviderWar
 		Health:    calculateGraphHealth(selective.Files, failures, selective.Header.Stats),
 	}
 	selective.Header.Stats.CompletenessLevel = selective.Header.Completeness.Health.Status
-}
-
-// finalizeSelectiveOrdering populates selective.Externals from externalsByID
-// (ordered by orderedExternalIDs) and sorts selective.Relations for stable
-// output -- but only on the complete (budgetHit == false) path.
-//
-// Sorting selective.Relations is itself O(n log n) work over whatever the
-// relation phase accumulated before the gate tripped -- on a 500-function
-// nested fixture, that phase alone produced 385,137 relations, and the
-// comparator reallocates a concatenated key on every comparison on top of
-// that. The caller already turned budget expiry into a truncation rather
-// than an error by the time this runs, so a true budgetHit skips the
-// (expensive) relations sort entirely instead of letting the advertised
-// parse/relation ceiling get blown by its own finalization step.
-// selective.Relations is already in a deterministic order without it -- it
-// is built by a plain append during the relation phase, never through a
-// map, so a truncated snapshot's relations come out in the same order for
-// the same tree and budget every time; skipping the sort trades
-// "alphabetical" for "scan order", not determinism for nondeterminism.
-// Preprocessing walks recordsByFile in sorted file-path order (not map
-// iteration) so that scan order is stable even when the budget stops early.
-func finalizeSelectiveOrdering(selective *ProviderSnapshot, externalsByID map[string]ExternalRecord, externalOrder []string, budgetHit bool) {
-	for _, id := range orderedExternalIDs(externalsByID, externalOrder, budgetHit) {
-		selective.Externals = append(selective.Externals, externalsByID[id])
-	}
-	if !budgetHit {
-		sort.Slice(selective.Relations, func(i, j int) bool {
-			left := selective.Relations[i].Type + selective.Relations[i].FromID + selective.Relations[i].ToID
-			right := selective.Relations[j].Type + selective.Relations[j].FromID + selective.Relations[j].ToID
-			return left < right
-		})
-	}
-}
-
-// The relation-phase failures recorded during selective derivation are merged
-// via mergePartialFailures (provider.go), which folds a record the (filtered)
-// full-build failures already carry for the same file and code into that record
-// instead of adding or dropping one — so the selective path reports the same
-// single record, carrying both phases' effects, that a full build does.
-// selectiveRelationWorkers mirrors the clamp streamSnapshotWithWorkerCount
-// applies to the streaming build: an opt-in wall-clock budget must resolve
-// relations serially, because the retained prefix of a truncated derivation has
-// to be a function of file order alone and parallel workers finish different
-// prefixes depending on scheduling. Without a budget the derivation always runs
-// to completion, so parallelism cannot change what it contains.
-func selectiveRelationWorkers(options ProviderSnapshotOptions) int {
-	if options.MaxDuration > 0 {
-		return 1
-	}
-	return defaultProviderWorkerCount()
-}
-
-// selectiveFailureFiles decides which of the full build's per-file partial
-// failures a selective derivation reports.
-//
-// On a complete derivation the answer is the SELECTION, not the retained file
-// records. Two of the codes a full build emits carry no FileRecord at all --
-// E_UNSUPPORTED_LANGUAGE ("no parser is available") and E_FILE_READ ("file
-// listed but content was unavailable") are both appended with result.file left
-// nil -- so filtering by the retained records dropped exactly the failures that
-// describe a file the snapshot does not otherwise mention. The same query
-// answered from a warm cache then came back clean where a cold build reported a
-// machine-readable omission, and cache presence is the one thing this path must
-// not change. Every other selected file that produced a record is retained
-// whole on this path, so widening to the selection cannot admit a failure for a
-// file the answer is silent about for any other reason.
-//
-// The condition is whether the FILE WALK completed, not whether the budget was
-// hit. Those come apart in the common case: the file/symbol filter is cheap and
-// the relation phase is what actually burns the ceiling, so a derivation that
-// truncates in the relation phase still holds the exact selection an unbudgeted
-// one would have produced, and its record-less failures are exact too.
-//
-// Only a walk that stopped MID-SELECTION falls back to the retained records.
-// There the selection no longer says what the answer covers, and no cheaper
-// signal can recover the record-less files: they are absent from full.Files
-// altogether, so they occupy no position in the walk and no prefix of it can
-// contain them. Distinguishing "record-less" from "beyond the stop point" would
-// mean completing the pass over full.Files that the budget just refused. The
-// single E_ANALYSIS_BUDGET_EXCEEDED marker accounts for them instead.
-func selectiveFailureFiles(allowedFiles map[string]bool, retained []FileRecord, selectionComplete bool) map[string]bool {
-	if selectionComplete {
-		return allowedFiles
-	}
-	return retainedFileSet(retained)
+	return selective, nil
 }
 
 // selectiveRelationRetained is the filter selectiveSearchSnapshotFromFull applies
@@ -1424,14 +1162,6 @@ func filterSearchPartialFailures(failures []PartialFailure, allowedFiles map[str
 		}
 	}
 	return filtered
-}
-
-func retainedFileSet(files []FileRecord) map[string]bool {
-	retained := make(map[string]bool, len(files))
-	for _, file := range files {
-		retained[filepath.ToSlash(filepath.Clean(file.Path))] = true
-	}
-	return retained
 }
 
 // LoadOrBuildProviderSnapshot reuses the tree-keyed, option-keyed compressed
@@ -1774,14 +1504,13 @@ func readSearchSnapshot(entry cacheEntry) (cachedSearchSnapshot, error) {
 }
 
 // ErrTruncatedSnapshotNotCacheable is returned when a caller tries to persist a
-// snapshot that stopped at its wall-clock ceiling. The search cache is keyed by
-// tree and by the options that SHAPE the graph -- never by the budget, which
-// only truncates it -- so a stored truncation would be served to every later
-// query on this tree, including queries that passed no budget, as though it were
-// the complete index. Missing symbols would then read as confident negatives.
-// The check lives in the writer rather than at the call sites so that a new call
-// site cannot reintroduce the hole.
-var ErrTruncatedSnapshotNotCacheable = errors.New("refusing to cache a snapshot truncated by its wall-clock budget (E_ANALYSIS_BUDGET_EXCEEDED)")
+// snapshot marked as stopped before it completed (AnalysisBudgetExceededCode).
+// The search cache is keyed by tree and by the options that SHAPE the graph, so
+// a stored truncation would be served to every later query on this tree as
+// though it were the complete index, and its missing symbols would read as
+// confident negatives. The check lives in the writers rather than at the call
+// sites so that a new call site cannot reintroduce the hole.
+var ErrTruncatedSnapshotNotCacheable = errors.New("refusing to cache a truncated snapshot (E_ANALYSIS_BUDGET_EXCEEDED)")
 
 // readSearchSnapshotPreferringStore answers from the sqlite sidecar when the
 // operator opted in (ENTIRE_GRAPH_SEARCH_STORE) and the sidecar matches the
@@ -1806,7 +1535,7 @@ func writeSearchSnapshot(entry cacheEntry, cache cachedSearchSnapshot) error {
 	return entry.write("snapshot", cache)
 }
 
-// refuseTruncatedSnapshot is the single place the budget refusal lives, and
+// refuseTruncatedSnapshot is the single place the truncation refusal lives, and
 // EVERY snapshot writer calls it. It is a shared helper rather than one check
 // inside writeSearchSnapshot because that is exactly how the hole came back:
 // writeSearchSnapshotAndStore and persistVerifiedSearchSnapshot were both

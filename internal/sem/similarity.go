@@ -135,9 +135,9 @@ func similarityRelations(recordsByFile map[string][]SymbolRecord, readContent co
 			// the halt() above only fires once per band, so a band with many
 			// buckets built its entire candidate contribution — up to the
 			// 2,000,000-pair global cap — without a single budget poll in
-			// between. Polled every budgetPollStride buckets like the other
+			// between. Polled every stopPollStride buckets like the other
 			// bounded scans in this package.
-			if keyIdx%budgetPollStride == 0 && halt() {
+			if keyIdx%stopPollStride == 0 && halt() {
 				return nil
 			}
 			group := buckets[key]

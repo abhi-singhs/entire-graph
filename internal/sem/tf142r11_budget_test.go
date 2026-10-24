@@ -2,13 +2,11 @@ package sem
 
 import (
 	"fmt"
-	"sync/atomic"
 	"testing"
-	"time"
 )
 
 // Round eleven. Three open review findings from the same class as prior
-// rounds: work that runs past the point the wall-clock budget expired because
+// rounds: work that runs past the point the caller's context stopped because
 // the guard checked the wrong place, or checked two unrelated places
 // independently.
 
@@ -67,8 +65,7 @@ func TestTF142R11TestRelationsStopsWhenTheBudgetIsGone(t *testing.T) {
 }
 
 // TestTF142R11TestRelationsUnbudgetedAreUnchanged is the widening direction:
-// a nil predicate (the unbudgeted path forEachRelation uses when no
-// MaxDuration is set) must still resolve the TESTS edge.
+// a nil predicate (no context to stop it) must still resolve the TESTS edge.
 func TestTF142R11TestRelationsUnbudgetedAreUnchanged(t *testing.T) {
 	t.Parallel()
 	recordsByFile, symbolsByShortName := tf142r11TestRelationsFixture(1)
@@ -149,80 +146,5 @@ func TestTF142R11FallbackEntitiesUnbudgetedAreUnchanged(t *testing.T) {
 	}
 	if got := htmlEntities("index.html", "<div id=\"a\"></div>\n<div id=\"b\"></div>\n", nil); len(got) != 3 {
 		t.Fatalf("nil predicate changed htmlEntities output: got %d entities, want 3 (1 document + 2 ids)", len(got))
-	}
-}
-
-// tf142r11LaggingClockAfterSecondPoll returns the real time for the first two
-// polls and a time far past the deadline on every later one. The first poll
-// is options.now() deriving the budget deadline; the second is the very first
-// gate.expired() check the derivation makes. Pairing that with a live-looking
-// deadline reproduces the exact clock transition the search_cache.go:668
-// finding is about: the budget goes from live to gone strictly BETWEEN the
-// point that used to be the Files loop's own index-0 check and the point that
-// used to be the Symbols loop's own, independent index-0 check.
-func tf142r11LaggingClockAfterSecondPoll() func() time.Time {
-	var polls atomic.Int64
-	base := time.Now()
-	return func() time.Time {
-		if polls.Add(1) <= 2 {
-			return base
-		}
-		return base.Add(2 * time.Hour)
-	}
-}
-
-func tf142r11SelectiveRepo(t *testing.T) string {
-	t.Helper()
-	repo := t.TempDir()
-	initRepo(t, repo)
-	writeFile(t, repo, "a.js", "function alpha(x) {\n  return x + 1;\n}\n")
-	writeFile(t, repo, "b.js", "function beta(y) {\n  return y + 2;\n}\n")
-	git(t, repo, "add", ".")
-	git(t, repo, "commit", "-m", "initial")
-	return repo
-}
-
-// TestTF142R11SelectiveDerivationKeepsFilesAndSymbolsAtomic reproduces the
-// search_cache.go:668 finding: filtering full.Files and full.Symbols in two
-// independent index-based loops let a budget that went live-to-gone strictly
-// BETWEEN them retain a file's FileRecord while dropping every one of its
-// SymbolRecords, because each loop polled the budget independently at its own
-// index 0. The cold (non-cached) path never produces that state: a file it
-// cannot finish in budget is dropped whole. The fix walks both slices in
-// lockstep so a file crosses the truncation boundary whole here too.
-func TestTF142R11SelectiveDerivationKeepsFilesAndSymbolsAtomic(t *testing.T) {
-	repo := tf142r11SelectiveRepo(t)
-	cacheDir := t.TempDir()
-
-	if _, _, err := LoadOrBuildProviderSnapshot(t.Context(), repo, "test", ProviderSnapshotOptions{
-		Profile: ProfileFull,
-	}, cacheDir, false); err != nil {
-		t.Fatalf("warm the complete snapshot: %v", err)
-	}
-
-	selective := ProviderSnapshotOptions{
-		Profile:     ProfileFull,
-		OnlyFiles:   []string{"a.js", "b.js"},
-		MaxDuration: time.Hour,
-		nowFn:       tf142r11LaggingClockAfterSecondPoll(),
-	}
-	snapshot, _, err := LoadOrBuildProviderSnapshot(t.Context(), repo, "test", selective, cacheDir, false)
-	if err != nil {
-		t.Fatalf("a budget going live-to-gone mid-derivation must truncate, not fail: %v", err)
-	}
-	if len(snapshot.Files) > 0 && len(snapshot.Symbols) == 0 {
-		t.Fatalf("retained %d file(s) with zero symbols: a file survived the Files filter while its symbols were dropped by a separately-polled Symbols filter", len(snapshot.Files))
-	}
-	for _, file := range snapshot.Files {
-		found := false
-		for _, symbol := range snapshot.Symbols {
-			if symbol.FilePath == file.Path {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Fatalf("file %q was retained but none of its symbols were: files and symbols were filtered inconsistently across the truncation boundary", file.Path)
-		}
 	}
 }

@@ -317,57 +317,27 @@ type PartialFailure struct {
 	Detail               string `json:"detail,omitempty"`
 }
 
-// AnalysisBudgetExceededCode marks a snapshot that stopped at the OPT-IN
-// wall-clock ceiling ProviderSnapshotOptions.MaxDuration instead of running to
-// completion. It is a truncation, not a parse failure: the records emitted
-// before the deadline are valid, everything after it is missing, and callers
-// must treat the graph as incomplete — in particular they must not persist it
-// as a complete snapshot.
+// AnalysisBudgetExceededCode marks a snapshot that did not run to completion:
+// the records it carries are valid, everything after the point it stopped is
+// missing, and callers must treat the graph as incomplete. In particular such a
+// snapshot must never be persisted as the complete answer for its tree.
 //
-// A deadline that came from the CALLER's own context never carries this code:
-// classifyStop (streamSnapshotWithWorkerCount, deriveSelectiveSnapshot) sets
-// the truncation flag only when MaxDuration > 0 and returns anything else as an
-// error, because a caller that never asked for truncation must not be handed a
-// silently incomplete snapshot with a nil error.
+// No build in this package produces one: a run that is cancelled, or whose
+// caller's deadline passes, returns the context's error and never emits a
+// summary. Every snapshot writer still refuses a snapshot carrying this code
+// (SnapshotTruncated, refuseTruncatedSnapshot), so a truncating path added
+// later -- or a snapshot assembled outside this package -- cannot be stored
+// under a tree key and served to every later caller as the complete index.
 const AnalysisBudgetExceededCode = "E_ANALYSIS_BUDGET_EXCEEDED"
 
-// analysisBudgetFailure reports a snapshot truncated by its wall-clock ceiling.
-// It carries no FilePath because the ceiling is a whole-run property: the
-// deadline can land in the middle of the relation phase, where the missing work
-// is spread across every file, so naming one file would misattribute the gap.
-//
-// The detail reports the CONFIGURED budget and nothing measured. It used to
-// carry time.Since(started) rounded to milliseconds, which made the record a
-// function of how fast the machine ran: three `snapshot --max-seconds 1` runs
-// over this repository agreed on the first 8,053,472 bytes and then published
-// "stopped after 1.248s" / "1.229s" / "1.211s" — three digests for one
-// truncation. A record that moves run to run cannot be diffed, content-addressed
-// or reproduced by a reviewer, and byte-identical output is this change's own
-// verification method. Elapsed time belongs where the schema already keeps it:
-// the *_latency_ms fields on the response envelope, which consumers know to
-// normalise. The sibling budget report, budgetSkippedFileWarning (analyze.go),
-// already reports counts and the configured budget for the same reason.
-func analysisBudgetFailure(budget time.Duration) PartialFailure {
-	detail := "the wall-clock budget expired"
-	if budget > 0 {
-		detail = fmt.Sprintf("the %s wall-clock budget expired", budget)
-	}
-	return PartialFailure{
-		Code:                 AnalysisBudgetExceededCode,
-		Severity:             "warning",
-		EffectOnCompleteness: "snapshot truncated at the wall-clock budget; files and relations after the deadline are missing",
-		Detail:               detail,
-	}
-}
-
-// SnapshotTruncated reports whether a snapshot stopped at its wall-clock
-// ceiling instead of completing. Such a result is valid to print, but it must
-// never be persisted as the answer for a tree: every cache key here is derived
-// from the tree and the options that SHAPE the graph, and a budget only
-// TRUNCATES it, so a stored truncation would be handed to every later caller --
-// including callers that passed no budget at all -- as the complete index.
-// Both cache writers (StoreProviderRecords and writeSearchSnapshot) enforce
-// this, so a new call site cannot reintroduce the hole by forgetting to check.
+// SnapshotTruncated reports whether a snapshot is marked as stopped before it
+// completed (see AnalysisBudgetExceededCode). Such a result must never be
+// persisted as the answer for a tree: every cache key here is derived from the
+// tree and the options that SHAPE the graph, so a stored truncation would be
+// handed to every later caller as the complete index. Every cache writer
+// (ProviderRecordsCacheTransaction.Store and the search snapshot writers)
+// enforces this, so a new call site cannot reintroduce the hole by forgetting
+// to check.
 func SnapshotTruncated(summary *SnapshotSummary) bool {
 	if summary == nil {
 		return false
@@ -540,18 +510,6 @@ func unmergedDataFlowEdgeKey(fromID, toID string) string {
 }
 
 type ProviderSnapshotOptions struct {
-	// nowFn is an in-package seam for the wall-clock the budget is measured
-	// against. It is unexported, so no embedder can set it and it is not part
-	// of any cache key; nil means time.Now, which is what every real caller
-	// gets. It exists because a budget cannot be tested by racing the platform
-	// clock: time.Now's resolution is nanoseconds on Linux and macOS but as
-	// coarse as a system tick on Windows, so a sub-tick budget reads as
-	// "not expired yet" there no matter how the check is written. Tests that
-	// need a budget that is expired BY CONSTRUCTION supply a clock instead of
-	// a tiny duration. Same idea as jsScanParseTimeout, threaded through the
-	// options rather than a package global so it is safe under t.Parallel.
-	nowFn func() time.Time
-
 	NoNetwork    bool
 	Worktree     bool
 	IgnoreFiles  []string
@@ -574,28 +532,6 @@ type ProviderSnapshotOptions struct {
 	// inventory, imports, shallow local calls, boundaries, IaC, no evidence), or
 	// syntax-only (file/symbol inventory and structure only). Empty means full.
 	Profile Profile
-	// MaxDuration is the wall-clock ceiling for the PARSE AND RELATION phases
-	// of one snapshot. Zero (the default) means no ceiling, which is the
-	// historical behavior. When it is set those phases stop at the deadline and
-	// the stream is still finished normally: the records produced so far, an
-	// E_ANALYSIS_BUDGET_EXCEEDED partial failure, and a summary.
-	//
-	// It is NOT a whole-process ceiling. Source preparation (the git listing
-	// and plumbing in prepareSource) runs before the clock starts and is not
-	// interruptible by it, so a run can exceed MaxDuration by however long
-	// listing takes.
-	//
-	// Truncation is strictly opt-in. A deadline that comes from the CALLER's
-	// context instead of this field is NOT swallowed: it is returned as
-	// context.DeadlineExceeded, exactly as before, because a caller that did
-	// not ask for a partial graph must never be handed one with a nil error.
-	// context.Canceled (Ctrl-C, an aborted parent) likewise still returns an
-	// error.
-	//
-	// MaxDuration is deliberately not part of any cache key -- a budget does
-	// not shape the graph, it truncates it -- so a truncated snapshot is never
-	// persisted; both cache writers reject one (see SnapshotTruncated).
-	MaxDuration time.Duration
 	// ProjectVersion, when non-nil, receives the project's own declared version
 	// as read from the root manifest.
 	//
@@ -1163,13 +1099,11 @@ func BuildProviderSnapshotWithOptions(ctx context.Context, repo, providerVersion
 	snapshot.Header.PartialFailures = summary.PartialFailures
 	snapshot.Header.Stats = summary.Stats
 	snapshot.Header.Completeness = summary.Completeness
-	if !SnapshotTruncated(&summary) {
-		sort.Slice(snapshot.Relations, func(i, j int) bool {
-			left := snapshot.Relations[i].Type + snapshot.Relations[i].FromID + snapshot.Relations[i].ToID
-			right := snapshot.Relations[j].Type + snapshot.Relations[j].FromID + snapshot.Relations[j].ToID
-			return left < right
-		})
-	}
+	sort.Slice(snapshot.Relations, func(i, j int) bool {
+		left := snapshot.Relations[i].Type + snapshot.Relations[i].FromID + snapshot.Relations[i].ToID
+		right := snapshot.Relations[j].Type + snapshot.Relations[j].FromID + snapshot.Relations[j].ToID
+		return left < right
+	})
 	return snapshot, nil
 }
 
@@ -1183,11 +1117,11 @@ var registrationFunctionPattern = regexp.MustCompile(`"function"\s*:\s*"([A-Za-z
 // handler body, so it is indexed as a searchable alias of the handler symbol.
 // Only paths matching commands/*.json are touched; no generic scan is performed.
 // collectRegistrationAliases scans a large inventory once, so its own loop
-// needs the stop predicate too: the gated reader passed to it only refuses
-// reads once the budget is gone, and a refused read merely `continue`s, so
-// without this check the loop still walked every remaining path (and the
-// final sort/dedupe pass still ran over whatever had accumulated) rather than
-// stopping where the budget actually expired.
+// needs the stop predicate too: the cancellable reader passed to it only
+// refuses reads once the context is done, and a refused read merely
+// `continue`s, so without this check the loop still walked every remaining path
+// (and the final sort/dedupe pass still ran over whatever had accumulated)
+// after the run was cancelled. A nil stop never fires.
 func collectRegistrationAliases(stop func() bool, paths []string, read contentReader) map[string][]string {
 	aliasesByHandler := map[string][]string{}
 	for _, p := range paths {
@@ -1270,23 +1204,18 @@ func registrationCandidateCounts(
 	maxParseBytes int,
 	workers int,
 	aliasesByHandler map[string][]string,
-	gates ...budgetGate,
 ) (map[string]int, error) {
 	counts := map[string]int{}
 	if len(aliasesByHandler) == 0 {
 		return counts, nil
 	}
-	gate := newBudgetGate(ctx, time.Time{}, time.Now)
-	if len(gates) > 0 {
-		gate = gates[0]
-	}
-	err := runProviderFilePipeline(ctx, gate.err, sc.paths, workers,
+	err := runProviderFilePipeline(ctx, ctx.Err, sc.paths, workers,
 		func(workerCtx context.Context, index int, path string) providerFileResult {
 			content, readable := sc.read(path)
 			if !readable || !mentionsRegistrationHandlerInFile(path, content, aliasesByHandler) {
 				return providerFileResult{index: index, path: path}
 			}
-			return processProviderFile(workerCtx, gate, sc, spec, maxParseBytes, index, path)
+			return processProviderFile(workerCtx, sc, spec, maxParseBytes, index, path)
 		},
 		func(result providerFileResult) error {
 			for _, symbol := range result.symbols {
@@ -1430,85 +1359,9 @@ func StreamSnapshot(ctx context.Context, repo, providerVersion string, options P
 // public provider always uses defaultProviderWorkerCount.
 func streamSnapshotWithWorkerCount(ctx context.Context, repo, providerVersion string, options ProviderSnapshotOptions, workers int, emit func(record any) error) error {
 	started := time.Now()
-
-	// An opt-in wall-clock budget must parse files serially so the retained
-	// prefix is a function of path order alone. Parallel workers finish
-	// different prefixes depending on scheduling and cache warmth, which
-	// regresses the provider's determinism contract for truncated snapshots.
-	if options.MaxDuration > 0 && workers > 1 {
-		workers = 1
-	}
-
-	// Source preparation (the git listing and plumbing) runs on the caller's
-	// context and OUTSIDE the budget clock: a partially-listed source has no
-	// reportable shape, so there is nothing to truncate it to. MaxDuration is
-	// therefore a parse-and-relation ceiling, not a whole-process one, and it
-	// is documented that way on the option and on the --max-seconds flag help.
 	sc, err := prepareSource(ctx, repo, options)
 	if err != nil {
 		return err
-	}
-
-	// Wall-clock ceiling over the parse and relation phases. A deadline on the
-	// work context is the single mechanism: the file pipeline already stops on
-	// ctx.Done and the relation phase already polls shouldStop, so one deadline
-	// bounds both without a second clock to keep in sync.
-	//
-	// Expiry of an OPT-IN budget is a truncation, not a failure: budgetHit turns
-	// into an E_ANALYSIS_BUDGET_EXCEEDED partial failure and the stream is
-	// finished normally, the way E_FILE_TOO_LARGE reports a file the provider
-	// chose not to parse. The retained prefix under MaxDuration is a function
-	// of stable path order (the file pipeline runs serially when a budget is
-	// set); callers that need a reproducible boundary must still not rely on
-	// wall-clock truncation alone because the exact cut point moves with
-	// machine speed.
-	// Everything else is returned as an error -- a
-	// cancellation, and also a deadline that came from the CALLER's own context
-	// rather than from MaxDuration. A caller that never asked for truncation
-	// must not receive a silently incomplete snapshot with a nil error: it would
-	// persist that snapshot (records_cache.go, search_cache.go) under a
-	// budget-independent tree key, and every later unbudgeted query would be
-	// served the gap as if it were the complete index.
-	workCtx := ctx
-	var budgetDeadline time.Time
-	if options.MaxDuration > 0 {
-		var cancelBudget context.CancelFunc
-		budgetDeadline = options.now().Add(options.MaxDuration)
-		workCtx, cancelBudget = context.WithDeadline(ctx, budgetDeadline)
-		defer cancelBudget()
-	}
-	// Observe the budget against the clock, not only against the context's
-	// timer: ctx.Err() flips one timer granularity after the deadline actually
-	// passed (~15.6 ms on Windows), and every poll below would spend that
-	// window working on a budget that is already gone. See budgetGate.
-	gate := newBudgetGate(workCtx, budgetDeadline, options.now)
-	budgetHit := false
-	// classifyStop splits a stop reason into "our budget expired, truncate and
-	// finish" and "return this to the caller". ctx.Err() != nil means the
-	// caller's own context is what expired, so the deadline is not ours to
-	// swallow.
-	classifyStop := func(err error) error {
-		if err == nil {
-			return nil
-		}
-		if isOptInBudgetExceeded(ctx, gate, budgetDeadline, options.MaxDuration, err) {
-			budgetHit = true
-			return nil
-		}
-		return err
-	}
-	// noteStop classifies the work context's current state.
-	noteStop := func() error { return classifyStop(gate.err()) }
-	// callerStop returns only when the caller's own context is done. Finalization
-	// runs after the relation phase has already classified budget expiry into
-	// budgetHit; re-polling the gate there would mark an otherwise complete
-	// snapshot truncated because slow stdout or progress callbacks ran past
-	// MaxDuration after the relation phase finished.
-	callerStop := func() error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		return nil
 	}
 	if sc.close != nil {
 		defer sc.close()
@@ -1574,17 +1427,15 @@ func streamSnapshotWithWorkerCount(ctx context.Context, repo, providerVersion st
 	// (commands/<name>.json) never appear in the handler body; index them once as
 	// searchable aliases so they can be attached to the handler symbol below.
 	//
-	// The alias scan reads whole files, so it gets the budgeted reader (see
-	// budgetGate.reader) rather than sc.read: on a repository with many or
-	// large command manifests the pass used to run to completion before the
-	// first budget check existed. The reader bounds it to one in-flight read,
-	// and the explicit classification below turns that expiry into the same
-	// truncation every later phase reports, rather than leaving it for the
-	// pipeline's timer to notice.
-	budgetedRead := gate.reader(sc.read)
-	aliasesByHandler := collectRegistrationAliases(gate.expired, sc.paths, budgetedRead)
+	// The alias scan reads whole files, so it gets the cancellable reader (see
+	// cancellableReader) rather than sc.read: on a repository with many or
+	// large command manifests the pass used to run to completion before
+	// anything observed a cancellation. The reader bounds it to one in-flight
+	// read, and the census below returns the context's error.
+	cancellableRead := cancellableReader(ctx, sc.read)
+	aliasesByHandler := collectRegistrationAliases(ctxStop(ctx), sc.paths, cancellableRead)
 	censusSource := sc
-	censusSource.read = budgetedRead
+	censusSource.read = cancellableRead
 	// A command verb names ONE callable. The verb was attached to every symbol
 	// that happened to share the handler's unqualified name, so a repository
 	// with a same-named function in another package — or a method, or a
@@ -1594,20 +1445,19 @@ func streamSnapshotWithWorkerCount(ctx context.Context, repo, providerVersion st
 	// by its own census pass BEFORE the file loop; the candidate symbols
 	// themselves are then emitted in their own file's place, as every other
 	// symbol is.
-	aliasCandidateCount, err := registrationCandidateCounts(workCtx, censusSource, spec, maxParseBytes, workers, aliasesByHandler, gate)
-	if err = classifyStop(err); err != nil {
+	aliasCandidateCount, err := registrationCandidateCounts(ctx, censusSource, spec, maxParseBytes, workers, aliasesByHandler)
+	if err != nil {
 		return err
 	}
 
 	// Phase 1: workers independently read, classify, and parse files. Only this
 	// reducer mutates graph indexes or calls emit, and it consumes the original
-	// path order, so worker timing cannot change snapshot bytes.
-	// gate.err rather than workCtx alone: a clock-triggered expiry is true
-	// before the context's deadline timer fires, and reducing one more result
-	// means emitting a whole file's symbol list into the caller's sink.
-	err = runProviderFilePipeline(workCtx, gate.err, sc.paths, workers,
+	// path order, so worker timing cannot change snapshot bytes. ctx.Err is
+	// polled before every reduction: reducing one more result means emitting a
+	// whole file's symbol list into the caller's sink after it was cancelled.
+	err = runProviderFilePipeline(ctx, ctx.Err, sc.paths, workers,
 		func(workerCtx context.Context, index int, path string) providerFileResult {
-			return processProviderFile(workerCtx, gate, sc, spec, maxParseBytes, index, path)
+			return processProviderFile(workerCtx, sc, spec, maxParseBytes, index, path)
 		},
 		func(result providerFileResult) error {
 			failures = append(failures, result.failures...)
@@ -1666,164 +1516,153 @@ func streamSnapshotWithWorkerCount(ctx context.Context, repo, providerVersion st
 		},
 	)
 	if err != nil {
-		// The pipeline surfaces the work context's error verbatim, so a budget
-		// expiry arrives here as context.DeadlineExceeded. Truncate rather than
-		// discard: every file already reduced has been emitted. A deadline that
-		// is not ours is still a failure.
-		if stopErr := classifyStop(err); stopErr != nil {
-			return stopErr
-		}
+		return err
 	}
 	emitProgress(BuildPhaseParse, len(sc.paths), symbolCount, relationCount)
 
-	externalsByID := map[string]ExternalRecord{}
-	var externalOrder []string
-	relationsByType := map[string]int{}
+	// Phase 2: resolve relations from indexes, re-reading content per file.
+	// Relation dedup uses compact 64-bit hashed keys rather than the full
+	// from+to+type string, so the set's memory is ~one machine word per unique
+	// relation instead of a ~100-byte key. The set is bounded by the unique
+	// relation count (== the relations reported in the summary). FNV-1a/64
+	// collisions across realistic relation counts are negligible.
+	startPhase()
+	seenRelation := map[uint64]struct{}{}
+	// One digest per DATA_FLOWS edge, so a dropped duplicate can be compared
+	// against the record that was kept without retaining either record. Sits on
+	// the DATA_FLOWS subset of the map above, which is already held for every
+	// relation, so this adds no new memory class.
 	dataFlowEvidence := map[uint64]uint64{}
 	unmergedEvidenceEdges := 0
-	if !budgetHit {
-		// Phase 2: resolve relations from indexes, re-reading content per file.
-		// Relation dedup uses compact 64-bit hashed keys rather than the full
-		// from+to+type string, so the set's memory is ~one machine word per unique
-		// relation instead of a ~100-byte key. The set is bounded by the unique
-		// relation count (== the relations reported in the summary). FNV-1a/64
-		// collisions across realistic relation counts are negligible.
-		startPhase()
-		seenRelation := map[uint64]struct{}{}
-		var emitErr error
-		emitRelation := func(r RelationRecord, symbolsByID map[string]SymbolRecord, filesByID map[string]FileRecord) {
-			if emitErr != nil || budgetHit {
-				return
-			}
-			if err := noteStop(); err != nil {
-				emitErr = err
-				return
-			}
-			if budgetHit {
-				return
-			}
-			// Profile filter: emit only relation families the profile includes; in
-			// shallow call resolution, keep only high-precision call-like relations; drop
-			// evidence when the profile omits it.
-			if !spec.emits(r.Type) {
-				return
-			}
-			if spec.callResolution == "shallow" && !shallowRelationRetained(r.Type, r.Resolution) {
-				return
-			}
-			if !spec.includeEvidence {
-				r.Evidence = nil
-			}
-			if r.WarningCodes == nil {
-				r.WarningCodes = []string{}
-			}
-			dedupKey := relationDedupKey(r)
-			if _, seen := seenRelation[dedupKey]; seen {
-				if r.Type == "DATA_FLOWS" {
-					if kept, ok := dataFlowEvidence[dedupKey]; ok && kept != evidenceDigest(r.Evidence) {
-						unmergedEvidenceEdges++
-						delete(dataFlowEvidence, dedupKey)
-						if options.onUnmergedDataFlowEdge != nil {
-							options.onUnmergedDataFlowEdge(r.FromID, r.ToID)
-						}
-					}
-				}
-				return
-			}
-			if r.Type == "DATA_FLOWS" {
-				dataFlowEvidence[dedupKey] = evidenceDigest(r.Evidence)
-			}
-			seenRelation[dedupKey] = struct{}{}
-			for _, id := range []string{r.FromID, r.ToID} {
-				if strings.HasPrefix(id, "external:") {
-					if _, exists := externalsByID[id]; !exists {
-						externalOrder = append(externalOrder, id)
-					}
-					mergeExternalRecord(externalsByID, externalRecordFor(r, id, symbolsByID, filesByID))
-				}
-			}
-			relationsByType[r.Type]++
-			relationCount++
-			if relationCount%relationProgressEvery == 0 {
-				emitProgress(BuildPhaseRelations, len(sc.paths), symbolCount, relationCount)
-			}
-			emitErr = emit(r)
-		}
-		relationsShouldStop := func() bool { return emitErr != nil || budgetHit || gate.expired() }
-		if options.ProjectVersion != nil && !relationsShouldStop() {
-			// Read through the snapshot's own content reader: metadata already
-			// validated, bounded by MaxParseBytes, non-regular files refused, and
-			// pinned to this snapshot's revision rather than to a HEAD that can move
-			// underneath it. Above the profile branch so a syntax-only export, which
-			// resolves no relations, still reports a version.
-			//
-			// Gated on both counts, because this sits inside the phase --max-seconds
-			// advertises that it bounds. Unguarded, an expiry landing just before
-			// this line still read and parsed up to three maximum-sized manifests
-			// before anything noticed, so the ceiling did not hold where it was
-			// claimed. budgetedRead stops mid-lookup for the same reason: checking
-			// only on entry leaves the same window one manifest wide.
-			options.ProjectVersion(ScipProjectVersion(ManifestReader(budgetedRead)))
-		}
-		if spec.name == ProfileSyntaxOnly {
-			emitStructuralRelationsCompact(sc.key, files, structuralByFile, relationsShouldStop, func(r RelationRecord) {
-				emitRelation(r, nil, nil)
-			})
-		} else {
-			var symbolsByID map[string]SymbolRecord
-			var filesByID map[string]FileRecord
-			if spec.includeEvidence {
-				symbolsByID, filesByID = recordIndexes(files, recordsByFile, relationsShouldStop)
-			}
-			var relationFailures []PartialFailure
-			forEachRelation(workCtx, sc.key, files, recordsByFile, budgetedRead, precomputedImports, spec, workers, relationsShouldStop, func(r RelationRecord) {
-				emitRelation(r, symbolsByID, filesByID)
-			}, func(failure PartialFailure) {
-				relationFailures = append(relationFailures, failure)
-			})
-			// A file can fail in both phases with the same code (a parse budget
-			// blown in the entity pass usually blows the relation-phase scope parse
-			// too): report one record per code+file, exactly as the cache-derived
-			// selective path does, so cache presence never changes the reported
-			// failure set.
-			failures = mergePartialFailures(failures, relationFailures)
-			// Check the budget BEFORE calling fileChangesWithRelations, not after:
-			// the call runs a `git log` subprocess over the last 256 commits and
-			// returns a fully materialised slice, so entering it once the deadline
-			// has passed charges the entire co-change subprocess to the overshoot.
-			// The subprocess also runs under workCtx now, so a budget that expires
-			// while git is running kills git instead of waiting for it.
-			if spec.emits("FILE_CHANGES_WITH") && !relationsShouldStop() {
-				for _, r := range fileChangesWithRelations(workCtx, sc.absRepo, sc.commit, sc.key, files, options.historyCochanges) {
-					if relationsShouldStop() {
-						break
-					}
-					emitRelation(r, symbolsByID, filesByID)
-				}
-			}
-		}
+	externalsByID := map[string]ExternalRecord{}
+	relationsByType := map[string]int{}
+	var emitErr error
+	emitRelation := func(r RelationRecord, symbolsByID map[string]SymbolRecord, filesByID map[string]FileRecord) {
 		if emitErr != nil {
-			return emitErr
+			return
 		}
-		// forEachRelation's shouldStop and the structural path both return without
-		// a reason, so classify the work context once here: budget expiry marks the
-		// snapshot truncated, a caller cancellation is returned. The parallel
-		// relation pipeline can also observe cancellation without emitting another
-		// record, so emitErr alone does not establish successful completion --
-		// noteStop covers that case because gate.err() reports the work context,
-		// which is derived from the caller's.
-		if err := noteStop(); err != nil {
-			return err
+		if err := ctx.Err(); err != nil {
+			emitErr = err
+			return
 		}
-	} // !budgetHit
+		// Profile filter: emit only relation families the profile includes; in
+		// shallow call resolution, keep only high-precision call-like relations; drop
+		// evidence when the profile omits it.
+		if !spec.emits(r.Type) {
+			return
+		}
+		if spec.callResolution == "shallow" && !shallowRelationRetained(r.Type, r.Resolution) {
+			return
+		}
+		if !spec.includeEvidence {
+			r.Evidence = nil
+		}
+		if r.WarningCodes == nil {
+			r.WarningCodes = []string{}
+		}
+		dedupKey := relationDedupKey(r)
+		if _, seen := seenRelation[dedupKey]; seen {
+			if r.Type == "DATA_FLOWS" {
+				// A duplicate carrying the same flows loses nothing. One carrying
+				// different flows is evidence this edge had a second producer that
+				// emission-site grouping could not see, and the record already
+				// written cannot be amended -- so count the edge and disclose it.
+				if kept, ok := dataFlowEvidence[dedupKey]; ok && kept != evidenceDigest(r.Evidence) {
+					unmergedEvidenceEdges++
+					delete(dataFlowEvidence, dedupKey) // count each edge once
+					if options.onUnmergedDataFlowEdge != nil {
+						options.onUnmergedDataFlowEdge(r.FromID, r.ToID)
+					}
+				}
+			}
+			return
+		}
+		if r.Type == "DATA_FLOWS" {
+			dataFlowEvidence[dedupKey] = evidenceDigest(r.Evidence)
+		}
+		seenRelation[dedupKey] = struct{}{}
+		for _, id := range []string{r.FromID, r.ToID} {
+			if strings.HasPrefix(id, "external:") {
+				mergeExternalRecord(externalsByID, externalRecordFor(r, id, symbolsByID, filesByID))
+			}
+		}
+		relationsByType[r.Type]++
+		relationCount++
+		if relationCount%relationProgressEvery == 0 {
+			emitProgress(BuildPhaseRelations, len(sc.paths), symbolCount, relationCount)
+		}
+		emitErr = emit(r)
+	}
+	// One stop predicate for every relation producer: a failed sink or a
+	// cancelled context ends the phase, and the checks after it return the
+	// reason. The producers poll it inside their own loops, so a cancellation
+	// that lands mid-producer is observed there rather than only once the
+	// producer has materialised its whole result.
+	relationsShouldStop := func() bool { return emitErr != nil || ctx.Err() != nil }
+	if options.ProjectVersion != nil && !relationsShouldStop() {
+		// Read through the snapshot's own content reader: metadata already
+		// validated, bounded by MaxParseBytes, non-regular files refused, and
+		// pinned to this snapshot's revision rather than to a HEAD that can move
+		// underneath it. Above the profile branch so a syntax-only export, which
+		// resolves no relations, still reports a version. The cancellable reader
+		// stops mid-lookup, so a cancellation does not still read up to three
+		// maximum-sized manifests first.
+		options.ProjectVersion(ScipProjectVersion(ManifestReader(cancellableRead)))
+	}
+	if spec.name == ProfileSyntaxOnly {
+		emitStructuralRelationsCompact(sc.key, files, structuralByFile, relationsShouldStop, func(r RelationRecord) {
+			emitRelation(r, nil, nil)
+		})
+	} else {
+		var symbolsByID map[string]SymbolRecord
+		var filesByID map[string]FileRecord
+		if spec.includeEvidence {
+			symbolsByID, filesByID = recordIndexes(files, recordsByFile, relationsShouldStop)
+		}
+		var relationFailures []PartialFailure
+		forEachRelation(ctx, sc.key, files, recordsByFile, cancellableRead, precomputedImports, spec, workers, relationsShouldStop, func(r RelationRecord) {
+			emitRelation(r, symbolsByID, filesByID)
+		}, func(failure PartialFailure) {
+			relationFailures = append(relationFailures, failure)
+		})
+		// A file can fail in both phases with the same code (a parse budget
+		// blown in the entity pass usually blows the relation-phase scope parse
+		// too): report one record per code+file, exactly as the cache-derived
+		// selective path does, so cache presence never changes the reported
+		// failure set. The single record carries BOTH phases' effect and detail
+		// text (mergePartialFailures folds duplicates) so neither loss is hidden.
+		failures = mergePartialFailures(failures, relationFailures)
+		// Checked BEFORE calling fileChangesWithRelations, not only inside the
+		// loop: the call runs a `git log` subprocess over the last 256 commits and
+		// returns a fully materialised slice, so entering it after a cancellation
+		// pays for the whole subprocess first.
+		if spec.emits("FILE_CHANGES_WITH") && !relationsShouldStop() {
+			for _, r := range fileChangesWithRelations(ctx, sc.absRepo, sc.commit, sc.key, files, options.historyCochanges) {
+				if relationsShouldStop() {
+					break
+				}
+				emitRelation(r, symbolsByID, filesByID)
+			}
+		}
+	}
+	if emitErr != nil {
+		return emitErr
+	}
+	// The relation pipeline can observe cancellation without emitting another
+	// record, so emitErr alone does not establish successful completion.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	emitProgress(BuildPhaseRelations, len(sc.paths), symbolCount, relationCount)
 
 	startPhase()
-	externalIDs := orderedExternalIDs(externalsByID, externalOrder, budgetHit)
+	externalIDs := make([]string, 0, len(externalsByID))
+	for id := range externalsByID {
+		externalIDs = append(externalIDs, id)
+	}
+	sort.Strings(externalIDs)
 	for _, id := range externalIDs {
-		// Externals are already resolved in memory; only a caller cancellation
-		// stops emitting them once the relation phase has finished.
-		if err := callerStop(); err != nil {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if err := emit(externalsByID[id]); err != nil {
@@ -1839,9 +1678,6 @@ func streamSnapshotWithWorkerCount(ctx context.Context, repo, providerVersion st
 	}
 	if failures == nil {
 		failures = []PartialFailure{}
-	}
-	if budgetHit {
-		failures = append(failures, analysisBudgetFailure(options.MaxDuration))
 	}
 	summary := SnapshotSummary{
 		RecordType:      "summary",
@@ -2396,12 +2232,11 @@ func entitySymbols(repoKey, path, language string, entities []Entity) []SymbolRe
 }
 
 // syntheticBoundarySymbols returns the derived route/tool/workflow boundary
-// symbols for a file, plus whether the wall-clock budget expired before it
-// finished. The tool-handler loop below rescans content once per already-
-// parsed symbol, so it is polled every budgetPollStride symbols like the other
+// symbols for a file, plus whether stop fired before it finished. The tool-handler loop below rescans content once per already-
+// parsed symbol, so it is polled every stopPollStride symbols like the other
 // whole-corpus loops in this package (see parser.go); a file with an unusually
-// large symbol count is the only way this pass takes long enough for the
-// budget to matter. On truncation the caller must drop the file atomically —
+// large symbol count is the only way this pass takes long enough for a
+// cancellation to matter. On a stop the caller must drop the file atomically —
 // a partial synthetic list appended to a complete entity list would read as a
 // complete file that simply has no boundary symbols.
 func syntheticBoundarySymbols(repoKey, path, language, content string, fileSymbols []SymbolRecord, stop func() bool) ([]SymbolRecord, bool) {
@@ -2428,7 +2263,7 @@ func syntheticBoundarySymbols(repoKey, path, language, content string, fileSymbo
 		})
 	}
 	for i, source := range fileSymbols {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return nil, true
 		}
 		block := symbolBlockFromLines(lines, source)
@@ -4964,8 +4799,7 @@ func emitStructuralRelations(repoKey string, files []FileRecord, recordsByFile m
 // emitStructuralRelationsCompact streams the syntax-only relation set. It takes
 // shouldStop because the emit sink returning early is not enough: without a stop
 // predicate the producer keeps walking every remaining file and symbol after the
-// wall-clock budget has expired, so the advertised ceiling is overshot by the
-// whole remainder of an O(symbol-count) pass.
+// run was cancelled, for the whole remainder of an O(symbol-count) pass.
 func emitStructuralRelationsCompact(repoKey string, files []FileRecord, recordsByFile map[string][]structuralSymbol, shouldStop func() bool, emit func(RelationRecord)) {
 	for _, file := range files {
 		if shouldStop != nil && shouldStop() {
@@ -5160,7 +4994,7 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 				return
 			}
 			for si, symbol := range recordsByFile[file.Path] {
-				if si%budgetPollStride == 0 && shouldStop != nil && shouldStop() {
+				if si%stopPollStride == 0 && shouldStop != nil && shouldStop() {
 					return
 				}
 				if typeLikeKind(symbol.Kind) {
@@ -7246,7 +7080,7 @@ func partialTypeCanonicalIDs(stop func() bool, files []FileRecord, recordsByFile
 			return nil, nil
 		}
 		for si, symbol := range recordsByFile[file.Path] {
-			if si%budgetPollStride == 0 && stop != nil && stop() {
+			if si%stopPollStride == 0 && stop != nil && stop() {
 				return nil, nil
 			}
 			if !typeLikeKind(symbol.Kind) || !declaresPartialType(symbol) {
@@ -7267,7 +7101,7 @@ func partialTypeCanonicalIDs(stop func() bool, files []FileRecord, recordsByFile
 	canonical := make(map[string]string, len(parts))
 	canonicalFile := make(map[string]string, len(canonicalByKey))
 	for pi, symbol := range parts {
-		if pi%budgetPollStride == 0 && stop != nil && stop() {
+		if pi%stopPollStride == 0 && stop != nil && stop() {
 			return nil, nil
 		}
 		key := symbol.Language + "\x00" + symbol.Kind + "\x00" + symbol.QualifiedName
@@ -12836,9 +12670,9 @@ func lookupHCLReference(index map[string]SymbolRecord, ref string) (SymbolRecord
 // repository resolves against every symbol sharing it), making the pass
 // quadratic in the worst case rather than the single linear pass over symbols
 // this loop otherwise is. stop is threaded into both the outer loops and
-// resolveTestSubject's own candidate scan so a run past the wall-clock budget
-// is interrupted where the cost actually accrues, not just at the
-// already-too-late edges of this function.
+// resolveTestSubject's own candidate scan so a cancelled run is interrupted
+// where the cost actually accrues, not just at the already-too-late edges of
+// this function.
 func testRelations(stop func() bool, recordsByFile map[string][]SymbolRecord, symbolsByShortName map[string][]SymbolRecord, resolvedImportsByFile map[string]map[string][]string) []RelationRecord {
 	paths := make([]string, 0, len(recordsByFile))
 	for path := range recordsByFile {
@@ -13459,16 +13293,16 @@ func fieldAccessRelations(from SymbolRecord, body symbolBody, fieldsByContainer 
 // resolved supertype overrides it. It only fires when both the supertype and
 // its methods are known local symbols, so external base classes never produce
 // guessed overrides.
-// overrideRelations is polled every budgetPollStride inheritance edges, like
+// overrideRelations is polled every stopPollStride inheritance edges, like
 // the other bounded scans in this package: the caller's shouldStop check
 // above only ran BEFORE this call, so a large class hierarchy -- many
 // EXTENDS/IMPLEMENTS edges, each sorting its subtype's whole method set --
-// kept consuming CPU and memory past MaxDuration until the entire slice was
-// materialized and returned.
+// kept consuming CPU and memory after a cancellation until the entire slice
+// was materialized and returned.
 func overrideRelations(relations []RelationRecord, methodsByContainer map[string]map[string]SymbolRecord, stop func() bool) []RelationRecord {
 	var overrides []RelationRecord
 	for i, relation := range relations {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return overrides
 		}
 		if relation.Type != "EXTENDS" && relation.Type != "IMPLEMENTS" {
@@ -13666,7 +13500,7 @@ func minFloat(a, b float64) float64 {
 }
 
 // recordIndexes builds id lookups for file and symbol records. stop is polled
-// every budgetPollStride symbols (mirroring parser.go's cadence): this whole-
+// every stopPollStride symbols (mirroring parser.go's cadence): this whole-
 // corpus pass runs BEFORE relation generation even starts, so on a large
 // full-profile snapshot a deadline expiring here previously went unnoticed
 // until relationsShouldStop was next consulted in forEachRelation, charging
@@ -13678,7 +13512,7 @@ func minFloat(a, b float64) float64 {
 func recordIndexes(files []FileRecord, recordsByFile map[string][]SymbolRecord, stop func() bool) (map[string]SymbolRecord, map[string]FileRecord) {
 	filesByID := make(map[string]FileRecord, len(files))
 	for i, file := range files {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return map[string]SymbolRecord{}, filesByID
 		}
 		filesByID[file.ID] = file
@@ -13687,7 +13521,7 @@ func recordIndexes(files []FileRecord, recordsByFile map[string][]SymbolRecord, 
 	count := 0
 	for _, records := range recordsByFile {
 		for _, symbol := range records {
-			if count%budgetPollStride == 0 && stopped(stop) {
+			if count%stopPollStride == 0 && stopped(stop) {
 				return symbolsByID, filesByID
 			}
 			count++
@@ -13723,41 +13557,6 @@ func mergeExternalRecord(seen map[string]ExternalRecord, record ExternalRecord) 
 		return
 	}
 	seen[record.ID] = record
-}
-
-// orderedExternalIDs decides what order externalsByID's records are emitted
-// in: alphabetical when the derivation ran to completion (budgetHit ==
-// false), or the deterministic first-seen scan order (externalOrder,
-// maintained by the caller's emitRelation alongside externalsByID) when it
-// was budget-truncated.
-//
-// The complete path sorts because emission order is otherwise whatever a Go
-// map iteration gives, which varies run to run for the identical input --
-// sorting is cheap here because a completed build already paid the full
-// relation-phase cost with no time pressure left to protect.
-//
-// The truncated path must NOT sort: sort.Strings is O(n log n) over however
-// many distinct external IDs the relation phase accumulated before the gate
-// tripped -- on a 500-function nested fixture that phase alone produced
-// 385,137 relations, so a comparably large external set is not implausible
-// -- and running it unconditionally after budget expiry was classified
-// blows the wall-clock ceiling the rest of the derivation had just finished
-// enforcing. Falling back to plain map iteration there instead of to
-// externalOrder would trade that bug for another: it would make even a
-// truncated build's Externals order vary run to run for the identical tree,
-// regressing the provider's determinism contract independent of caching.
-// externalOrder is deterministic for the same input at O(1) extra cost per
-// relation, so the truncated case loses nothing switching to it.
-func orderedExternalIDs(externalsByID map[string]ExternalRecord, externalOrder []string, budgetHit bool) []string {
-	if budgetHit {
-		return externalOrder
-	}
-	ids := make([]string, 0, len(externalsByID))
-	for id := range externalsByID {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	return ids
 }
 
 type boundarySource struct {
@@ -21238,7 +21037,7 @@ func buildManifestImportResolver(files []FileRecord, readContent contentReader, 
 		resolver.jsPackageImports = parsePackageJSONTargets(content, "imports")
 	}
 	for i, file := range files {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return resolver
 		}
 		path := filepath.ToSlash(file.Path)
@@ -21315,7 +21114,7 @@ func buildManifestImportResolver(files []FileRecord, readContent contentReader, 
 	}
 	resolver.jvmPackagePrefixes = normalizeJVMPackagePrefixes(resolver.jvmPackagePrefixes)
 	for i, file := range files {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return resolver
 		}
 		if !strings.EqualFold(filepath.Ext(file.Path), ".csproj") {
@@ -21340,7 +21139,7 @@ func buildManifestImportResolver(files []FileRecord, readContent contentReader, 
 	// repository-wide file list this pass alone can outlast an already-expired
 	// deadline before the very first gated read below ever runs.
 	for i, file := range files {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return resolver
 		}
 		if strings.EqualFold(filepath.Ext(file.Path), ".go") {
@@ -21407,7 +21206,7 @@ func buildManifestImportResolver(files []FileRecord, readContent contentReader, 
 	}
 	if resolver.goModule != "" {
 		for i, path := range goPaths {
-			if i%budgetPollStride == 0 && stopped(stop) {
+			if i%stopPollStride == 0 && stopped(stop) {
 				return resolver
 			}
 			dir := filepath.ToSlash(filepath.Dir(path))
@@ -21422,7 +21221,7 @@ func buildManifestImportResolver(files []FileRecord, readContent contentReader, 
 	}
 	sort.Strings(jsPaths)
 	for i, path := range jsPaths {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return resolver
 		}
 		key := strings.TrimSuffix(path, filepath.Ext(path))
@@ -21445,7 +21244,7 @@ func buildManifestImportResolver(files []FileRecord, readContent contentReader, 
 		pyFileSet[path] = true
 	}
 	for i, path := range pyPaths {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return resolver
 		}
 		for _, key := range pythonModuleKeysForPath(path, resolver.pythonSourceRoots, pyFileSet) {
@@ -21467,7 +21266,7 @@ func buildManifestImportResolver(files []FileRecord, readContent contentReader, 
 	}
 	sort.Strings(jvmPaths)
 	for i, path := range jvmPaths {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return resolver
 		}
 		content, ok := readContent(path)
@@ -21486,7 +21285,7 @@ func buildManifestImportResolver(files []FileRecord, readContent contentReader, 
 	}
 	sort.Strings(csharpPaths)
 	for i, path := range csharpPaths {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return resolver
 		}
 		content, ok := readContent(path)
@@ -21507,7 +21306,7 @@ func buildManifestImportResolver(files []FileRecord, readContent contentReader, 
 	}
 	sort.Strings(phpPaths)
 	for i, path := range phpPaths {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return resolver
 		}
 		content, ok := readContent(path)
@@ -21530,7 +21329,7 @@ func buildManifestImportResolver(files []FileRecord, readContent contentReader, 
 	// Build per-crate src roots from every Cargo.toml [package] (Cargo workspaces
 	// put crates under <crate>/src/, not ./src/). Longest dir first for nearest-match.
 	for i, cp := range cargoPaths {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return resolver
 		}
 		content, ok := readContent(cp)
@@ -21561,7 +21360,7 @@ func buildManifestImportResolver(files []FileRecord, readContent contentReader, 
 	rustPaths = uniqueStrings(rustPaths)
 	sort.Strings(rustPaths)
 	for i, path := range rustPaths {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return resolver
 		}
 		for _, module := range resolver.rustModuleKeysForPath(path) {
@@ -21571,7 +21370,7 @@ func buildManifestImportResolver(files []FileRecord, readContent contentReader, 
 		}
 	}
 	for i, path := range rustPaths {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return resolver
 		}
 		content, ok := readContent(path)

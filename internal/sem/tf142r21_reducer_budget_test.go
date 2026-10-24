@@ -8,13 +8,12 @@ import (
 )
 
 // TestTF142R21PipelineStopsReducingOnceTheBudgetIsGone closes the last hole in
-// the wall-clock ceiling's coverage of the parse phase. Every stop check lived
-// on the worker side (processProviderFile) or on the coordinator's context; the
+// cancellation's coverage of the parse phase. Every stop check lived on the
+// worker side (processProviderFile) or on the coordinator's context; the
 // reduction itself polled nothing. Reducing is not bookkeeping -- it emits the
-// file record plus that file's entire symbol list into the caller's sink -- and
-// the coordinator's cancellation branch deliberately drains and reduces every
-// buffered result before returning, so a budget that expired mid-run still paid
-// for those reductions in full.
+// file record plus that file's entire symbol list into the caller's sink -- so
+// a run stopped mid-reduction must not reduce the results buffered behind the
+// one in flight.
 func TestTF142R21PipelineStopsReducingOnceTheBudgetIsGone(t *testing.T) {
 	t.Parallel()
 
@@ -85,9 +84,8 @@ func TestTF142R21PipelineWithoutAStopIsUnchanged(t *testing.T) {
 }
 
 // TestTF142R21StopIsPolledInTheCancellationDrain pins the branch the finding
-// named: on cancellation the coordinator drains every buffered result and
-// reduces it before returning, which is exactly where an already-expired
-// ceiling must not buy another file's worth of emission.
+// named: a cancellation that lands inside a reduction must not buy another
+// file's worth of emission from the results already buffered behind it.
 func TestTF142R21StopIsPolledInTheCancellationDrain(t *testing.T) {
 	t.Parallel()
 

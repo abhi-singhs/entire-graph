@@ -240,7 +240,7 @@ func (TreeSitterParser) Parse(path, content string) ([]Entity, string) {
 }
 
 // ParseWithStatus parses without a cancellation deadline of its own. It is the
-// entry point for callers that are not under a wall-clock budget.
+// entry point for callers that have no context to stop it.
 func (TreeSitterParser) ParseWithStatus(path, content string) ([]Entity, string, ParseStatus) {
 	return TreeSitterParser{}.ParseWithStatusCtx(context.Background(), path, content)
 }
@@ -3720,10 +3720,10 @@ func inventoryLanguageForSuffix(base string) (languageSpec, bool) {
 
 // fallbackEntities dispatches to a per-format extractor for files with no
 // tree-sitter grammar. Every extractor below that scans line-by-line polls
-// stop every budgetPollStride lines, mirroring the cadence search_cache.go
+// stop every stopPollStride lines, mirroring the cadence search_cache.go
 // uses for its own per-record loops: a maximum-sized Markdown, HTML, XML or
-// JSON file is exactly the case a wall-clock budget expiring mid-file needs
-// to interrupt, since the caller discards the whole result once ctx expires
+// JSON file is exactly the case a cancellation landing mid-file needs to
+// interrupt, since the caller discards the whole result once ctx expires
 // regardless of how much of the file this pass already walked.
 func fallbackEntities(path, content, language string, stop func() bool) []Entity {
 	switch language {
@@ -3778,7 +3778,7 @@ func dockerfileEntities(content string, stop func() bool) []Entity {
 	var entities []Entity
 	stageIndex := 0
 	for index, line := range lines {
-		if index%budgetPollStride == 0 && stopped(stop) {
+		if index%stopPollStride == 0 && stopped(stop) {
 			return entities
 		}
 		trimmed := strings.TrimSpace(line)
@@ -3830,7 +3830,7 @@ func yamlKeyEntities(content, prefix string, stop func() bool) []Entity {
 	lines := strings.Split(content, "\n")
 	var entities []Entity
 	for i, line := range lines {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return entities
 		}
 		trimmed := strings.TrimSpace(line)
@@ -3854,7 +3854,7 @@ func jsonLikeEntities(content string, stop func() bool) []Entity {
 	var entities []Entity
 	seen := map[string]bool{}
 	for i, line := range lines {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return entities
 		}
 		match := jsonLikeEntitiesKeyRe.FindStringSubmatch(line)
@@ -3877,7 +3877,7 @@ func tomlEntities(content string, stop func() bool) []Entity {
 	var entities []Entity
 	seen := map[string]bool{}
 	for i, line := range lines {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return entities
 		}
 		name := ""
@@ -3904,7 +3904,7 @@ func xmlEntities(content string, stop func() bool) []Entity {
 	var entities []Entity
 	seen := map[string]bool{}
 	for i, line := range lines {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return entities
 		}
 		match := xmlEntitiesTagRe.FindStringSubmatch(line)
@@ -3923,7 +3923,7 @@ func makeEntities(content string, stop func() bool) []Entity {
 	lines := strings.Split(content, "\n")
 	var entities []Entity
 	for i, line := range lines {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return entities
 		}
 		if strings.HasPrefix(line, "\t") || strings.TrimSpace(line) == "" || strings.HasPrefix(strings.TrimSpace(line), "#") {
@@ -3948,7 +3948,7 @@ func markdownEntities(content string, stop func() bool) []Entity {
 	var entities []Entity
 	fenceIndex := 0
 	for i, line := range lines {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return entities
 		}
 		if match := markdownEntitiesHeadingRe.FindStringSubmatch(line); match != nil {
@@ -3978,7 +3978,7 @@ func htmlEntities(path, content string, stop func() bool) []Entity {
 	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	entities = append(entities, simpleFallbackEntity("document", base, "html document "+base, 1, maxInt(1, len(lines)), base))
 	for i, line := range lines {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return entities
 		}
 		for _, match := range htmlEntitiesIdRe.FindAllStringSubmatch(line, -1) {
@@ -3999,7 +3999,7 @@ func cssEntities(content string, stop func() bool) []Entity {
 	lines := strings.Split(content, "\n")
 	var entities []Entity
 	for i, line := range lines {
-		if i%budgetPollStride == 0 && stopped(stop) {
+		if i%stopPollStride == 0 && stopped(stop) {
 			return entities
 		}
 		match := cssEntitiesSelectorRe.FindStringSubmatch(line)
@@ -4437,7 +4437,7 @@ func walkEntities(ctx context.Context, node *sitter.Node, src []byte, language, 
 // returns; two independent budgets over the same root-to-leaf path would let the
 // two walkers amplify each other.
 func walkEntitiesScoped(ctx context.Context, node *sitter.Node, src []byte, language, scope string, scopeIsCallable, inFunc bool, stop func() bool, depth int, entities *[]Entity, depthExceeded *bool) {
-	// Check the caller's wall-clock budget before descending into each node.
+	// Check the caller's context before descending into each node.
 	if stop != nil && stop() {
 		return
 	}

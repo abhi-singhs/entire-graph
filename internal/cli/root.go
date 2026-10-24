@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -35,6 +34,10 @@ type Options struct {
 	// buildInfo overrides how the session replay reads this binary's build metadata. Unexported and
 	// nil in production (debug.ReadBuildInfo); tests set it to exercise specific producer identities.
 	buildInfo func() (*debug.BuildInfo, bool)
+	// streamSnapshot stands in for sem.StreamSnapshot when non-nil. It exists so
+	// tests can hand runProviderRecords a summary no build in sem produces any
+	// more -- one marked truncated -- and prove the cache refusals still hold.
+	streamSnapshot func(ctx context.Context, repo, providerVersion string, options sem.ProviderSnapshotOptions, emit func(record any) error) error
 }
 
 // SignalError reports that Execute stopped because it received a signal
@@ -531,18 +534,6 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 	if scip && flags.Progress {
 		return errors.New("--format scip cannot be combined with --progress; stderr is reserved for the JSON omission note")
 	}
-	if (compact || scip) && flags.MaxSeconds > 0 {
-		// Both of these artifacts are DEFINED to be a complete snapshot, and
-		// neither has a record that can carry E_ANALYSIS_BUDGET_EXCEEDED forward.
-		// LoadCompactSnapshot and snapshot-query accept whatever compact prefix
-		// they are handed; a SCIP Index is a single binary protobuf message whose
-		// only truncation signal is a stderr note that does not travel with the
-		// file. Either way a truncated artifact turns every symbol that was never
-		// reached into a confident negative answer for every later consumer. The
-		// NDJSON stream can say "partial"; these formats cannot, so the
-		// combination is refused rather than written.
-		return fmt.Errorf("--format %s requires a complete snapshot and cannot be combined with --max-seconds; use --format ndjson (which reports E_ANALYSIS_BUDGET_EXCEEDED when truncated), or --max-seconds 0", flags.Format)
-	}
 	repo, err := resolveRepo(ctx, opts.Env, flags.Repo)
 	if err != nil {
 		return err
@@ -557,9 +548,6 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 		IgnoreFiles:  flags.IgnoreFiles,
 		IncludeFiles: flags.IncludeFiles,
 		Profile:      profile,
-	}
-	if flags.MaxSeconds > 0 {
-		options.MaxDuration = time.Duration(flags.MaxSeconds) * time.Second
 	}
 	if flags.Progress {
 		options.Progress = func(event sem.ProgressEvent) {
@@ -632,6 +620,10 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 
 	if filterActive && mode == "symbols" {
 		return fmt.Errorf("--to/--from/--relation filter relations; use `edges` (not `symbols`)")
+	}
+	streamSnapshot := opts.streamSnapshot
+	if streamSnapshot == nil {
+		streamSnapshot = sem.StreamSnapshot
 	}
 	// Serve from the committed-record cache when possible. The cache is keyed on
 	// the exact HEAD commit and tree, the mode, and output-affecting options, so
@@ -718,7 +710,7 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 			cacheRecord = newRecordEncoder(spool)
 		}
 		var matched int
-		if err := sem.StreamSnapshot(ctx, repo, opts.Version, options, func(record any) error {
+		if err := streamSnapshot(ctx, repo, opts.Version, options, func(record any) error {
 			capture(record)
 			if cacheRecord != nil && includeRecord("edges", record) {
 				if err := cacheRecord(record); err != nil {
@@ -741,13 +733,13 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 			return err
 		}
 		warnIfPartial(opts.Stderr, flags.Worktree, summary)
-		truncated := budgetTruncated(summary)
+		truncated := sem.SnapshotTruncated(summary)
 		if truncated {
 			// Same refusal as the main path: a truncated index must not become
-			// the cached answer. The auto-merge of this hunk kept the warning
-			// and the Store, which would have printed "were not cached" and
-			// then cached. The spool is left for the deferred Abandon.
-			fmt.Fprintln(opts.Stderr, "graph: index stopped at the --max-seconds budget; the matched edges are partial and were not cached")
+			// the cached answer. An earlier merge of this hunk kept the warning
+			// and the Store, which printed "were not cached" and then cached.
+			// The spool is left for the deferred Abandon.
+			fmt.Fprintln(opts.Stderr, "graph: index is truncated (E_ANALYSIS_BUDGET_EXCEEDED); the matched edges are partial and were not cached")
 		}
 		reportMatched(matched)
 		if spool != nil && !truncated {
@@ -785,13 +777,13 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 	// repositories the cache matters most for.
 	//
 	// The stdout side stays wrapped for cancellation: a run that is cancelled
-	// or hits its --max-seconds ceiling must stop writing, not drain the rest
-	// of the graph into a pipe nobody is reading. The wrapper is idempotent,
+	// must stop writing, not drain the rest of the graph into a pipe nobody is
+	// reading. The wrapper is idempotent,
 	// so this is a no-op when opts.Stdout was already wrapped at entry.
 	if spool = beginRecordsSpool(recordsCache, opts.Stderr); spool != nil {
 		encodeRecord = newRecordEncoder(io.MultiWriter(contextChunkWriterFor(ctx, opts.Stdout), spool))
 	}
-	if err := sem.StreamSnapshot(ctx, repo, opts.Version, options, func(record any) error {
+	if err := streamSnapshot(ctx, repo, opts.Version, options, func(record any) error {
 		capture(record)
 		if !includeRecord(mode, record) {
 			return nil
@@ -807,13 +799,13 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 	} else {
 		warnIfPartial(opts.Stderr, flags.Worktree, summary)
 	}
-	if budgetTruncated(summary) {
-		// A budget-truncated graph must never become the cached answer for this
-		// tree: the cache key deliberately does not include the budget, so a
-		// stored truncation would be served to every later caller as if it were
-		// the complete index. The spool is left non-nil so the deferred Abandon
+	if sem.SnapshotTruncated(summary) {
+		// A truncated graph must never become the cached answer for this tree:
+		// the cache key is the tree and the graph-shaping options, so a stored
+		// truncation would be served to every later caller as if it were the
+		// complete index. The spool is left non-nil so the deferred Abandon
 		// discards it.
-		fmt.Fprintln(opts.Stderr, "graph: index stopped at the --max-seconds budget; result is partial and was not cached")
+		fmt.Fprintln(opts.Stderr, "graph: index is truncated (E_ANALYSIS_BUDGET_EXCEEDED); result is partial and was not cached")
 	} else if spool != nil {
 		// Best effort: a failed cache write never fails the command, but it is
 		// said once on stderr rather than silently costing a re-parse per run.
@@ -823,21 +815,6 @@ func runProviderRecords(ctx context.Context, opts Options, args []string, mode s
 		spool = nil
 	}
 	return nil
-}
-
-// budgetTruncated reports whether a snapshot stopped at its wall-clock ceiling
-// rather than finishing. Such a result is valid to print but must not be
-// persisted or treated as a complete index.
-func budgetTruncated(s *sem.SnapshotSummary) bool {
-	if s == nil {
-		return false
-	}
-	for _, failure := range s.PartialFailures {
-		if failure.Code == sem.AnalysisBudgetExceededCode {
-			return true
-		}
-	}
-	return false
 }
 
 // beginRecordsSpool opens the disk spool a cold run tees its records into, or
@@ -983,15 +960,7 @@ func includeRecord(mode string, record any) bool {
 // command stops cleanly at the limit and emits the partial result plus
 // machine-readable W_ANALYSIS_BUDGET_EXCEEDED warnings. --max-seconds 0
 // disables the budget.
-const defaultMaxSeconds int64 = 120
-
-// maxSecondsCeiling is the largest --max-seconds value that still fits in a
-// time.Duration once multiplied by time.Second (~292 years). strconv.Atoi
-// happily accepts every int64, but seconds*time.Second above this wraps to a
-// NEGATIVE duration: context.WithDeadline would then fire in the past, and the
-// provider commands' "MaxDuration > 0" test would be false, silently disabling
-// the very ceiling the operator asked for.
-const maxSecondsCeiling = int64(math.MaxInt64) / int64(time.Second)
+const defaultMaxSeconds = 120
 
 type commonFlags struct {
 	Repo     string
@@ -999,7 +968,7 @@ type commonFlags struct {
 	Progress bool
 	// MaxSeconds is the overall analysis budget in seconds; -1 means the flag
 	// was not given (commands apply their default), 0 means unlimited.
-	MaxSeconds int64
+	MaxSeconds int
 }
 
 type providerFlags struct {
@@ -1011,13 +980,6 @@ type providerFlags struct {
 	Progress     bool
 	IgnoreFiles  []string
 	IncludeFiles []string
-	// MaxSeconds is the wall-clock ceiling for the index build in seconds.
-	// -1 means the flag was not given, 0 means unlimited. Unlike diff/commit
-	// these commands do NOT apply defaultMaxSeconds when the flag is absent:
-	// a full index of a large repository legitimately runs for minutes, and
-	// silently truncating one by default would turn a slow index into a wrong
-	// one. The ceiling is opt-in.
-	MaxSeconds int64
 	// Targeted edge filters (edges mode). When any is set the command emits only
 	// the matching relation records (plus header/summary) instead of the whole
 	// graph, so "callers of X" is a tiny reply rather than a 50MB dump that the
@@ -1079,19 +1041,8 @@ func parseProfile(value string) (sem.Profile, error) {
 	}
 }
 
-func parseMaxSecondsValue(raw string) (int64, error) {
-	seconds, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || seconds < 0 {
-		return 0, fmt.Errorf("--max-seconds requires a non-negative integer, got %q", raw)
-	}
-	if seconds > maxSecondsCeiling {
-		return 0, fmt.Errorf("--max-seconds must be at most %d (larger values overflow time.Duration and disable the ceiling), got %q", maxSecondsCeiling, raw)
-	}
-	return seconds, nil
-}
-
 func parseProviderFlags(args []string) (providerFlags, []string, error) {
-	flags := providerFlags{Format: "ndjson", MaxSeconds: -1}
+	flags := providerFlags{Format: "ndjson"}
 	var rest []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -1113,16 +1064,6 @@ func parseProviderFlags(args []string) (providerFlags, []string, error) {
 				return flags, nil, errors.New("--profile requires a value")
 			}
 			flags.Profile = args[i]
-		case "--max-seconds":
-			i++
-			if i >= len(args) {
-				return flags, nil, errors.New("--max-seconds requires a value")
-			}
-			seconds, err := parseMaxSecondsValue(args[i])
-			if err != nil {
-				return flags, nil, err
-			}
-			flags.MaxSeconds = seconds
 		case "--no-network":
 			flags.NoNetwork = true
 		case "--worktree":
@@ -1193,9 +1134,9 @@ func parseCommonFlags(args []string) (commonFlags, []string, error) {
 			if i >= len(args) {
 				return flags, nil, errors.New("--max-seconds requires a value")
 			}
-			seconds, err := parseMaxSecondsValue(args[i])
-			if err != nil {
-				return flags, nil, err
+			seconds, err := strconv.Atoi(args[i])
+			if err != nil || seconds < 0 {
+				return flags, nil, fmt.Errorf("--max-seconds requires a non-negative integer, got %q", args[i])
 			}
 			flags.MaxSeconds = seconds
 		case "--repo":

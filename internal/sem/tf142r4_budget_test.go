@@ -15,8 +15,7 @@ import (
 //
 // Every test here is DETERMINISTIC: the stop predicate is flipped by the test,
 // not by a clock, and the assertions are on work performed, not on elapsed time.
-// A wall-clock ceiling is not a property a shared CI runner can be asked to
-// meet; the timed end-to-end measurements live in the PR description.
+// Elapsed time is not a property a shared CI runner can be asked to meet.
 
 // tf142r4GroovyBomb is Groovy whose declarations nest, so every enclosing class
 // entity spans the rest of the file and the body-hash pass joins those lines

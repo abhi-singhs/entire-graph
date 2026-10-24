@@ -10,52 +10,27 @@ import (
 	"time"
 )
 
-// f06fixBudgetCode is the wire-visible truncation marker, spelled out on
+// f06fixTruncationCode is the wire-visible truncation marker, spelled out on
 // purpose so the test pins the string consumers match on rather than whatever
 // the constant currently holds.
-const f06fixBudgetCode = "E_ANALYSIS_BUDGET_EXCEEDED"
+const f06fixTruncationCode = "E_ANALYSIS_BUDGET_EXCEEDED"
 
-func f06fixHasBudgetFailure(failures []PartialFailure) bool {
-	for _, failure := range failures {
-		if failure.Code == f06fixBudgetCode {
-			return true
-		}
-	}
-	return false
-}
-
-// TestF06FixCallerDeadlineWithoutBudgetIsAnError reproduces the HIGH finding.
-// Callers that never asked for truncation (no MaxDuration) but happen to run
-// under a context that carries a deadline -- a request timeout, an outer
+// TestF06FixCallerDeadlineIsAnError reproduces the HIGH finding. A caller that
+// runs under a context carrying a deadline -- a request timeout, an outer
 // errgroup, a parent CLI budget -- must not silently receive an incomplete
-// snapshot with a nil error. Truncation is opt-in.
-func TestF06FixCallerDeadlineWithoutBudgetIsAnError(t *testing.T) {
+// snapshot with a nil error when that deadline passes mid-build.
+func TestF06FixCallerDeadlineIsAnError(t *testing.T) {
 	repo := budgetBombRepo(t)
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	snapshot, err := BuildProviderSnapshotWithOptions(ctx, repo, "test", ProviderSnapshotOptions{})
 	if err == nil {
-		t.Fatalf("a caller deadline with no MaxDuration must surface as an error, got a snapshot with %d file(s) and failures %#v",
+		t.Fatalf("a caller deadline must surface as an error, got a snapshot with %d file(s) and failures %#v",
 			len(snapshot.Files), snapshot.Header.PartialFailures)
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("want context.DeadlineExceeded, got %v", err)
-	}
-}
-
-// TestF06FixOptedInBudgetStillTruncates is the other half of the split: a
-// caller that explicitly set MaxDuration did ask for a truncated result, and
-// still gets one.
-func TestF06FixOptedInBudgetStillTruncates(t *testing.T) {
-	repo := budgetBombRepo(t)
-
-	snapshot, err := BuildProviderSnapshotWithOptions(t.Context(), repo, "test", ProviderSnapshotOptions{MaxDuration: time.Second})
-	if err != nil {
-		t.Fatalf("an explicit MaxDuration must truncate, not fail: %v", err)
-	}
-	if !f06fixHasBudgetFailure(snapshot.Header.PartialFailures) {
-		t.Fatalf("explicit budget must report %s, got %#v", f06fixBudgetCode, snapshot.Header.PartialFailures)
 	}
 }
 
@@ -76,7 +51,7 @@ func TestF06FixRecordCacheWriterRejectsTruncatedSummary(t *testing.T) {
 	options := ProviderSnapshotOptions{Profile: ProfileFull}
 	summary := &SnapshotSummary{
 		RecordType:      "summary",
-		PartialFailures: []PartialFailure{analysisBudgetFailure(time.Second)},
+		PartialFailures: []PartialFailure{{Code: f06fixTruncationCode, Severity: "warning", EffectOnCompleteness: "snapshot truncated"}},
 	}
 	if err := storeProviderRecordsForTest(t.Context(), repo, "test", tree, "symbols", cacheDir, options, []byte("{}\n"), summary); err != nil {
 		t.Fatalf("store: %v", err)
@@ -86,29 +61,28 @@ func TestF06FixRecordCacheWriterRejectsTruncatedSummary(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	if hit {
-		t.Fatal("a budget-truncated record stream must never be persisted: a later unbudgeted query would serve it as the complete index")
+		t.Fatal("a truncated record stream must never be persisted: a later query would serve it as the complete index")
 	}
 }
 
-// TestF06FixSearchSnapshotCacheRejectsTruncated reproduces the HIGH finding on
-// the search/preindex path, which is the one the PR did not cover: it writes
-// through writeSearchSnapshot without ever looking at PartialFailures.
-func TestF06FixSearchSnapshotCacheRejectsTruncated(t *testing.T) {
+// TestF06FixSearchSnapshotPastCallerDeadlineCachesNothing pins the same
+// property on the search/preindex path: a build stopped by its caller's
+// deadline returns the context's error, and nothing it produced reaches the
+// tree-keyed cache, where every later query would be served it as complete.
+func TestF06FixSearchSnapshotPastCallerDeadlineCachesNothing(t *testing.T) {
 	repo := budgetBombRepo(t)
 	cacheDir := t.TempDir()
 
-	snapshot, _, err := LoadOrBuildProviderSnapshot(t.Context(), repo, "test", ProviderSnapshotOptions{
-		Profile:     ProfileFull,
-		MaxDuration: time.Second,
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	snapshot, _, err := LoadOrBuildProviderSnapshot(ctx, repo, "test", ProviderSnapshotOptions{
+		Profile: ProfileFull,
 	}, cacheDir, false)
-	if err != nil {
-		t.Fatalf("budgeted search build: %v", err)
-	}
-	if !f06fixHasBudgetFailure(snapshot.Header.PartialFailures) {
-		t.Fatalf("expected a truncated snapshot, got %#v", snapshot.Header.PartialFailures)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a search build past its caller's deadline must return context.DeadlineExceeded, got %v (snapshot with %d file(s))", err, len(snapshot.Files))
 	}
 	if n := f06fixCacheFileCount(t, cacheDir); n != 0 {
-		t.Fatalf("a budget-truncated search snapshot must not be cached, found %d file(s) under %s", n, cacheDir)
+		t.Fatalf("a search build stopped by its deadline must cache nothing, found %d file(s) under %s", n, cacheDir)
 	}
 }
 

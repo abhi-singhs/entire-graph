@@ -42,7 +42,7 @@ func TestTF142R15OverrideRelationsStopsMidScan(t *testing.T) {
 	visited := 0
 	stop := func() bool { visited++; return visited > 1 }
 	stopped := overrideRelations(relations, methodsByContainer, stop)
-	if visited > budgetPollStride*2 {
+	if visited > stopPollStride*2 {
 		t.Fatalf("overrideRelations polled shouldStop only %d times before stopping ('never' if this is 0): "+
 			"it must poll inside its own loop, not just rely on the caller's check before the call", visited)
 	}

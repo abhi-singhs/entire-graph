@@ -6,15 +6,14 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 )
 
 // nestedRelationBomb returns a JavaScript source of n nested function
 // declarations. Every enclosing function's body textually contains every inner
 // function's call sites and URL literals, so the relation phase does O(n^2)
 // work re-scanning them: 500 declarations in ~52 KB take tens of seconds and
-// emit ~386,000 relations. It is the smallest input that makes the missing
-// wall-clock ceiling observable in a test.
+// emit ~386,000 relations. It is the smallest input that keeps a build running
+// long enough for a cancellation or a caller's deadline to land mid-build.
 func nestedRelationBomb(n int) string {
 	var head, tail strings.Builder
 	head.WriteString("// nested relation bomb\n")
@@ -35,34 +34,9 @@ func budgetBombRepo(t *testing.T) string {
 	return repo
 }
 
-// TestStreamSnapshotExplicitBudgetTruncatesInsteadOfFailing pins the
-// degradation for an OPT-IN budget: MaxDuration expiry finishes the stream with
-// an E_ANALYSIS_BUDGET_EXCEEDED summary instead of aborting with no records and
-// no summary at all. A deadline the caller merely happens to be running under is
-// deliberately NOT treated this way -- see
-// TestF06FixCallerDeadlineWithoutBudgetIsAnError.
-func TestStreamSnapshotExplicitBudgetTruncatesInsteadOfFailing(t *testing.T) {
-	repo := budgetBombRepo(t)
-
-	var summary *SnapshotSummary
-	err := StreamSnapshot(t.Context(), repo, "test", ProviderSnapshotOptions{MaxDuration: time.Second}, func(record any) error {
-		if s, ok := record.(SnapshotSummary); ok {
-			s := s
-			summary = &s
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("an explicit budget must truncate, not fail: got %v", err)
-	}
-	if summary == nil || !hasBudgetFailure(summary.PartialFailures) {
-		t.Fatalf("an expired budget must report %s, got %#v", budgetFailureCode, summary)
-	}
-}
-
-// TestStreamSnapshotCanceledContextStillReturnsError pins the other half of the
-// split: a cancellation is an abort, not a budget. A half-finished snapshot is
-// not what an interrupted caller asked for, so it must still be an error.
+// TestStreamSnapshotCanceledContextStillReturnsError: a cancellation is an
+// abort. A half-finished snapshot is not what an interrupted caller asked for,
+// so it must be an error.
 func TestStreamSnapshotCanceledContextStillReturnsError(t *testing.T) {
 	repo := budgetBombRepo(t)
 
@@ -74,9 +48,9 @@ func TestStreamSnapshotCanceledContextStillReturnsError(t *testing.T) {
 	}
 }
 
-// TestStreamSnapshotWithoutBudgetIsUnchanged pins that the default (no
-// MaxDuration, no caller deadline) still produces a complete snapshot with no
-// budget failure, on a repository small enough to finish quickly.
+// TestStreamSnapshotWithoutBudgetIsUnchanged pins that the default (no caller
+// deadline, no cancellation) still produces a complete snapshot with no
+// truncation marker, on a repository small enough to finish quickly.
 func TestStreamSnapshotWithoutBudgetIsUnchanged(t *testing.T) {
 	repo := t.TempDir()
 	initRepo(t, repo)
