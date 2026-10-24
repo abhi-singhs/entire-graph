@@ -12,6 +12,25 @@ auto-generated notes on
 
 ## [Unreleased]
 
+### Changed
+
+- `neighbors` (with `--direction in` or `both`) and `impact` on a Go function or
+  method now disclose that references to it as a value are not modelled: being
+  assigned to a variable, passed as an argument, or stored in a struct field or
+  map creates no edge, so code that reaches the function only that way is missing
+  from its callers. JSON carries a `W_VALUE_REFERENCES_UNMODELLED` warning, and
+  agent and text output print one line beside the callers with a `grep` the
+  reader can run to find those references. A degenerate `impact` ("no callers")
+  keeps its marker line and prints the disclosure after it.
+
+### Fixed
+
+- A co-change history read that fails (for example on a partial clone whose
+  history needs a missing blob for rename detection) no longer drops every
+  `FILE_CHANGES_WITH` relation silently. The snapshot carries a
+  `W_COCHANGE_HISTORY_UNAVAILABLE` warning with Git's reason, and `impact`
+  reports co-change coupling as unknown instead of "No co-change coupling found".
+
 ## [0.5.0] - 2026-10-23
 
 ### Removed

@@ -220,7 +220,10 @@ func BeginProviderRecordsCache(ctx context.Context, repo, providerVersion, commi
 	}
 	transaction.repositoryKey = repoKey(ctx, absRepo)
 	if resolveProfile(options.Profile).emits("FILE_CHANGES_WITH") {
-		captured := &capturedFileCochanges{unavailable: true}
+		captured := &capturedFileCochanges{
+			unavailable: true,
+			reason:      "git metadata is not safe for Git subprocesses, so history was not read",
+		}
 		if safe {
 			pairs, historyErr := gitutil.FileCochanges(ctx, absRepo, commit, 256)
 			if ctx.Err() != nil {
@@ -228,6 +231,8 @@ func BeginProviderRecordsCache(ctx context.Context, repo, providerVersion, commi
 			}
 			if historyErr == nil {
 				captured = &capturedFileCochanges{pairs: pairs}
+			} else {
+				captured.reason = historyErr.Error()
 			}
 		}
 		transaction.options.historyCochanges = captured

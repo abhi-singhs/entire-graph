@@ -1046,6 +1046,17 @@ func selectiveSearchSnapshotFromFull(
 	if len(selective.unmergedDataFlowEdges) > 0 {
 		warnings = append(warnings, unmergedDataFlowEvidenceWarning(len(selective.unmergedDataFlowEdges)))
 	}
+	// The co-change edges filtered above came from the complete graph, so the view
+	// is missing them for the same reason it was, and a build of the view would say
+	// so in the same place.
+	if spec.name != ProfileSyntaxOnly && spec.emits("FILE_CHANGES_WITH") {
+		for _, warning := range full.Header.Warnings {
+			if warning.Code == CochangeHistoryUnavailableCode {
+				warnings = append(warnings, warning)
+				break
+			}
+		}
+	}
 	// The complete build already folded its relation-phase failures into these
 	// records (mergePartialFailures), so filtering them by file is the selective
 	// view's whole failure set: the filter itself resolves nothing and cannot fail.
@@ -1360,8 +1371,12 @@ func loadCachedSearchSnapshot(
 				refreshed = append(refreshed, relation)
 			}
 		}
-		history := fileChangesWithRelations(ctx, absRepo, commit, repositoryKey, cached.Snapshot.Files, &capturedFileCochanges{pairs: cochanges})
+		// The pairs were read just above, so this cannot report unavailable history.
+		history, _ := fileChangesWithRelations(ctx, absRepo, commit, repositoryKey, cached.Snapshot.Files, &capturedFileCochanges{pairs: cochanges})
 		refreshed = append(refreshed, history...)
+		// An entry built where history could not be read carries that warning; it no
+		// longer holds now that the history edges have been refreshed here.
+		cached.Snapshot.Header.Warnings = withoutWarningCode(cached.Snapshot.Header.Warnings, CochangeHistoryUnavailableCode)
 		sort.Slice(refreshed, func(i, j int) bool {
 			left, right := refreshed[i], refreshed[j]
 			return left.Type+left.FromID+left.ToID < right.Type+right.FromID+right.ToID
@@ -1380,6 +1395,24 @@ func loadCachedSearchSnapshot(
 		cached.Snapshot.Header.Completeness.Relations = counts
 	}
 	return cached, true
+}
+
+// withoutWarningCode returns warnings minus every warning with code, without
+// mutating the input. A nil or empty input is returned unchanged.
+func withoutWarningCode(warnings []ProviderWarning, code string) []ProviderWarning {
+	for index, warning := range warnings {
+		if warning.Code != code {
+			continue
+		}
+		kept := append([]ProviderWarning{}, warnings[:index]...)
+		for _, rest := range warnings[index+1:] {
+			if rest.Code != code {
+				kept = append(kept, rest)
+			}
+		}
+		return kept
+	}
+	return warnings
 }
 
 // rebindCachedSearchSnapshot adopts an entry, which may have been written from
