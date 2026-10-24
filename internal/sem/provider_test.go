@@ -6974,7 +6974,11 @@ func goRouteRegistrationsWithin(t *testing.T, content string) []goHTTPRouteRegis
 func goRouteSet(regs []goHTTPRouteRegistration) map[string]bool {
 	routes := map[string]bool{}
 	for _, reg := range regs {
-		routes[reg.Route+" -> "+reg.Handler] = true
+		key := reg.Route + " -> " + reg.Handler
+		if reg.Unplaced {
+			key += " [unplaced]"
+		}
+		routes[key] = true
 	}
 	return routes
 }

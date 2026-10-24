@@ -146,7 +146,8 @@ func TestCompletenessSignalsRespectDisplayFidelityAcrossFormats(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			end := strings.Count(tc.body, "\n")
 			result := sem.SearchResult{Rank: 1, Score: 20, FilePath: "payload.go", SymbolName: "payload", StartLine: 1, EndLine: end, SnippetStartLine: 1, SnippetEndLine: end, Snippet: tc.body, Signals: []string{sem.CompleteSymbolSignal}}
-			response := sem.SearchResponse{Query: "payload", Profile: "fast", Results: []sem.SearchResult{result}}
+			// A phrase query: a bare identifier takes the exact-name answer, which never certifies.
+			response := sem.SearchResponse{Query: "payload string body", Profile: "fast", Results: []sem.SearchResult{result}}
 			original, err := json.Marshal(response)
 			if err != nil {
 				t.Fatal(err)

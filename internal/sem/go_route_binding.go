@@ -64,6 +64,22 @@ import (
 // handler argument is unknown, and a ServeMux instance that escapes (the usual
 // way it reaches a StripPrefix elsewhere) is unknown too.
 //
+// Unplaced routers: a struct field this file shows holding a root router
+// (declared with a root router type or assigned a constructor, never a group),
+// a parameter of a mountable root type (*fiber.App, *chi.Mux), and a ServeMux
+// handed to code this file does not show (otelhttp.NewHandler(mux), a struct
+// literal) are served under a prefix that is not visible. Their routes are
+// emitted relative to the router and marked unplaced (ROUTE_PREFIX_UNRESOLVED,
+// lower confidence) rather than dropped. A chi or fiber router that escapes and
+// any router returned from its function stay unknown: that is the sub-router
+// factory idiom, mounted by the caller. StripPrefix, rewrite middleware or a
+// Mount on a router field makes the field unknown.
+//
+// Route and prefix arguments resolve identifiers lexically (constantsFor): a
+// parameter or local is unknown, a local string const resolves, and only
+// names no function scope declares reach package-level consts and
+// never-reassigned package vars.
+//
 // KNOWN LIMITATIONS: a parameter of an unclassified local type, or of a
 // framework root type (*http.ServeMux, *gin.Engine, *echo.Echo), keeps the
 // root heuristic: a StripPrefix in its caller is not visible. A gin, echo,
@@ -111,6 +127,14 @@ type goRouteBinding struct {
 	// closure is present only for a provably local function literal. Aliases
 	// copy the descriptor; an ordinary assignment replaces it.
 	closure *goRouteClosureEffect
+	// local marks a binding declared inside a function (a parameter, a local
+	// variable or constant, a range or type-switch name). Its identifier
+	// shadows any package-level constant of the same name, so a route or
+	// prefix argument that reads it is not a static string unless it is a
+	// local constant (isConst, with constValue). A write keeps local.
+	local      bool
+	isConst    bool
+	constValue string
 }
 
 // goRouteOrigin is one router instance created by a constructor call. Every
@@ -133,7 +157,16 @@ type goRouteOrigin struct {
 	// router is not also mounted, so its escapes to read-only helpers (route
 	// docs, walkers, test requests) do not make it unknown.
 	served bool
-	region int
+	// unplaced: where this instance is served is not visible from this file
+	// by construction (a struct field holding a router, a parameter of a
+	// mountable root type, an instance handed to code that may serve it), but
+	// it is not known to be rewritten either. Its routes are emitted relative
+	// to the instance with a prefix-unresolved marker.
+	unplaced bool
+	// returned: the instance itself is returned from its function, so its
+	// caller decides where it is served: its routes stay omitted.
+	returned bool
+	region   int
 	// mounts counts in-file Mount calls with a composable prefix; the prefix
 	// is mountPrefix under mountParent (nil for a root).
 	mounts      int
@@ -141,26 +174,50 @@ type goRouteOrigin struct {
 	mountPrefix string
 }
 
-// prefix is the path the instance is served under.
+// prefix is the path the instance is served under, when that is fully
+// visible in this file.
 func (o *goRouteOrigin) prefix(depth int) (string, bool) {
-	if o.opaque || (o.mountable && o.escaped && !o.served) || o.mounts > 1 || (o.served && o.mounts > 0) || depth > 16 {
-		return "", false
+	base, placed, ok := o.place(depth)
+	return base, ok && placed
+}
+
+// place is the path the instance is served under. placed is false when an
+// unknown prefix may precede it (the instance, or one it is mounted into, is
+// unplaced); ok is false when even its own part cannot be stated (rewritten,
+// mounted more than once, or a mountable instance whose escape may mount it).
+func (o *goRouteOrigin) place(depth int) (string, bool, bool) {
+	if o.opaque || o.mounts > 1 || (o.served && o.mounts > 0) || depth > 16 {
+		return "", false, false
+	}
+	placed := !o.unplaced
+	if o.mountable && o.escaped && !o.served {
+		// Handed to code this file does not show. A chi or fiber router
+		// that escapes is the sub-router idiom (its receiver mounts it), a
+		// router returned from its function is a factory result whose caller
+		// may mount or strip it, and one this file also mounts may be served
+		// twice: all unknown. A ServeMux handed to a wrapper (otelhttp,
+		// recovery, a struct field) is served through it, under a prefix
+		// this file does not show: its own part is stated with that open.
+		if o.mounts > 0 || o.returned || goRouteMountStrips[o.framework] {
+			return "", false, false
+		}
+		placed = false
 	}
 	if o.mounts == 0 {
-		return "", true
+		return "", placed, true
 	}
 	base := ""
 	if o.mountParent != nil {
-		parent, ok := o.mountParent.prefix(depth + 1)
+		parent, parentPlaced, ok := o.mountParent.place(depth + 1)
 		if !ok {
-			return "", false
+			return "", false, false
 		}
-		base = parent
+		base, placed = parent, placed && parentPlaced
 	}
 	if len(base)+len(o.mountPrefix) > goRouteMaxPrefixBytes {
-		return "", false
+		return "", false, false
 	}
-	return goRouteJoin(o.framework, base, o.mountPrefix), true
+	return goRouteJoin(o.framework, base, o.mountPrefix), placed, true
 }
 
 var goRouteUnknownBinding = goRouteBinding{kind: goRouteUnknown}
@@ -217,6 +274,9 @@ type goRouteClosureEffect struct {
 	creationCallback *ast.FuncLit
 	escaped          bool
 	applying         bool
+	// rewrites: some write carries rewrite-middleware evidence. Only such a
+	// descriptor seeds a branch join (visibleClosureRewriteTargets).
+	rewrites bool
 }
 
 type goRouteClosureRewriteTarget struct {
@@ -346,6 +406,28 @@ type goRouteResolver struct {
 	imports    map[string]string
 	log        []goRouteWrite
 	groupNames map[string]bool
+	// pkgStrings are the static string values of package-level constants and
+	// never-reassigned package variables: the only names a route or prefix
+	// argument may resolve without a local binding.
+	pkgStrings map[string]string
+	// boundNames are every name this file declares or assigns anywhere. A
+	// name outside it can only come from the caller's constant table.
+	boundNames map[string]bool
+	// stripParams: per same-file function name (methods by name, merged),
+	// the parameters it hands to http.StripPrefix as the handler, directly or
+	// through another such function. stripFactories name functions that build
+	// such a middleware closure. stripLits caches the answer per closure.
+	// routerFields: struct field names this file shows holding a root
+	// router (declared with a router type or assigned a constructor), with
+	// their framework; fieldOrigins is this walk's instance per field name
+	// (every receiver's field of that name shares it, conservatively).
+	routerFields map[string]string
+	fieldOrigins map[string]*goRouteOrigin
+	// returnIdents are identifiers returned as a whole result.
+	returnIdents   map[*ast.Ident]bool
+	stripParams    map[string][]bool
+	stripFactories map[string]bool
+	stripLits      map[*ast.FuncLit]bool
 	// pkgWritten collects package variables assigned from inside a function.
 	pkgWritten map[string]bool
 	pkgUnknown map[string]bool
@@ -409,6 +491,11 @@ type goRouteResolver struct {
 	safeClosureUses       map[*ast.Ident]bool
 	closureCollector      *goRouteClosureEffect
 	asyncClosureCall      bool
+	// rewriteClosureNames are the names ever bound in this walk to a closure
+	// descriptor with rewrite writes. A branch looks only these up, instead of
+	// scanning every visible binding (100k package variables made each branch
+	// that scan, and a large file exhausted its budget).
+	rewriteClosureNames map[string]bool
 	// Callback-local writes are undone after analysis, but a descriptor defined
 	// outside that callback can write an outer binding directly. Its invocation
 	// must therefore retain MAY evidence through the conservative escape path.
@@ -473,6 +560,7 @@ func (r *goRouteResolver) read(binding *goRouteBinding) goRouteBinding {
 		value.stripPrefixJoins = before.stripPrefixJoins
 		value.stripPrefixSource = before.stripPrefixSource
 		value.closure = before.closure
+		value.local = before.local
 	}
 	if r.escapedStripPrefixWrites[binding] {
 		value.stripPrefixMiddleware = true
@@ -505,6 +593,10 @@ func (r *goRouteResolver) resolve() (ok bool) {
 		}
 	}()
 	r.computeSafe()
+	r.computeRouterFields()
+	r.computeStripHelpers()
+	r.pkgStrings = r.packageStrings()
+	r.boundNames = r.fileBoundNames()
 	r.pkgWritten = map[string]bool{}
 	r.collecting = true
 	r.walkFile()
@@ -538,6 +630,7 @@ func (r *goRouteResolver) taintParams() {
 				continue
 			}
 			bad := r.paramValueUse[key.fn]
+			unplaced := false
 			args := r.paramArgs[key]
 			if key.recv != "" {
 				// Method calls whose receiver type is not visible may reach
@@ -546,16 +639,36 @@ func (r *goRouteResolver) taintParams() {
 			}
 			for _, arg := range args {
 				r.step(1)
-				if !goRouteIsServedRoot(arg) {
+				switch {
+				case goRouteIsServedRoot(arg):
+				case goRouteIsUnplacedRoot(arg):
+					// The caller's own router is served somewhere this file
+					// does not show: so is the parameter.
+					unplaced = true
+				default:
 					bad = true
 				}
 			}
-			if bad {
+			switch {
+			case bad:
 				origin.opaque = true
+				changed = true
+			case unplaced && !origin.unplaced:
+				origin.unplaced = true
 				changed = true
 			}
 		}
 	}
+}
+
+// goRouteIsUnplacedRoot reports a known router value with no prefix of its
+// own whose instance is served under a prefix this file does not show.
+func goRouteIsUnplacedRoot(value goRouteBinding) bool {
+	if value.kind != goRouteKnown || value.prefix != "" || value.origin == nil {
+		return false
+	}
+	base, placed, ok := value.origin.place(0)
+	return ok && !placed && base == ""
 }
 
 // goRouteIsServedRoot reports a known router value with no prefix whose
@@ -575,6 +688,7 @@ func (r *goRouteResolver) walkFile() {
 	r.uses = map[int]goRouteBinding{}
 	r.regs = r.regs[:0]
 	r.origins = map[token.Pos]*goRouteOrigin{}
+	r.fieldOrigins = map[string]*goRouteOrigin{}
 	r.paramOrigins = map[goRouteParamKey]*goRouteOrigin{}
 	r.paramArgs = map[goRouteParamKey][]goRouteBinding{}
 	r.escaped = map[*goRouteBinding]bool{}
@@ -584,6 +698,7 @@ func (r *goRouteResolver) walkFile() {
 	r.localClosureLits = map[*ast.FuncLit]bool{}
 	r.immediateClosureLits = map[*ast.FuncLit]bool{}
 	r.closureEffects = map[*ast.FuncLit]*goRouteClosureEffect{}
+	r.rewriteClosureNames = map[string]bool{}
 	r.safeClosureUses = map[*ast.Ident]bool{}
 	r.closureCollector = nil
 	r.asyncClosureCall = false
@@ -722,10 +837,12 @@ func (r *goRouteResolver) noteGroup(name string, binding goRouteBinding) {
 }
 
 func (r *goRouteResolver) set(name string, binding *goRouteBinding, value goRouteBinding) {
+	r.noteRewriteClosure(name, value)
 	r.log = append(r.log, goRouteWrite{binding: binding, old: *binding})
-	clientType := binding.httpClientType
+	clientType, local := binding.httpClientType, binding.local
 	*binding = value
 	binding.httpClientType = clientType
+	binding.local = local
 	if clientType {
 		binding.httpClient = true
 	}
@@ -1071,6 +1188,8 @@ func (r *goRouteResolver) declare(scope *goRouteScope, name string, value goRout
 		value = goRouteUnknownBinding
 	}
 	binding := value
+	binding.local = true
+	r.noteRewriteClosure(name, value)
 	scope.vars[name] = &binding
 	r.noteGroup(name, value)
 }
@@ -1108,9 +1227,15 @@ func (r *goRouteResolver) groupValue(expr ast.Expr, lookup goRouteLookup) goRout
 	case *ast.ParenExpr:
 		return r.groupValue(expr.X, lookup)
 	case *ast.FuncLit:
-		return goRouteBinding{kind: goRouteUnknown, closure: r.closureEffects[expr]}
+		// A middleware closure that hands its handler to http.StripPrefix
+		// rewrites the path before the router sees it.
+		return goRouteBinding{kind: goRouteUnknown, closure: r.closureEffects[expr], stripPrefixMiddleware: r.funcLitStrips(expr)}
 	case *ast.Ident:
-		value, _ := lookup(expr.Name)
+		value, declared := lookup(expr.Name)
+		if !declared && goRouteAnyTrue(r.stripParams[expr.Name]) {
+			// A same-file middleware function that strips its handler's prefix.
+			value.stripPrefixMiddleware = true
+		}
 		return value
 	case *ast.CallExpr:
 		if r.isStripPrefixMiddlewareCall(expr, lookup) {
@@ -1119,6 +1244,12 @@ func (r *goRouteResolver) groupValue(expr ast.Expr, lookup goRouteLookup) goRout
 		if fun, ok := expr.Fun.(*ast.Ident); ok && fun.Name == "new" && len(expr.Args) == 1 && !expr.Ellipsis.IsValid() {
 			if _, declared := lookup(fun.Name); !declared && r.isHTTPClientType(expr.Args[0]) {
 				return goRouteBinding{kind: goRouteUnknown, httpClient: true, httpClientType: true}
+			}
+		}
+		if fun, ok := goRouteUnparen(expr.Fun).(*ast.Ident); ok && r.stripFactories[fun.Name] {
+			if _, declared := lookup(fun.Name); !declared {
+				// A same-file constructor of a StripPrefix middleware.
+				return goRouteBinding{kind: goRouteUnknown, stripPrefixMiddleware: true}
 			}
 		}
 		selector, ok := expr.Fun.(*ast.SelectorExpr)
@@ -1150,10 +1281,12 @@ func (r *goRouteResolver) groupValue(expr ast.Expr, lookup goRouteLookup) goRout
 		switch receiver := selector.X.(type) {
 		case *ast.Ident:
 			parent, _ = lookup(receiver.Name)
-		case *ast.CallExpr, *ast.ParenExpr:
+		case *ast.CallExpr, *ast.ParenExpr, *ast.SelectorExpr:
+			// A field receiver (s.mux.Group) is a router only when this file
+			// shows the field holds one (fieldValue).
 			parent = r.groupValue(receiver, lookup)
 		default:
-			// A field or index receiver (s.api.Group) may hold any prefix.
+			// An index receiver may hold any prefix.
 			return goRouteUnknownBinding
 		}
 		switch {
@@ -1176,10 +1309,11 @@ func (r *goRouteResolver) groupValue(expr ast.Expr, lookup goRouteLookup) goRout
 			return goRouteUnknownBinding
 		}
 		argument := r.text(expr.Args[0])
-		prefix, ok := goRouteLiteral(parent.framework, argument, r.constants)
+		constants := r.constantsFor(expr.Args[0], lookup)
+		prefix, ok := goRouteLiteral(parent.framework, argument, constants)
 		if !ok {
 			// Group("") is the parent itself: a known empty prefix, not unknown.
-			if value, isStatic := staticStringExpressionValue(argument, r.constants); isStatic && value == "" {
+			if value, isStatic := staticStringExpressionValue(argument, constants); isStatic && value == "" {
 				prefix, ok = "", true
 			}
 		}
@@ -1209,6 +1343,9 @@ func (r *goRouteResolver) groupValue(expr ast.Expr, lookup goRouteLookup) goRout
 			if _, declared := lookup(pkg.Name); !declared && r.framework(pkg.Name) == "http" {
 				return goRouteBinding{kind: goRouteUnknown, httpClient: true, httpClientType: true}
 			}
+		}
+		if origin := r.fieldOrigin(expr, lookup); origin != nil {
+			return goRouteBinding{kind: goRouteKnown, origin: origin, framework: origin.framework}
 		}
 		// A value read from a field or package whose router prefix this pass
 		// does not follow.
@@ -1255,6 +1392,9 @@ func (r *goRouteResolver) walkFunc(recv *ast.FieldList, typ *ast.FuncType, body 
 					// A framework-root-typed parameter: its callers in this file
 					// decide whether it is really served at the root.
 					declared.origin = r.paramOriginAt(goRouteParamKey{recv: r.paramRecv, fn: fn, index: index}, value.framework)
+					if value.origin != nil && value.origin.unplaced {
+						declared.origin.unplaced = true
+					}
 				}
 				r.declare(scope, name.Name, declared)
 				index++
@@ -1287,7 +1427,14 @@ func (r *goRouteResolver) walkStmt(stmt ast.Stmt, scope *goRouteScope) {
 		r.assign(stmt, scope)
 	case *ast.DeclStmt:
 		gen, ok := stmt.Decl.(*ast.GenDecl)
-		if !ok || gen.Tok != token.VAR {
+		if !ok {
+			return
+		}
+		if gen.Tok == token.CONST {
+			r.declareConsts(gen, scope)
+			return
+		}
+		if gen.Tok != token.VAR {
 			return
 		}
 		for _, spec := range gen.Specs {
@@ -1468,41 +1615,55 @@ func (r *goRouteResolver) clauses(scope *goRouteScope, body *ast.BlockStmt, bind
 // local closure descriptor may write with rewrite middleware. Lexical names
 // are considered only once so a shadowed outer descriptor cannot seed a join;
 // value aliases of the same descriptor are deduplicated by effect identity.
+//
+// Only names ever bound to a descriptor with rewrite writes can contribute,
+// and the visible binding of a name is its lexical lookup, so each of those
+// names is looked up instead of scanning every binding of every scope.
 func (r *goRouteResolver) visibleClosureRewriteTargets(scope *goRouteScope) []goRouteClosureRewriteTarget {
-	if len(r.closureEffects) == 0 {
+	if len(r.rewriteClosureNames) == 0 {
 		return nil
 	}
-	seenNames := map[string]bool{}
 	seenEffects := map[*goRouteClosureEffect]bool{}
 	seenTargets := map[*goRouteBinding]bool{}
 	var targets []goRouteClosureRewriteTarget
-	for current := scope; current != nil; current = current.parent {
-		for name, binding := range current.vars {
+	for name := range r.rewriteClosureNames {
+		r.step(1)
+		binding := r.lookup(scope, name)
+		if binding == nil {
+			continue
+		}
+		effect := binding.closure
+		if effect == nil || seenEffects[effect] {
+			continue
+		}
+		seenEffects[effect] = true
+		for _, write := range effect.writes {
 			r.step(1)
-			if seenNames[name] {
+			if !goRouteRewriteValue(write.value) {
 				continue
 			}
-			seenNames[name] = true
-			effect := binding.closure
-			if effect == nil || seenEffects[effect] {
+			target := write.target
+			if target == nil || seenTargets[target] {
 				continue
 			}
-			seenEffects[effect] = true
-			for _, write := range effect.writes {
-				r.step(1)
-				if !write.value.stripPrefixMiddleware && write.value.stripPrefixSource == nil && len(write.value.stripPrefixJoins) == 0 {
-					continue
-				}
-				target := write.target
-				if target == nil || seenTargets[target] {
-					continue
-				}
-				seenTargets[target] = true
-				targets = append(targets, goRouteClosureRewriteTarget{name: write.name, binding: target})
-			}
+			seenTargets[target] = true
+			targets = append(targets, goRouteClosureRewriteTarget{name: write.name, binding: target})
 		}
 	}
 	return targets
+}
+
+// goRouteRewriteValue reports a value carrying rewrite-middleware evidence.
+func goRouteRewriteValue(value goRouteBinding) bool {
+	return value.stripPrefixMiddleware || value.stripPrefixSource != nil || len(value.stripPrefixJoins) > 0
+}
+
+// noteRewriteClosure records name when value is a closure descriptor with a
+// rewrite write, so visibleClosureRewriteTargets considers it.
+func (r *goRouteResolver) noteRewriteClosure(name string, value goRouteBinding) {
+	if value.closure != nil && value.closure.rewrites {
+		r.rewriteClosureNames[name] = true
+	}
 }
 
 // branches walks code that may run zero, one, or many times, or instead of a
@@ -1792,6 +1953,7 @@ func (r *goRouteResolver) expr(expr ast.Expr, scope *goRouteScope) {
 			r.noteCall(node, scope)
 			r.noteMount(node, scope)
 			r.noteStripPrefix(node, scope)
+			r.noteStripHelper(node, scope)
 			r.noteUseStripPrefix(node, scope)
 			r.noteServe(node, scope)
 			r.noteParamArgs(node, scope)
@@ -1827,6 +1989,9 @@ func (r *goRouteResolver) expr(expr ast.Expr, scope *goRouteScope) {
 				// The router itself is passed, returned or stored: whoever
 				// receives it may mount it under a prefix.
 				value.origin.escaped = true
+				if r.returnIdents[node] {
+					value.origin.returned = true
+				}
 			}
 		}
 		return true
@@ -1847,6 +2012,7 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 		joins []*goRouteRewriteJoin
 	}
 	var captures []rewriteCapture
+	proxies := map[string]*goRouteBinding{}
 	deferred := seed == nil && goRouteLocalClosureEligible(lit) &&
 		(r.localClosureLits[lit] || r.immediateClosureLits[lit])
 	var effect *goRouteClosureEffect
@@ -1879,6 +2045,7 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 		unknown.closure = binding.closure
 		unknown.httpClientType = binding.httpClientType
 		unknown.httpClient = binding.httpClientType
+		unknown.local = binding.local
 		// Preserve the exact lexical binding. A later escaped write to this
 		// binding must remain visible even when its current value points farther
 		// outward through another captured source.
@@ -1891,6 +2058,7 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 		r.closureCaptureTargets[proxy] = captureTarget
 		closureScope.vars[name] = proxy
 		captures = append(captures, rewriteCapture{name: name, outer: binding, proxy: proxy})
+		proxies[name] = proxy
 	}
 	mark := len(r.log)
 	savedRegion := r.region
@@ -1927,6 +2095,9 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 				effect.writes = append(effect.writes, goRouteClosureWrite{
 					name: capture.name, target: capture.outer, value: capture.value,
 				})
+				if goRouteRewriteValue(capture.value) {
+					effect.rewrites = true
+				}
 			}
 		}
 		r.markNames(scope, written, false)
@@ -1977,6 +2148,52 @@ func (r *goRouteResolver) funcLit(lit *ast.FuncLit, scope *goRouteScope, seed *g
 	for name := range r.addressedNames(lit) {
 		r.escape(scope, name)
 	}
+}
+
+// closureDeclaredNames lists every name the closure (or a closure nested in
+// it) declares: parameters, results, := targets and var specs.
+func (r *goRouteResolver) closureDeclaredNames(lit *ast.FuncLit) map[string]bool {
+	declared := map[string]bool{}
+	noteFields := func(fields *ast.FieldList) {
+		if fields == nil {
+			return
+		}
+		for _, field := range fields.List {
+			for _, name := range field.Names {
+				declared[name.Name] = true
+			}
+		}
+	}
+	ast.Inspect(lit, func(n ast.Node) bool {
+		r.step(1)
+		switch n := n.(type) {
+		case *ast.FuncType:
+			noteFields(n.Params)
+			noteFields(n.Results)
+		case *ast.AssignStmt:
+			if n.Tok == token.DEFINE {
+				for _, target := range n.Lhs {
+					if ident, ok := target.(*ast.Ident); ok {
+						declared[ident.Name] = true
+					}
+				}
+			}
+		case *ast.RangeStmt:
+			if n.Tok == token.DEFINE {
+				for _, target := range []ast.Expr{n.Key, n.Value} {
+					if ident, ok := target.(*ast.Ident); ok {
+						declared[ident.Name] = true
+					}
+				}
+			}
+		case *ast.ValueSpec:
+			for _, name := range n.Names {
+				declared[name.Name] = true
+			}
+		}
+		return true
+	})
+	return declared
 }
 
 // escape records that name's address was taken: its binding is unknown for
@@ -2358,6 +2575,13 @@ func (r *goRouteResolver) typeValue(expr ast.Expr) goRouteBinding {
 		if ok && goRouteRootTypes[r.framework(pkg.Name)+"."+expr.Sel.Name] {
 			return goRouteBinding{kind: goRouteKnown, framework: r.framework(pkg.Name)}
 		}
+		if ok && goRouteUnplacedRootTypes[r.framework(pkg.Name)+"."+expr.Sel.Name] {
+			// A root router of a framework that mounts routers (*fiber.App,
+			// *chi.Mux): the instance is a root, where it is served is not
+			// visible from its type.
+			framework := r.framework(pkg.Name)
+			return goRouteBinding{kind: goRouteKnown, framework: framework, origin: &goRouteOrigin{framework: framework, unplaced: true, region: r.region}}
+		}
 		// A framework group or sub-router type, or another package's type.
 		return goRouteUnknownBinding
 	case *ast.Ellipsis, *ast.IndexExpr, *ast.IndexListExpr:
@@ -2408,6 +2632,15 @@ func (r *goRouteResolver) noteMount(call *ast.CallExpr, scope *goRouteScope) {
 	if !ok || selector.Sel.Name != "Mount" || len(call.Args) != 2 || call.Ellipsis.IsValid() {
 		return
 	}
+	lookup := r.lookupIn(scope)
+	if field, ok := goRouteUnparen(call.Args[1]).(*ast.SelectorExpr); ok {
+		// A router field mounted here is served under a prefix composed
+		// from a parent this pass does not tie to the field: unknown.
+		if origin := r.fieldOrigin(field, lookup); origin != nil {
+			origin.opaque = true
+		}
+		return
+	}
 	ident, ok := goRouteUnparen(call.Args[1]).(*ast.Ident)
 	if !ok {
 		// Wrappers may preserve or change placement; never publish the nested
@@ -2440,7 +2673,6 @@ func (r *goRouteResolver) noteMount(call *ast.CallExpr, scope *goRouteScope) {
 		ast.Inspect(argument, inspect)
 		return
 	}
-	lookup := r.lookupIn(scope)
 	sub, _ := lookup(ident.Name)
 	origin := sub.origin
 	if origin == nil {
@@ -2453,7 +2685,7 @@ func (r *goRouteResolver) noteMount(call *ast.CallExpr, scope *goRouteScope) {
 		return
 	}
 	parent := r.groupValue(selector.X, lookup)
-	prefix, ok := goRouteLiteral(origin.framework, r.text(call.Args[0]), r.constants)
+	prefix, ok := goRouteLiteral(origin.framework, r.text(call.Args[0]), r.constantsFor(call.Args[0], lookup))
 	if !ok || parent.kind == goRouteUnknown {
 		origin.opaque = true
 		return
@@ -2478,10 +2710,17 @@ func (r *goRouteResolver) computeSafe() {
 		}
 	}
 	r.computeParamFacts()
+	r.returnIdents = map[*ast.Ident]bool{}
 	called := map[*ast.SelectorExpr]bool{}
 	ast.Inspect(r.file, func(n ast.Node) bool {
 		r.step(1)
 		switch n := n.(type) {
+		case *ast.ReturnStmt:
+			for _, result := range n.Results {
+				if ident, ok := goRouteUnparen(result).(*ast.Ident); ok {
+					r.returnIdents[ident] = true
+				}
+			}
 		case *ast.CallExpr:
 			if fun, ok := n.Fun.(*ast.Ident); ok && !n.Ellipsis.IsValid() {
 				// A same-file helper that only calls methods on a parameter
@@ -2570,12 +2809,12 @@ func (r *goRouteResolver) subrouterValue(call *ast.CallExpr, selector *ast.Selec
 	switch receiver := prefixSelector.X.(type) {
 	case *ast.Ident:
 		parent, _ = lookup(receiver.Name)
-	case *ast.CallExpr, *ast.ParenExpr:
+	case *ast.CallExpr, *ast.ParenExpr, *ast.SelectorExpr:
 		parent = r.groupValue(receiver, lookup)
 	default:
 		return goRouteUnknownBinding
 	}
-	prefix, ok := goRouteLiteral("mux", r.text(pathPrefix.Args[0]), r.constants)
+	prefix, ok := goRouteLiteral("mux", r.text(pathPrefix.Args[0]), r.constantsFor(pathPrefix.Args[0], lookup))
 	if !ok || parent.kind == goRouteUnknown {
 		return goRouteUnknownBinding
 	}
@@ -2610,17 +2849,7 @@ func (r *goRouteResolver) noteStripPrefix(call *ast.CallExpr, scope *goRouteScop
 	if !ok || selector.Sel.Name != "StripPrefix" || len(call.Args) != 2 {
 		return
 	}
-	ast.Inspect(call.Args[1], func(n ast.Node) bool {
-		r.step(1)
-		ident, ok := n.(*ast.Ident)
-		if !ok {
-			return true
-		}
-		if binding := r.lookup(scope, ident.Name); binding != nil && binding.origin != nil {
-			binding.origin.opaque = true
-		}
-		return true
-	})
+	r.makeOpaqueIn(call.Args[1], scope)
 }
 
 // inPackageConstructorValue recognizes a framework's own constructor called
@@ -2807,6 +3036,9 @@ func (r *goRouteResolver) computeParamFacts() {
 	r.paramValueUse = map[string]bool{}
 	r.readOnlyParams = map[string][]bool{}
 	declNames := map[*ast.Ident]bool{}
+	// rootParamMethods are the methods among rootParamFuncs: only they can be
+	// named by a selector's Sel (a method value `s.register`).
+	rootParamMethods := map[string]bool{}
 	for _, decl := range r.file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Body == nil {
@@ -2817,6 +3049,9 @@ func (r *goRouteResolver) computeParamFacts() {
 		for _, field := range fn.Type.Params.List {
 			if r.typeValue(field.Type).kind == goRouteKnown {
 				r.rootParamFuncs[fn.Name.Name] = true
+				if fn.Recv != nil {
+					rootParamMethods[fn.Name.Name] = true
+				}
 			}
 			if len(field.Names) == 0 {
 				names = append(names, nil)
@@ -2838,19 +3073,45 @@ func (r *goRouteResolver) computeParamFacts() {
 		r.readOnlyParams[fn.Name.Name] = readOnly
 	}
 	calledIdents := map[*ast.Ident]bool{}
+	// selIdents are selector Sels; notValues are names that never denote a
+	// package-level function: field and parameter names, and composite-literal
+	// keys (a struct field name; a function is not comparable, so never a map key).
+	selIdents := map[*ast.Ident]bool{}
+	notValues := map[*ast.Ident]bool{}
 	ast.Inspect(r.file, func(n ast.Node) bool {
 		r.step(1)
-		if call, ok := n.(*ast.CallExpr); ok {
-			switch fun := call.Fun.(type) {
+		switch n := n.(type) {
+		case *ast.CallExpr:
+			switch fun := n.Fun.(type) {
 			case *ast.Ident:
 				calledIdents[fun] = true
 			case *ast.SelectorExpr:
 				calledIdents[fun.Sel] = true
 			}
+		case *ast.SelectorExpr:
+			selIdents[n.Sel] = true
+		case *ast.Field:
+			for _, name := range n.Names {
+				notValues[name] = true
+			}
+		case *ast.CompositeLit:
+			for _, element := range n.Elts {
+				if pair, ok := element.(*ast.KeyValueExpr); ok {
+					if key, ok := pair.Key.(*ast.Ident); ok {
+						notValues[key] = true
+					}
+				}
+			}
 		}
-		if ident, ok := n.(*ast.Ident); ok && r.rootParamFuncs[ident.Name] && !calledIdents[ident] && !declNames[ident] {
-			r.paramValueUse[ident.Name] = true
+		ident, ok := n.(*ast.Ident)
+		if !ok || !r.rootParamFuncs[ident.Name] || calledIdents[ident] || declNames[ident] || notValues[ident] {
+			return true
 		}
+		if selIdents[ident] && !rootParamMethods[ident.Name] {
+			// A field or another package's name that only shares the spelling.
+			return true
+		}
+		r.paramValueUse[ident.Name] = true
 		return true
 	})
 }
@@ -2950,5 +3211,529 @@ func (r *goRouteResolver) noteUseStripPrefix(call *ast.CallExpr, scope *goRouteS
 			continue
 		}
 		r.observeStripPrefixValue(middleware, router.origin, true)
+	}
+}
+
+// declareConsts binds a function-local const declaration. A static string
+// constant resolves inside its scope; any other constant (a number, an iota
+// repetition, a value from another package) is a local that shadows a
+// package-level constant of the same name, so it is not a static route.
+func (r *goRouteResolver) declareConsts(gen *ast.GenDecl, scope *goRouteScope) {
+	for _, spec := range gen.Specs {
+		valueSpec, ok := spec.(*ast.ValueSpec)
+		if !ok {
+			continue
+		}
+		values := make([]goRouteBinding, len(valueSpec.Names))
+		if len(valueSpec.Values) == len(valueSpec.Names) {
+			lookup := r.lookupIn(scope)
+			for i, value := range valueSpec.Values {
+				if text, ok := staticStringExpressionValue(r.text(value), r.constantsFor(value, lookup)); ok {
+					values[i] = goRouteBinding{isConst: true, constValue: text}
+				}
+			}
+		}
+		for i, name := range valueSpec.Names {
+			r.declare(scope, name.Name, values[i])
+		}
+	}
+}
+
+// constantsFor is the constant table a route or prefix argument may use: each
+// identifier it reads resolves through the lexical scope at that point. A
+// parameter or local variable is not static (it is absent, so the argument is
+// unknown); a local string constant has its value; only a name no function
+// scope declares reaches the package-level constants and variables.
+func (r *goRouteResolver) constantsFor(expr ast.Expr, lookup goRouteLookup) map[string]string {
+	constants := map[string]string{}
+	var visit func(node ast.Node) bool
+	visit = func(node ast.Node) bool {
+		r.step(1)
+		switch node := node.(type) {
+		case *ast.SelectorExpr:
+			// pkg.Name or value.Field: only the base can be a variable.
+			ast.Inspect(node.X, visit)
+			return false
+		case *ast.FuncLit:
+			return false
+		case *ast.Ident:
+			binding, declared := lookup(node.Name)
+			if declared && binding.local {
+				if binding.isConst {
+					constants[node.Name] = binding.constValue
+				}
+				return false
+			}
+			if value, ok := r.pkgStrings[node.Name]; ok {
+				constants[node.Name] = value
+			} else if value, ok := r.constants[node.Name]; ok && !declared && !r.boundNames[node.Name] {
+				// Declared nowhere in this file: the caller's table is the only
+				// source, and no binding here can shadow it.
+				constants[node.Name] = value
+			}
+		}
+		return true
+	}
+	ast.Inspect(expr, visit)
+	return constants
+}
+
+// packageStrings evaluates the static string values of package-level const
+// and var declarations in this file. A variable assigned or addressed
+// anywhere in the file (by name, ignoring shadowing) may hold another value
+// at any call, so it is left out; so is a name declared more than once.
+func (r *goRouteResolver) packageStrings() map[string]string {
+	exprs := map[string]ast.Expr{}
+	skip := map[string]bool{}
+	vars := map[string]bool{}
+	for _, decl := range r.file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || (gen.Tok != token.CONST && gen.Tok != token.VAR) {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			valueSpec, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for i, name := range valueSpec.Names {
+				if _, seen := exprs[name.Name]; seen || len(valueSpec.Values) != len(valueSpec.Names) {
+					skip[name.Name] = true
+					continue
+				}
+				exprs[name.Name] = valueSpec.Values[i]
+				if gen.Tok == token.VAR {
+					vars[name.Name] = true
+				}
+			}
+		}
+	}
+	if len(vars) > 0 {
+		// This is a whole-file scan: package declarations are inside the
+		// subtree too. The closure-capture filter would exclude every write.
+		for name := range r.collectWrittenNames(r.file, true) {
+			if vars[name] {
+				skip[name] = true
+			}
+		}
+	}
+	values := map[string]string{}
+	for round := 0; round < 8; round++ {
+		changed := false
+		for name, expr := range exprs {
+			r.step(1)
+			if skip[name] {
+				continue
+			}
+			if _, done := values[name]; done {
+				continue
+			}
+			if value, ok := staticStringExpressionValue(r.text(expr), values); ok {
+				values[name] = value
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	return values
+}
+
+// fileBoundNames lists every name the file binds: declarations, parameters,
+// results, fields, range and assignment targets.
+func (r *goRouteResolver) fileBoundNames() map[string]bool {
+	names := map[string]bool{}
+	add := func(expr ast.Expr) {
+		if ident, ok := goRouteUnparen(expr).(*ast.Ident); ok {
+			names[ident.Name] = true
+		}
+	}
+	ast.Inspect(r.file, func(n ast.Node) bool {
+		r.step(1)
+		switch n := n.(type) {
+		case *ast.Field:
+			for _, name := range n.Names {
+				names[name.Name] = true
+			}
+		case *ast.ValueSpec:
+			for _, name := range n.Names {
+				names[name.Name] = true
+			}
+		case *ast.AssignStmt:
+			for _, lhs := range n.Lhs {
+				add(lhs)
+			}
+		case *ast.RangeStmt:
+			add(n.Key)
+			add(n.Value)
+		case *ast.IncDecStmt:
+			add(n.X)
+		}
+		return true
+	})
+	return names
+}
+
+func goRouteAnyTrue(values []bool) bool {
+	for _, value := range values {
+		if value {
+			return true
+		}
+	}
+	return false
+}
+
+// goRouteCallName is the function a call names: f(...) or x.f(...).
+func goRouteCallName(call *ast.CallExpr) string {
+	switch fun := goRouteUnparen(call.Fun).(type) {
+	case *ast.Ident:
+		return fun.Name
+	case *ast.SelectorExpr:
+		return fun.Sel.Name
+	}
+	return ""
+}
+
+// goRouteIsStripPrefixCall reports a two-argument StripPrefix(prefix, h).
+func goRouteIsStripPrefixCall(call *ast.CallExpr) bool {
+	selector, ok := goRouteUnparen(call.Fun).(*ast.SelectorExpr)
+	return ok && selector.Sel.Name == "StripPrefix" && len(call.Args) == 2
+}
+
+// goRouteParamNames lists a function type's parameter names by index ("" for
+// an unnamed or blank parameter).
+func goRouteParamNames(typ *ast.FuncType) []string {
+	if typ == nil || typ.Params == nil {
+		return nil
+	}
+	var names []string
+	for _, field := range typ.Params.List {
+		if len(field.Names) == 0 {
+			names = append(names, "")
+			continue
+		}
+		for _, name := range field.Names {
+			if name.Name == "_" {
+				names = append(names, "")
+			} else {
+				names = append(names, name.Name)
+			}
+		}
+	}
+	return names
+}
+
+// strippedParams reports which of params body hands to http.StripPrefix as
+// its handler, or to a stripping parameter of a same-file function. A name
+// counts anywhere inside that argument (wrapped in other calls, a method
+// value), ignoring shadowing: a miss would publish a path the server never
+// serves, a false hit only withholds routes.
+func (r *goRouteResolver) strippedParams(params []string, body *ast.BlockStmt) []bool {
+	stripped := make([]bool, len(params))
+	if body == nil {
+		return stripped
+	}
+	index := map[string]int{}
+	for i, name := range params {
+		if name != "" {
+			index[name] = i
+		}
+	}
+	if len(index) == 0 {
+		return stripped
+	}
+	markIn := func(arg ast.Expr) {
+		ast.Inspect(arg, func(n ast.Node) bool {
+			r.step(1)
+			if ident, ok := n.(*ast.Ident); ok {
+				if i, ok := index[ident.Name]; ok {
+					stripped[i] = true
+				}
+			}
+			return true
+		})
+	}
+	ast.Inspect(body, func(n ast.Node) bool {
+		r.step(1)
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if goRouteIsStripPrefixCall(call) {
+			markIn(call.Args[1])
+			return true
+		}
+		for i, strips := range r.stripParams[goRouteCallName(call)] {
+			if strips && i < len(call.Args) {
+				markIn(call.Args[i])
+			}
+		}
+		return true
+	})
+	return stripped
+}
+
+// funcLitStrips reports a closure that hands one of its parameters to
+// http.StripPrefix: used as router middleware, it rewrites every request
+// before the router matches it.
+func (r *goRouteResolver) funcLitStrips(lit *ast.FuncLit) bool {
+	if strips, ok := r.stripLits[lit]; ok {
+		return strips
+	}
+	strips := goRouteAnyTrue(r.strippedParams(goRouteParamNames(lit.Type), lit.Body))
+	r.stripLits[lit] = strips
+	return strips
+}
+
+// computeStripHelpers finds the same-file functions that wrap a parameter in
+// http.StripPrefix (directly or through each other) and those that build a
+// closure that does.
+func (r *goRouteResolver) computeStripHelpers() {
+	r.stripParams = map[string][]bool{}
+	r.stripFactories = map[string]bool{}
+	r.stripLits = map[*ast.FuncLit]bool{}
+	var funcs []*ast.FuncDecl
+	for _, decl := range r.file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Body != nil {
+			funcs = append(funcs, fn)
+		}
+	}
+	for round := 0; round < 8; round++ {
+		changed := false
+		for _, fn := range funcs {
+			current := r.stripParams[fn.Name.Name]
+			for i, strips := range r.strippedParams(goRouteParamNames(fn.Type), fn.Body) {
+				if !strips {
+					continue
+				}
+				for len(current) <= i {
+					current = append(current, false)
+				}
+				if !current[i] {
+					current[i] = true
+					changed = true
+				}
+			}
+			if current != nil {
+				r.stripParams[fn.Name.Name] = current
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	for _, fn := range funcs {
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if lit, ok := n.(*ast.FuncLit); ok && goRouteAnyTrue(r.strippedParams(goRouteParamNames(lit.Type), lit.Body)) {
+				r.stripFactories[fn.Name.Name] = true
+				return false
+			}
+			return true
+		})
+	}
+}
+
+// noteStripHelper handles a same-file helper that wraps an argument in
+// http.StripPrefix (wrap(r) where wrap returns http.StripPrefix("/api", h)):
+// every router instance in that argument is served under a prefix its own
+// registrations do not show.
+func (r *goRouteResolver) noteStripHelper(call *ast.CallExpr, scope *goRouteScope) {
+	for i, strips := range r.stripParams[goRouteCallName(call)] {
+		if strips && i < len(call.Args) {
+			r.makeOpaqueIn(call.Args[i], scope)
+		}
+	}
+}
+
+// makeOpaqueIn marks every router instance named in expr opaque: a variable
+// or a router field (s.mux).
+func (r *goRouteResolver) makeOpaqueIn(expr ast.Expr, scope *goRouteScope) {
+	lookup := r.lookupIn(scope)
+	ast.Inspect(expr, func(n ast.Node) bool {
+		r.step(1)
+		switch n := n.(type) {
+		case *ast.SelectorExpr:
+			if origin := r.fieldOrigin(n, lookup); origin != nil {
+				origin.opaque = true
+			}
+		case *ast.Ident:
+			if binding := r.lookup(scope, n.Name); binding != nil && binding.origin != nil {
+				binding.origin.opaque = true
+			}
+		}
+		return true
+	})
+}
+
+// goRouteUnplacedRootTypes are root router types of frameworks that mount
+// routers: a parameter or field of one is a root instance whose serving
+// prefix is not visible (chi.Router, fiber.Router and *mux.Router are also
+// what a group or sub-router is, so they stay unknown).
+var goRouteUnplacedRootTypes = map[string]bool{"fiber.App": true, "chi.Mux": true}
+
+// goRouteFieldRootTypes are the types a struct field may be declared with to
+// hold a root router.
+var goRouteFieldRootTypes = map[string]bool{
+	"http.ServeMux": true, "chi.Mux": true, "gin.Engine": true, "echo.Echo": true,
+	"fiber.App": true, "mux.Router": true, "httprouter.Router": true,
+}
+
+// fieldOrigin is the router instance a field selector (s.mux, r.Mux,
+// s.srv.router) reads, or nil when the field is not a router field or the
+// base is not a variable (a package qualifier).
+func (r *goRouteResolver) fieldOrigin(sel *ast.SelectorExpr, lookup goRouteLookup) *goRouteOrigin {
+	framework, ok := r.routerFields[sel.Sel.Name]
+	if !ok || framework == "" {
+		return nil
+	}
+	base := goRouteUnparen(sel.X)
+	for {
+		inner, ok := base.(*ast.SelectorExpr)
+		if !ok {
+			break
+		}
+		base = goRouteUnparen(inner.X)
+	}
+	ident, ok := base.(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	if _, declared := lookup(ident.Name); !declared {
+		return nil
+	}
+	origin := r.fieldOrigins[sel.Sel.Name]
+	if origin == nil {
+		origin = &goRouteOrigin{framework: framework, unplaced: true, region: r.region}
+		r.fieldOrigins[sel.Sel.Name] = origin
+	}
+	return origin
+}
+
+// computeRouterFields finds the struct fields this file shows holding a root
+// router: declared in a same-file struct with a root router type, or assigned
+// a router constructor (s.mux = http.NewServeMux(), Server{mux: chi.NewMux()}).
+// A field also assigned a group, sub-router or prefixed value anywhere in the
+// file, or declared with another type, holds a prefix this pass cannot see,
+// and so does a field name declared with two different router frameworks.
+func (r *goRouteResolver) computeRouterFields() {
+	r.routerFields = map[string]string{}
+	excluded := map[string]bool{}
+	note := func(name, framework string) {
+		if name == "_" || excluded[name] {
+			return
+		}
+		if previous, seen := r.routerFields[name]; seen && previous != framework {
+			excluded[name] = true
+			return
+		}
+		r.routerFields[name] = framework
+	}
+	typeFramework := func(expr ast.Expr) string {
+		selector, ok := goRouteUnstar(goRouteUnparen(expr)).(*ast.SelectorExpr)
+		if !ok {
+			return ""
+		}
+		pkg, ok := selector.X.(*ast.Ident)
+		if !ok {
+			return ""
+		}
+		framework := r.framework(pkg.Name)
+		if framework == "" || !goRouteFieldRootTypes[framework+"."+selector.Sel.Name] {
+			return ""
+		}
+		return framework
+	}
+	// valueFramework classifies a value stored into a field: a constructor
+	// (a root), a group-producing call (excluded), or anything else (neutral:
+	// an alias, nil, a parameter).
+	valueFramework := func(expr ast.Expr) (string, bool) {
+		expr = goRouteUnparen(expr)
+		if unary, ok := expr.(*ast.UnaryExpr); ok && unary.Op == token.AND {
+			expr = goRouteUnparen(unary.X)
+		}
+		switch value := expr.(type) {
+		case *ast.CompositeLit:
+			if framework := typeFramework(value.Type); framework != "" {
+				return framework, true
+			}
+		case *ast.CallExpr:
+			switch fun := goRouteUnparen(value.Fun).(type) {
+			case *ast.SelectorExpr:
+				if pkg, ok := fun.X.(*ast.Ident); ok {
+					if _, ok := goRouteConstructors[r.framework(pkg.Name)+"."+fun.Sel.Name]; ok {
+						return r.framework(pkg.Name), true
+					}
+				}
+				switch fun.Sel.Name {
+				case "Group", "Route", "Subrouter", "PathPrefix", "Host", "Mount", "StripPrefix":
+					return "", false
+				}
+			case *ast.Ident:
+				if fun.Name == "new" && len(value.Args) == 1 {
+					if framework := typeFramework(value.Args[0]); framework != "" {
+						return framework, true
+					}
+				}
+			}
+		}
+		return "", true
+	}
+	ast.Inspect(r.file, func(n ast.Node) bool {
+		r.step(1)
+		switch n := n.(type) {
+		case *ast.StructType:
+			if n.Fields == nil {
+				return true
+			}
+			for _, field := range n.Fields.List {
+				framework := typeFramework(field.Type)
+				for _, name := range field.Names {
+					if framework == "" {
+						excluded[name.Name] = true
+					} else {
+						note(name.Name, framework)
+					}
+				}
+			}
+		case *ast.AssignStmt:
+			if len(n.Lhs) != len(n.Rhs) {
+				for _, lhs := range n.Lhs {
+					if sel, ok := lhs.(*ast.SelectorExpr); ok {
+						excluded[sel.Sel.Name] = true
+					}
+				}
+				return true
+			}
+			for i, lhs := range n.Lhs {
+				sel, ok := lhs.(*ast.SelectorExpr)
+				if !ok {
+					continue
+				}
+				framework, neutral := valueFramework(n.Rhs[i])
+				switch {
+				case !neutral:
+					excluded[sel.Sel.Name] = true
+				case framework != "":
+					note(sel.Sel.Name, framework)
+				}
+			}
+		case *ast.KeyValueExpr:
+			key, ok := n.Key.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			framework, neutral := valueFramework(n.Value)
+			switch {
+			case !neutral:
+				excluded[key.Name] = true
+			case framework != "":
+				note(key.Name, framework)
+			}
+		}
+		return true
+	})
+	for name := range excluded {
+		delete(r.routerFields, name)
 	}
 }

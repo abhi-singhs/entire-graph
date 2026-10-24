@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   locate-benchmark-guards:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-4
     env:
       GIT_CONFIG_GLOBAL: /dev/null
       GIT_CONFIG_SYSTEM: /dev/null
@@ -33,7 +33,7 @@ jobs:
       - run: python3 bench/locate/seal_run.py --test
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-4
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -48,13 +48,20 @@ jobs:
             echo "$unformatted"
             exit 1
           fi
+      # Go 1.27 enables the jsonv2 experiment by default, so every other job compiles the
+      # streaming cache encoder (cache_encode_jsonv2.go) and
+      # TestDefaultBuildCompilesStreamingCacheEncoder fails if one ever does not. This step
+      # keeps the buffering fallback (cache_encode_legacy.go) compiled and byte-identical.
+      - name: cache encoder fallback (GOEXPERIMENT=nojsonv2)
+        env: { GOEXPERIMENT: nojsonv2 }
+        run: go test -count=1 -run 'Cache|EncodeCacheValue' ./internal/sem
 
   # Release archives are immutable once published, so third-party attribution
   # has to be correct before a tag, not after it. This regenerates NOTICES from
   # the vendored license files and the resolved module graph and fails on any
   # drift.
   notices:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-4
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -67,7 +74,19 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        # macOS stays GitHub-hosted: Depot's org-wide macOS concurrency cap is
+        # already contended (entire-brain queues on it).
+        include:
+          - os: ubuntu-latest
+            runner: depot-ubuntu-24.04-4
+          - os: macos-latest
+            runner: macos-latest
+          - os: windows-latest
+            runner: depot-windows-2025-4
+    # The explicit name keeps matrix.runner out of the default display name:
+    # "build (<os>)" is a required check on main.
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -80,7 +99,15 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-latest
+            runner: depot-ubuntu-24.04-8
+          - os: macos-latest
+            runner: macos-latest
+    # The explicit name keeps matrix.runner out of the default display name:
+    # "test (<os>)" is a required check on main.
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -92,7 +119,7 @@ jobs:
 
   windows-test-prepare:
     name: test (windows-latest) / compile and plan
-    runs-on: windows-latest
+    runs-on: depot-windows-2025-8
     timeout-minutes: 30
     outputs:
       shard-matrix: ${{ steps.shard-matrix.outputs.value }}
@@ -148,7 +175,7 @@ jobs:
   windows-test-shards:
     name: test (windows-latest) / shard ${{ matrix.shard }}
     needs: windows-test-prepare
-    runs-on: windows-latest
+    runs-on: depot-windows-2025-8
     timeout-minutes: 105
     strategy:
       fail-fast: false
@@ -196,7 +223,7 @@ jobs:
   windows-test-other:
     name: test (windows-latest) / non-heavy packages
     needs: windows-test-prepare
-    runs-on: windows-latest
+    runs-on: depot-windows-2025-4
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7.0.1
@@ -237,7 +264,7 @@ jobs:
 
   windows-test-vet:
     name: test (windows-latest) / vet
-    runs-on: windows-latest
+    runs-on: depot-windows-2025-4
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
@@ -253,7 +280,7 @@ jobs:
     name: test (windows-latest) / coverage and integrity
     needs: [windows-test-prepare, windows-test-shards, windows-test-other]
     if: ${{ always() && needs.windows-test-prepare.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-4
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
@@ -296,7 +323,7 @@ jobs:
     needs:
       [windows-test-prepare, windows-test-shards, windows-test-other, windows-test-vet, windows-test-verify]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-4
     steps:
       - name: Require every Windows test component
         env:
@@ -314,7 +341,7 @@ jobs:
           done
 
   bm25-adapter:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-4
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -328,7 +355,7 @@ jobs:
   # The LoCoMo nightly's scoreability gate is Python and carries its own suite;
   # `go test` never runs it, so nothing exercised it until this job.
   locomo-summary-gate:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04-4
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -346,7 +373,15 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-latest
+            runner: depot-ubuntu-24.04-4
+          - os: macos-latest
+            runner: macos-latest
+    # The explicit name keeps matrix.runner out of the default display name:
+    # "statusline (<os>)" is a required check on main.
+    name: statusline (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -363,7 +398,13 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-latest
+            runner: depot-ubuntu-24.04-4
+          - os: macos-latest
+            runner: macos-latest
+    name: prompt-context-hook (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:

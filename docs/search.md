@@ -83,9 +83,10 @@ not certified. File names and other metadata escape the reserved token so they
 cannot impersonate this header annotation. JSON/NDJSON retain the original data.
 Text output also omits the `complete-symbol` signal when display changes the body.
 
-For certified bodies, the agent renderer emits the whole body with the marker
-or falls back to an unmarked locator if the budget cannot hold it. Ordinary
-uncertified results retain excerpt fitting and trailing-line behavior. A genuine
+The agent renderer prefers the whole certified body with its marker. If it
+cannot fit, it retains an unmarked source window or declaration when possible,
+then falls back to a locator. Unmarked source makes no completeness claim.
+Ordinary uncertified results retain excerpt fitting and trailing-line behavior. A genuine
 final source blank line is preserved only on the certified path; an ordinary
 line terminator does not become an extra source line.
 
@@ -132,6 +133,7 @@ Declaration rendering preserves the parser’s name line when an uncertified sou
 window would otherwise omit it. Exact-identifier answers retain every matching
 definition or fall back to the ordinary ranking. Certified source keeps its whole
 body and completeness marker, including in exact-name answers; when that body
-cannot fit, the ordinary renderer uses an unmarked locator. Additional passages
+cannot fit, the ordinary renderer may retain an unmarked declaration or source
+window before falling back to a locator. Additional passages
 cannot spend the primary location’s reserved space. Declaration floors are used
 only when they collectively fit, preserving the bounded rank-weighted allocator.

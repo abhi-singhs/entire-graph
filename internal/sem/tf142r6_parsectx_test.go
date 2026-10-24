@@ -25,10 +25,17 @@ import (
 // TestCheckoutScopeLookupHonorsCallerCancellation and
 // TestRecordsCacheLoadHonorsCallerCancellation verify the cache call paths.
 var unbudgetedParseAllowlist = map[string]string{
-	"parser.go.ParseWithStatus":                    "return TreeSitterParser{}.ParseWithStatusCtx(context.Background(), path, content)",
-	"search_cache.go.cacheCheckoutScope":           "ctx := context.Background()",
-	"search_cache.go.loadCachedSearchSnapshot":     "ctx := context.Background()",
-	"records_cache.go.providerRecordsKeyForSchema": "ctx := context.Background()",
+	"parser.go.ParseWithStatus":                "return TreeSitterParser{}.ParseWithStatusCtx(context.Background(), path, content)",
+	"search_cache.go.cacheCheckoutScope":       "ctx := context.Background()",
+	"search_cache.go.loadCachedSearchSnapshot": "ctx := context.Background()",
+	// Same entry point as the line above, after main factored the sidecar read
+	// out of loadCachedSearchSnapshot: both take `contexts ...context.Context`
+	// and fall back to Background only when the caller supplied none. A
+	// budgeted caller's context is forwarded through loadCachedSearchSnapshot
+	// and reaches loadSearchStoreForEntry intact, so the fallback is the
+	// no-context default, not a parse stage escaping the budget.
+	"search_cache.go.readSearchSnapshotPreferringStore": "ctx := context.Background()",
+	"records_cache.go.providerRecordsKeyForSchema":      "ctx := context.Background()",
 }
 
 // TestTF142R6NoUnbudgetedParseContext closes the CLASS the three round-six

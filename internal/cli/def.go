@@ -167,10 +167,7 @@ func runDef(ctx context.Context, opts Options, args []string) error {
 	if err != nil {
 		return err
 	}
-	cacheDir := flags.CacheDir
-	if cacheDir == "" {
-		cacheDir = opts.Env.PluginDataDir
-	}
+	cacheDir := resolveCacheDir(flags.CacheDir, opts.Env.PluginDataDir)
 	totalStarted := time.Now()
 	snapshot, cacheHit, err := sem.LoadOrBuildProviderSnapshot(ctx, repo, opts.Version, sem.ProviderSnapshotOptions{
 		NoNetwork:    true,
@@ -206,6 +203,11 @@ func runDef(ctx context.Context, opts Options, args []string) error {
 	// --max-context-bytes is the TOTAL for the invocation, so N names share it evenly. A per-name
 	// budget would let `def A B C` print three budgets' worth while the guide promised one.
 	nameBudget := defNameBudget(flags.MaxContextBytes, len(symbols))
+	// JSON answers cannot be cut, so a name whose smallest answer does not fit its share is left
+	// out rather than aborting the names that do fit. The share rolls: bytes an earlier answer did
+	// not need go to the names after it.
+	jsonRemaining := flags.MaxContextBytes
+	var jsonUnfit []string
 	for position, symbol := range symbols {
 		query := flags
 		query.Symbol = symbol
@@ -216,13 +218,24 @@ func runDef(ctx context.Context, opts Options, args []string) error {
 		response.TotalLatencyMS = time.Since(totalStarted).Milliseconds()
 		switch flags.Format {
 		case "json":
-			encoded, err := fitDefJSON(response, nameBudget, flags.MaxContextBytes)
+			share := nameBudget
+			if flags.MaxContextBytes > 0 && len(symbols) > 1 {
+				// max(…, 1): a spent budget must refuse the answer, and 0 would mean unbounded.
+				share = defNameBudget(max(jsonRemaining, 1), len(symbols)-position)
+			}
+			encoded, err := fitDefJSON(response, share, flags.MaxContextBytes)
+			var unfit *defJSONBudgetError
+			if errors.As(err, &unfit) && len(symbols) > 1 {
+				jsonUnfit = append(jsonUnfit, symbol)
+				continue
+			}
 			if err != nil {
 				return err
 			}
 			if _, err := opts.Stdout.Write(encoded); err != nil {
 				return err
 			}
+			jsonRemaining -= len(encoded)
 		case "text", "agent":
 			var section bytes.Buffer
 			if position > 0 {
@@ -250,6 +263,10 @@ func runDef(ctx context.Context, opts Options, args []string) error {
 		default:
 			return fmt.Errorf("def --format must be json, text, or agent, got %q", flags.Format)
 		}
+	}
+	if len(jsonUnfit) > 0 {
+		return fmt.Errorf("def --max-context-bytes %d left no room for the JSON answer to %d of %d names (%s); the others were written. Raise it, ask for fewer names, or pass 0 for no limit",
+			flags.MaxContextBytes, len(jsonUnfit), len(symbols), termsafe.Line(strings.Join(jsonUnfit, ", ")))
 	}
 	return nil
 }
@@ -500,7 +517,16 @@ func fitDefJSON(response defResponse, budget, flagBudget int) ([]byte, error) {
 	if err != nil || ok {
 		return out, err
 	}
-	return nil, fmt.Errorf("def --max-context-bytes %d leaves %d bytes for this answer, less than the smallest JSON answer (%d bytes); raise it, or pass 0 for no limit", flagBudget, budget, len(out))
+	return nil, &defJSONBudgetError{flagBudget: flagBudget, budget: budget, smallest: len(out)}
+}
+
+// defJSONBudgetError is fitDefJSON's refusal: even the smallest JSON answer exceeds the budget.
+type defJSONBudgetError struct {
+	flagBudget, budget, smallest int
+}
+
+func (e *defJSONBudgetError) Error() string {
+	return fmt.Sprintf("def --max-context-bytes %d leaves %d bytes for this answer, less than the smallest JSON answer (%d bytes); raise it, or pass 0 for no limit", e.flagBudget, e.budget, e.smallest)
 }
 
 // defClipDeclarationSignatures shortens every signature in declaration to defMaxSignatureRunes,

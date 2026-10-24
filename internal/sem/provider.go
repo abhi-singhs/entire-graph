@@ -13,6 +13,7 @@ import (
 	"hash/fnv"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -5431,6 +5432,11 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 				return
 			}
 			emit(r.Relation)
+			if goRouteRelationUnplaced(r.Relation) {
+				// A relative route under an unseen prefix is no full path an
+				// HTTP client call can be matched to, and claims no literal.
+				continue
+			}
 			routeHandlers[r.Route] = append(routeHandlers[r.Route], r.Handler)
 			handledRoutes[r.Route] = struct{}{}
 		}
@@ -5439,6 +5445,9 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 			// at their own call sites (masked below), so they claim nothing by
 			// string: an identical literal elsewhere is still scanned.
 			emit(r.Relation)
+			if goRouteRelationUnplaced(r.Relation) {
+				continue
+			}
 			routeHandlers[r.Route] = append(routeHandlers[r.Route], r.Handler)
 		}
 		for _, r := range djangoRouteRelations(files, recordsByFile, readContent, shouldStop) {
@@ -6323,7 +6332,7 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 				// paid for. Revisit if a corpus shows it is not rare.
 				edgeOrder := []string{}
 				flowsByEdge := map[string]*RelationRecord{}
-				for _, flow := range returnFlowCalls(body, symbolFlowParameterNames(from)) {
+				for _, flow := range returnFlowCalls(body, symbolFlowParameterNames(from), flowSyntaxFor(file.Language)) {
 					if flow.Name == from.Name {
 						continue
 					}
@@ -25501,8 +25510,12 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 	var relations, inline []expressRouteRelation
 	var failures []PartialFailure
 	masks := map[string][][2]int{}
-	seen := map[string]bool{}
-	inlineSeen := map[string]bool{}
+	// seen and inlineSeen map an edge (symbol, route) to its index in
+	// relations or inline. The route id is the path, so a second ServeMux
+	// method on the same path and symbol ("GET /x" and "DELETE /x") is the
+	// same edge: its method is added to that edge's evidence instead.
+	seen := map[string]int{}
+	inlineSeen := map[string]int{}
 	for _, file := range files {
 		if !strings.EqualFold(filepath.Ext(file.Path), ".go") {
 			continue
@@ -25551,42 +25564,52 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 				// A named handler that is not a symbol here (a local variable,
 				// another package's function): attributed to the enclosing
 				// symbol like an inline handler, never dropped to the bare path.
-				inlineRegs = append(inlineRegs, goRouteInline{Route: registration.Route, Offset: registration.offset})
+				inlineRegs = append(inlineRegs, goRouteInline{Route: registration.Route, Method: registration.method, Offset: registration.offset, Unplaced: registration.Unplaced})
 			}
 		}
+		// Line lookup by binary search over the file's newline offsets, computed once: counting
+		// newlines up to each registration was quadratic in a file with many inline handlers.
+		var newlines []int
+		if len(inlineRegs) > 0 {
+			newlines = newlineOffsets(content)
+		}
 		for _, registration := range inlineRegs {
-			from, ok := goRouteEnclosingSymbol(recordsByFile[file.Path], 1+strings.Count(content[:registration.Offset], "\n"))
+			from, ok := goRouteEnclosingSymbol(recordsByFile[file.Path], lineAtOffset(newlines, registration.Offset))
 			if !ok {
 				continue
 			}
 			key := from.ID + "\x00" + registration.Route
-			if inlineSeen[key] {
+			if index, ok := inlineSeen[key]; ok {
+				goRouteAddMethodEvidence(&inline[index].Relation, registration.Method, goRouteMethodDetail(registration.Method, registration.Route))
+				if !registration.Unplaced {
+					goRouteMarkPlaced(&inline[index].Relation, 0.7, "pattern", goRouteInlineReason)
+				}
 				continue
 			}
-			inlineSeen[key] = true
-			inline = append(inline, expressRouteRelation{
-				Route:   registration.Route,
-				Handler: from,
-				Relation: RelationRecord{
-					RecordType:    "relation",
-					FromID:        from.ID,
-					ToID:          externalID("route", registration.Route),
-					Type:          "HANDLES_ROUTE",
-					Confidence:    0.7,
-					Reason:        "Go route registration with an inline handler; route composed from its router, attributed to the enclosing symbol",
-					RelationScope: "external",
-					Resolution:    "pattern",
-					TargetKind:    "route",
-					Evidence: []Evidence{{
-						Kind:      "go_router_inline",
-						FilePath:  from.FilePath,
-						StartLine: from.StartLine,
-						EndLine:   from.EndLine,
-						Detail:    registration.Route,
-					}},
-					WarningCodes: []string{},
-				},
-			})
+			inlineSeen[key] = len(inline)
+			relation := RelationRecord{
+				RecordType:    "relation",
+				FromID:        from.ID,
+				ToID:          externalID("route", registration.Route),
+				Type:          "HANDLES_ROUTE",
+				Confidence:    0.7,
+				Reason:        goRouteInlineReason,
+				RelationScope: "external",
+				Resolution:    "pattern",
+				TargetKind:    "route",
+				Evidence: []Evidence{{
+					Kind:      "go_router_inline",
+					FilePath:  from.FilePath,
+					StartLine: from.StartLine,
+					EndLine:   from.EndLine,
+					Detail:    goRouteMethodDetail(registration.Method, registration.Route),
+				}},
+				WarningCodes: []string{},
+			}
+			if registration.Unplaced {
+				goRouteMarkUnplaced(&relation)
+			}
+			inline = append(inline, expressRouteRelation{Route: registration.Route, Handler: from, Relation: relation})
 		}
 		for _, registration := range detail.regs {
 			handler, ok := resolveRouteHandlerSymbol(handlers, registration.Handler)
@@ -25594,33 +25617,37 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 				continue
 			}
 			key := handler.ID + "\x00" + registration.Route
-			if seen[key] {
+			if index, ok := seen[key]; ok {
+				goRouteAddMethodEvidence(&relations[index].Relation, registration.method, registration.Detail)
+				if !registration.Unplaced {
+					goRouteMarkPlaced(&relations[index].Relation, 0.86, "exact", goRouteNamedReason)
+				}
 				continue
 			}
-			seen[key] = true
-			relations = append(relations, expressRouteRelation{
-				Route:   registration.Route,
-				Handler: handler,
-				Relation: RelationRecord{
-					RecordType:    "relation",
-					FromID:        handler.ID,
-					ToID:          externalID("route", registration.Route),
-					Type:          "HANDLES_ROUTE",
-					Confidence:    0.86,
-					Reason:        "Go net/http route registration resolved to local handler",
-					RelationScope: "external",
-					Resolution:    "exact",
-					TargetKind:    "route",
-					Evidence: []Evidence{{
-						Kind:      registration.EvidenceKind,
-						FilePath:  handler.FilePath,
-						StartLine: handler.StartLine,
-						EndLine:   handler.EndLine,
-						Detail:    registration.Detail,
-					}},
-					WarningCodes: []string{},
-				},
-			})
+			seen[key] = len(relations)
+			relation := RelationRecord{
+				RecordType:    "relation",
+				FromID:        handler.ID,
+				ToID:          externalID("route", registration.Route),
+				Type:          "HANDLES_ROUTE",
+				Confidence:    0.86,
+				Reason:        goRouteNamedReason,
+				RelationScope: "external",
+				Resolution:    "exact",
+				TargetKind:    "route",
+				Evidence: []Evidence{{
+					Kind:      registration.EvidenceKind,
+					FilePath:  handler.FilePath,
+					StartLine: handler.StartLine,
+					EndLine:   handler.EndLine,
+					Detail:    registration.Detail,
+				}},
+				WarningCodes: []string{},
+			}
+			if registration.Unplaced {
+				goRouteMarkUnplaced(&relation)
+			}
+			relations = append(relations, expressRouteRelation{Route: registration.Route, Handler: handler, Relation: relation})
 		}
 	}
 	sort.Slice(relations, func(i, j int) bool {
@@ -25630,6 +25657,75 @@ func goHTTPRouteRelations(files []FileRecord, recordsByFile map[string][]SymbolR
 		return relations[i].Handler.ID < relations[j].Handler.ID
 	})
 	return relations, inline, masks, failures
+}
+
+// goRouteAddMethodEvidence records one more ServeMux method registration of
+// an edge that already exists: a copy of its first evidence with this
+// registration's detail. A registration without a method, or a detail the
+// edge already carries, adds nothing, so other frameworks' edges are unchanged.
+func goRouteAddMethodEvidence(relation *RelationRecord, method, detail string) {
+	if method == "" || len(relation.Evidence) == 0 {
+		return
+	}
+	for _, evidence := range relation.Evidence {
+		if evidence.Detail == detail {
+			return
+		}
+	}
+	evidence := relation.Evidence[0]
+	evidence.Detail = detail
+	relation.Evidence = append(relation.Evidence, evidence)
+}
+
+// goRouteUnplacedWarning marks a Go route whose router is served under a
+// prefix the source does not show (a struct-field router, a router parameter
+// of a mountable root type, a router handed to a wrapper): the route is the
+// path relative to that router and may lack a leading prefix.
+const goRouteUnplacedWarning = "ROUTE_PREFIX_UNRESOLVED"
+
+// goRouteMarkUnplaced lowers an unplaced route's confidence by 0.2 (0.86 to
+// 0.66 for a named handler, 0.7 to 0.5 for an enclosing symbol), resolves it
+// as a pattern, and names the open prefix in the reason and warning code.
+func goRouteMarkUnplaced(relation *RelationRecord) {
+	relation.Confidence = math.Round((relation.Confidence-0.2)*100) / 100
+	relation.Resolution = "pattern"
+	relation.Reason += "; the router's mount prefix is not visible, so the route is relative to it and may be incomplete"
+	relation.WarningCodes = append(relation.WarningCodes, goRouteUnplacedWarning)
+}
+
+// goRouteMarkPlaced undoes goRouteMarkUnplaced when a duplicate registration
+// of the same edge has a visible prefix: one placed registration proves the
+// route, whichever of the two the file happens to list first.
+func goRouteMarkPlaced(relation *RelationRecord, confidence float64, resolution, reason string) {
+	if !goRouteRelationUnplaced(*relation) {
+		return
+	}
+	relation.Confidence = confidence
+	relation.Resolution = resolution
+	relation.Reason = reason
+	codes := relation.WarningCodes[:0]
+	for _, code := range relation.WarningCodes {
+		if code != goRouteUnplacedWarning {
+			codes = append(codes, code)
+		}
+	}
+	relation.WarningCodes = codes
+}
+
+// Reasons of placed Go route edges, before goRouteMarkUnplaced extends them.
+const (
+	goRouteNamedReason  = "Go net/http route registration resolved to local handler"
+	goRouteInlineReason = "Go route registration with an inline handler; route composed from its router, attributed to the enclosing symbol"
+)
+
+// goRouteRelationUnplaced reports a relation goRouteMarkUnplaced marked.
+func goRouteRelationUnplaced(relation RelationRecord) bool {
+	for _, code := range relation.WarningCodes {
+		if code == goRouteUnplacedWarning {
+			return true
+		}
+	}
+	return false
 }
 
 // goRouteEnclosingSymbol is the innermost non-type symbol spanning line.
@@ -26757,10 +26853,18 @@ func routeLiteralPartOfConcat(line string, start, end int) bool {
 }
 
 func staticStringConstants(content string) map[string]string {
+	// One scan collects the assignment candidates; the fixed-point passes that
+	// chase constant-to-constant references (`B = A + "/x"`) then iterate over
+	// the candidates in memory. The scan used to run INSIDE the loop,
+	// re-matching the entire file — every assignment-shaped line, not just
+	// string ones — on each pass, for a match list that cannot change between
+	// iterations: only the resolution map does. Measured at ~5% of full-profile
+	// snapshot CPU on a large Go repository before the hoist.
+	matches := staticStringAssignRe.FindAllStringSubmatch(content, -1)
 	constants := map[string]string{}
 	for i := 0; i < 5; i++ {
 		changed := false
-		for _, match := range staticStringAssignRe.FindAllStringSubmatch(content, -1) {
+		for _, match := range matches {
 			if len(match) != 3 {
 				continue
 			}
@@ -26810,8 +26914,14 @@ type goHTTPRouteRegistration struct {
 	EvidenceKind     string
 	Detail           string
 	AllowTypeHandler bool
+	// Unplaced (Go route pass only): the router's serving prefix is not
+	// visible, so Route is relative to it and may lack a leading prefix.
+	Unplaced bool
 	// offset of the registration call in the file (Go route pass only).
 	offset int
+	// method a net/http ServeMux pattern restricts the route to (Go route
+	// pass only; "" for any method).
+	method string
 }
 
 type djangoRouteRegistration struct {

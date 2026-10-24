@@ -22,9 +22,30 @@ import (
 // TestSearchVerifyBlockDefaultIsExplicitOn verifies the current public default/flag/env
 // equivalence end to end. Regenerate only the integration golden with
 //
-//	VERIFY_BLOCK_GOLDEN_OUT=testdata/verify_block_default_golden_integration.json \
-//	    go test -run TestVerifyBlockGoldenGenerate ./internal/cli
-const verifyBlockGoldenPath = "testdata/verify_block_default_golden_integration.json"
+//	cp internal/cli/search_verify_block_golden_test.go <pre-flag checkout>/internal/cli/
+//	VERIFY_BLOCK_GOLDEN_OUT=<new golden path> \
+//	    go test -run TestVerifyBlockGoldenGenerate ./internal/cli/   # in that checkout
+//
+// Two bindings are kept. testdata/verify_block_default_golden.json is the original one, generated
+// at 973e9ea5 for the flag on its own. The combined candidate binds verifyBlockGoldenPath, generated
+// from the combined tree just before the flag. That tree does not compile on its own, so it is
+// rebuilt from reachable history: check out df38be28 (the commit before the flag), apply the
+// call-signature repair e04c33f2 on top (git show e04c33f2 | git apply; patch-id eaea41315b956769),
+// copy this file in unchanged, and generate. The result differs from the 973e9ea5 file in exactly
+// the six decl-*/agent entries, where the combined renderer certifies a whole, unchanged body ahead
+// of the declaration window.
+//
+// It therefore uses only renderer seams and fixtures that exist before the flag, and no index: every
+// input is a constructed sem.SearchResponse. The fixtures deliberately carry the VERIFY block, and
+// one of them quotes the producer's VERIFY and contract-note lines inside a retrieved snippet.
+
+// A third binding, verify_block_default_golden_merge295.json, is the one checked. Merging main's
+// #295 (tier-major header ladder, head-weighted byte split, source-protecting passes) changed every
+// agent-format entry and none of the text/json/ndjson ones: the renderer changed, not the flag. No
+// pre-flag tree carries #295, so this binding is generated from the merge itself with the generator
+// below. It keeps the default pinned against further drift; the flag-only identity is what the two
+// earlier bindings established, and they are kept for that history.
+const verifyBlockGoldenPath = "testdata/verify_block_default_golden_merge295.json"
 const verifyBlockLegacyGoldenPath = "testdata/verify_block_default_golden_pre306_3d047d40.json"
 
 // verifyGoldenForgedSnippet is repository text holding the exact lines the producer emits for
