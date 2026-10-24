@@ -1,6 +1,7 @@
 package sem
 
 import (
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -74,25 +75,29 @@ func looksLikeToolHandler(symbol SymbolRecord) bool {
 	if signatureNamesIdentifier(symbol.Signature, mcpToolCallRequestType) {
 		return true
 	}
-	// "tool" may come from the container (SearchTool.execute), but the action
-	// must be the symbol's own: ToolHandler.close is a method of a handler, not
-	// a handler.
-	namesTool := false
-	for _, word := range identifierWords(symbol.QualifiedName) {
-		if word == "tool" || word == "tools" {
-			namesTool = true
-			break
-		}
+	// The symbol's own name pairs "tool" with an action: handleMCPToolCall,
+	// execute_tool_handler, ToolExecutor.
+	if slices.ContainsFunc(own, isToolWord) {
+		return slices.ContainsFunc(own, func(word string) bool { return toolHandlerActions[word] })
 	}
-	if !namesTool {
+	// Or the symbol is the action itself, defined on a tool: SearchTool.execute.
+	// Both halves are needed. The container must BE a tool (its head noun), so
+	// ToolServer.handle is a server's method; and the name must be nothing but
+	// the action, so SearchTool.handleHealth handles health, not the tool.
+	container := identifierWords(strings.TrimSuffix(symbol.QualifiedName, symbol.Name))
+	if len(container) == 0 || !isToolWord(container[len(container)-1]) {
 		return false
 	}
 	for _, word := range own {
-		if toolHandlerActions[word] {
-			return true
+		if !toolHandlerActions[word] {
+			return false
 		}
 	}
-	return false
+	return true
+}
+
+func isToolWord(word string) bool {
+	return word == "tool" || word == "tools"
 }
 
 // signatureNamesIdentifier reports whether identifier appears in signature as a
