@@ -22,27 +22,26 @@ func assertGoRelationScannersEqual(t *testing.T, path, source string) (used, fal
 		}
 		legacy := newSymbolBody(symbolBlock(source, symbol))
 		optimized := legacy
-		optimized.goFacts = collectGoRelationFacts(optimized.stripped)
-		if optimized.goFacts == nil {
+		optimized.facts = collectRelationFacts(optimized.stripped)
+		if strings.Contains(optimized.stripped, "$") {
 			fallback++
-			continue
 		}
 		used++
-		assertGoRelationBodyEqual(t, fmt.Sprintf("%s:%d %s", path, symbol.StartLine, symbol.Name), legacy, optimized)
-		assertGoReturnFlowsEqual(t, path, legacy, optimized, symbolFlowParameterNames(symbol))
+		assertRelationBodyEqual(t, "Go", fmt.Sprintf("%s:%d %s", path, symbol.StartLine, symbol.Name), legacy, optimized)
+		assertRelationReturnFlowsEqual(t, language, path, legacy, optimized, symbolFlowParameterNames(symbol))
 	}
 	return used, fallback
 }
 
-func assertGoRelationBodyEqual(t *testing.T, label string, legacy, optimized symbolBody) {
+func assertRelationBodyEqual(t *testing.T, language, label string, legacy, optimized symbolBody) {
 	t.Helper()
 	// Check captures and their original byte offsets as well as final edges.
 	// Assignment ordering depends on offsets, including leading whitespace.
 	patterns := []*regexp.Regexp{receiverCallRe, fieldAccessRe}
-	for re := range goRelationAnchored {
+	for re := range relationAnchoredPatterns {
 		patterns = append(patterns, re)
 	}
-	for re := range goFlowPatterns {
+	for re := range relationFlowPatterns {
 		patterns = append(patterns, re)
 	}
 	for _, re := range patterns {
@@ -55,8 +54,8 @@ func assertGoRelationBodyEqual(t *testing.T, label string, legacy, optimized sym
 	for _, name := range destructuredAssignmentVariablesRe.FindAllString(legacy.stripped, -1) {
 		params[strings.TrimPrefix(name, "$")] = true
 	}
-	assertGoReturnFlowsEqual(t, label, legacy, optimized, params)
-	assertGoReturnFlowsEqual(t, label, legacy, optimized, nil)
+	assertRelationReturnFlowsEqual(t, language, label, legacy, optimized, params)
+	assertRelationReturnFlowsEqual(t, language, label, legacy, optimized, nil)
 	factories := map[string]map[string][]string{}
 	for _, match := range factoryReturnAssignRe.FindAllStringSubmatch(legacy.stripped, -1) {
 		factories[match[2]] = map[string][]string{"fixture.go": {"Result"}}
@@ -84,10 +83,10 @@ func assertGoRelationBodyEqual(t *testing.T, label string, legacy, optimized sym
 	}
 }
 
-func assertGoReturnFlowsEqual(t *testing.T, label string, legacy, optimized symbolBody, params map[string]bool) {
+func assertRelationReturnFlowsEqual(t *testing.T, language, label string, legacy, optimized symbolBody, params map[string]bool) {
 	t.Helper()
-	want := returnFlowCalls(legacy, params, flowSyntaxFor("Go"))
-	got := returnFlowCalls(optimized, params, flowSyntaxFor("Go"))
+	want := returnFlowCalls(legacy, params, flowSyntaxFor(language))
+	got := returnFlowCalls(optimized, params, flowSyntaxFor(language))
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("%s return flows\nbody: %q\nparams: %v\nwant: %#v\n got: %#v", label, legacy.stripped, params, want, got)
 	}
@@ -191,7 +190,7 @@ func TestGoRelationFactsRelationsMatchReference(t *testing.T) {
 				for _, workers := range []int{1, 8} {
 					spec := resolveProfile(profile)
 					if !shared {
-						spec.shareGoRelationFacts = false
+						spec.shareRelationFacts = false
 					}
 					records := map[string][]SymbolRecord{}
 					for _, symbol := range snapshot.Symbols {
@@ -224,18 +223,18 @@ func TestGoRelationFactsActivationAndMasking(t *testing.T) {
 	for _, profile := range []Profile{"", ProfileFull, ProfileFast, ProfileSyntaxOnly} {
 		for _, language := range []string{"Go", "JavaScript", "Python", "Rust"} {
 			body := newRelationSymbolBody(source, language, resolveProfile(profile))
-			want := language == "Go" && (profile == "" || profile == ProfileFull)
-			if (body.goFacts != nil) != want {
-				t.Fatalf("%s/%s: facts enabled=%v, want %v", language, profile, body.goFacts != nil, want)
+			want := profile == "" || profile == ProfileFull
+			if (body.facts != nil) != want {
+				t.Fatalf("%s/%s: facts enabled=%v, want %v", language, profile, body.facts != nil, want)
 			}
 		}
 	}
 	body := newRelationSymbolBody(source, "Go", resolveProfile(ProfileFull))
-	if body.masked(source).goFacts != body.goFacts {
+	if body.masked(source).facts != body.facts {
 		t.Fatal("unchanged mask discarded shared facts")
 	}
 	masked := body.masked("func f() { other.Call() }")
-	if masked.goFacts != nil {
+	if masked.facts != nil {
 		t.Fatal("changed mask reused stale facts")
 	}
 	if !reflect.DeepEqual(receiverCalls(masked), receiverCalls(newSymbolBody(masked.text))) {
@@ -244,10 +243,10 @@ func TestGoRelationFactsActivationAndMasking(t *testing.T) {
 	// Malformed Go can contain dollar-prefixed names. The generic reference
 	// matcher remains authoritative for this unsupported lexical case.
 	fallback := newRelationSymbolBody("func f() { $x.Call(); return $load() }", "Go", resolveProfile(ProfileFull))
-	if fallback.goFacts != nil {
-		t.Fatal("dollar-prefixed snippet must use reference matchers")
+	if fallback.facts == nil {
+		t.Fatal("dollar-prefixed snippet must share reference matches")
 	}
-	assertGoRelationBodyEqual(t, "fallback", newSymbolBody(fallback.text), fallback)
+	assertRelationBodyEqual(t, "Go", "fallback", newSymbolBody(fallback.text), fallback)
 	// Unindexed patterns must still scan, even when facts exist for other patterns.
 	re := regexp.MustCompile(`send\((p)\)`)
 	if !reflect.DeepEqual(body.relationMatchIndices(re), re.FindAllStringSubmatchIndex(body.stripped, -1)) {
@@ -280,8 +279,8 @@ func FuzzGoRelationFactsMatchesReference(f *testing.F) {
 		}
 		legacy := symbolBody{text: source, stripped: source}
 		optimized := legacy
-		optimized.goFacts = collectGoRelationFacts(source)
-		assertGoRelationBodyEqual(t, "fuzz", legacy, optimized)
+		optimized.facts = collectRelationFacts(source)
+		assertRelationBodyEqual(t, "Go", "fuzz", legacy, optimized)
 	})
 }
 
@@ -301,7 +300,7 @@ func BenchmarkGoRelationScanners(b *testing.B) {
 		for _, shared := range []bool{false, true} {
 			b.Run(fmt.Sprintf("blocks=%d/shared=%v", repeats, shared), func(b *testing.B) {
 				spec := resolveProfile(ProfileFull)
-				spec.shareGoRelationFacts = shared
+				spec.shareRelationFacts = shared
 				params := map[string]bool{"p": true}
 				b.ReportAllocs()
 				b.SetBytes(int64(len(source)))

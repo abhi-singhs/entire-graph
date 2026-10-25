@@ -5,18 +5,18 @@ import (
 	"strings"
 )
 
-// Flow extraction shares the identifier-boundary index built for the other Go
+// Flow extraction shares the identifier-boundary index built for the other
 // relation facts. The old matchers run only at compatible candidate locations;
 // captures and non-overlap ordering remain those of the reference regexes.
 // In particular, a legacy assignment match may start at the END of the previous
 // word and consume whitespace. Keep those boundaries and the preceding byte:
 // slicing at a boundary would otherwise change the meaning of \b.
-type goFlowPattern struct {
+type relationFlowPattern struct {
 	start, after *regexp.Regexp
 }
 
-var goFlowPatterns = func() map[*regexp.Regexp]goFlowPattern {
-	out := map[*regexp.Regexp]goFlowPattern{}
+var relationFlowPatterns = func() map[*regexp.Regexp]relationFlowPattern {
+	out := map[*regexp.Regexp]relationFlowPattern{}
 	for _, re := range []*regexp.Regexp{
 		returnCallRe, returnVarRe, returnPropertyRe, jsFallbackReturnRe,
 		assignCallRe, jsFallbackAssignRe, aliasAssignRe,
@@ -27,7 +27,7 @@ var goFlowPatterns = func() map[*regexp.Regexp]goFlowPattern {
 		collectionAddRe, collectionSetRe, collectionCallbackRe,
 		branchAssignedReturnFlowsBranchRe, flowCallSiteRe,
 	} {
-		out[re] = goFlowPattern{
+		out[re] = relationFlowPattern{
 			start: regexp.MustCompile(`\A(?:` + re.String() + `)`),
 			after: regexp.MustCompile(`\A(?s:.)(?:` + re.String() + `)`),
 		}
@@ -35,13 +35,13 @@ var goFlowPatterns = func() map[*regexp.Regexp]goFlowPattern {
 	return out
 }()
 
-func (facts *goRelationFacts) collectFlows(text string, boundaries []int) {
+func (facts *relationFacts) collectFlows(text string, boundaries []int) {
 	next := map[*regexp.Regexp]int{}
 	matchAt := func(re *regexp.Regexp, start int) {
 		if start < next[re] {
 			return
 		}
-		pattern := goFlowPatterns[re]
+		pattern := relationFlowPatterns[re]
 		offset := start
 		var match []int
 		if start == 0 {
@@ -65,7 +65,7 @@ func (facts *goRelationFacts) collectFlows(text string, boundaries []int) {
 		next[re] = match[1]
 	}
 	for _, start := range boundaries {
-		at := goRelationSkipSpace(text, start)
+		at := relationSkipSpace(text, start)
 		if at == len(text) {
 			continue
 		}
@@ -73,12 +73,12 @@ func (facts *goRelationFacts) collectFlows(text string, boundaries []int) {
 			matchAt(destructuredAssignCallRe, start)
 			continue
 		}
-		if !goRelationWordStart(text[at]) {
+		if !relationWordStart(text[at]) {
 			continue
 		}
-		end := goRelationWordEnd(text, at)
+		end := relationWordEnd(text, at)
 		word := text[at:end]
-		after := goRelationSkipSpace(text, end)
+		after := relationSkipSpace(text, end)
 		if word == "return" {
 			matchAt(returnCallRe, start)
 			matchAt(returnVarRe, start)
@@ -140,8 +140,8 @@ func flowCallsFromMatches(text string, matches [][]int) []flowCallFact {
 }
 
 func (body symbolBody) forwardingCallFacts() []flowCallFact {
-	if body.goFacts != nil {
-		return body.goFacts.flowCalls
+	if body.facts != nil {
+		return body.facts.flowCalls
 	}
 	return flowCallsFromMatches(body.stripped, flowCallSiteRe.FindAllStringSubmatchIndex(body.stripped, -1))
 }

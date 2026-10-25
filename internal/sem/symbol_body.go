@@ -14,20 +14,20 @@ package sem
 type symbolBody struct {
 	text     string
 	stripped string
-	goFacts  *goRelationFacts
+	facts    *relationFacts
 }
 
 func newSymbolBody(text string) symbolBody {
 	return symbolBody{text: text, stripped: stripCodeLiteralsAndComments(text)}
 }
 
-// newRelationSymbolBody shares immutable lexical facts within one Go symbol's
-// full relation pass. Other languages and lighter profiles retain their existing
-// scanners; facts never escape this body or enter a persistent cache.
+// newRelationSymbolBody shares immutable matches within one callable symbol's
+// full relation pass. Language-specific interpretation remains in the scanners;
+// facts never escape this body or enter a persistent cache.
 func newRelationSymbolBody(text, language string, spec profileSpec) symbolBody {
 	body := newSymbolBody(text)
-	if language == "Go" && spec.shareGoRelationFacts {
-		body.goFacts = collectGoRelationFacts(body.stripped)
+	if spec.shareRelationFacts && callExtractionLanguage(language) {
+		body.facts = collectRelationFacts(body.stripped)
 	}
 	return body
 }

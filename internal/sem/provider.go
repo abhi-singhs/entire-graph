@@ -603,9 +603,9 @@ type profileSpec struct {
 	relations       map[string]bool
 	includeEvidence bool
 	callResolution  string // "full" | "shallow" | "none"
-	// shareGoRelationFacts changes execution only, never emitted records. Keep
+	// shareRelationFacts changes execution only, never emitted records. Keep
 	// the reference path available for differential tests of the full profile.
-	shareGoRelationFacts bool
+	shareRelationFacts bool
 }
 
 func (s profileSpec) emits(relationType string) bool { return s.relations[relationType] }
@@ -698,7 +698,7 @@ func resolveProfile(p Profile) profileSpec {
 	case ProfileFast:
 		return profileSpec{name: ProfileFast, relations: relationTypeSet("DEFINES", "CONTAINS", "IMPORTS", "CALLS", "CONSTRUCTS", "HANDLES_ROUTE", "HANDLES_TOOL", "CONFIGURES", "RESOURCE_DEPENDS_ON"), includeEvidence: false, callResolution: "shallow"}
 	default:
-		return profileSpec{name: ProfileFull, relations: relationTypeSet(relationTypes...), includeEvidence: true, callResolution: "full", shareGoRelationFacts: true}
+		return profileSpec{name: ProfileFull, relations: relationTypeSet(relationTypes...), includeEvidence: true, callResolution: "full", shareRelationFacts: true}
 	}
 }
 
@@ -6047,11 +6047,11 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 				// paid for. Revisit if a corpus shows it is not rare.
 				edgeOrder := []string{}
 				flowsByEdge := map[string]*RelationRecord{}
-				// For Go every lookup here has the same caller,
+				// Every lookup here has the same caller,
 				// imports and resolution mode. Multiple evidence items for one
 				// callee can therefore share its resolved targets (including misses).
 				var flowTargets map[string][]resolvedCallTarget
-				if body.goFacts != nil {
+				if body.facts != nil {
 					flowTargets = map[string][]resolvedCallTarget{}
 				}
 				for _, flow := range returnFlowCalls(body, symbolFlowParameterNames(from), flowSyntaxFor(file.Language)) {
