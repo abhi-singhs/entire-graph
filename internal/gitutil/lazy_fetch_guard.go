@@ -44,7 +44,7 @@ const lazyFetchGuardAlwaysFromMinor = 46
 
 // LazyFetchGuardRequirement names the Git releases that honour
 // GIT_NO_LAZY_FETCH for every lazy fetch, for diagnostics.
-const LazyFetchGuardRequirement = "Git 2.45.1 or newer (or 2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4 or 2.44.1 on an older release line)"
+const LazyFetchGuardRequirement = "Git 2.45.1 or newer (or, on an older release line, 2.39.4+, 2.40.2+, 2.41.1+, 2.42.2+, 2.43.4+ or 2.44.1+)"
 
 // LazyFetchGuardStatus reports whether a Git honours GIT_NO_LAZY_FETCH, which
 // every provider subprocess sets.

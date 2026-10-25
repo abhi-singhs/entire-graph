@@ -16,7 +16,8 @@ auto-generated notes on
 
 - Partial clones (`--filter=blob:none`, or any repository with a promisor
   remote) are no longer refused outright when the Git that runs in them is
-  2.45.1 or newer (or 2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4 or 2.44.1).
+  2.45.1 or newer (or, on an older release line, 2.39.4+, 2.40.2+, 2.41.1+,
+  2.42.2+, 2.43.4+ or 2.44.1+).
   `index --head` used to fail on them and every query rebuilt an uncached
   working-tree snapshot; now `index --head`, `query --head`, `impact`,
   `neighbors`, `def`, `context`, `store`, `health` and `snapshot` read the

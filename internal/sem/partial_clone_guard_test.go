@@ -90,7 +90,7 @@ func TestPartialCloneRefusalNamesTheGitVersionAndPromisesNoFallback(t *testing.T
 		"declares a promisor remote (a partial clone)",
 		"lazy fetching cannot be proven disabled for the Git on PATH (2.45.0)",
 		"Git subprocesses are refused for this repository",
-		"GIT_NO_LAZY_FETCH stops every lazy fetch in Git 2.45.1 or newer (or 2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4 or 2.44.1",
+		"GIT_NO_LAZY_FETCH stops every lazy fetch in Git 2.45.1 or newer (or, on an older release line, 2.39.4+, 2.40.2+, 2.41.1+, 2.42.2+, 2.43.4+ or 2.44.1+)",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("refusal cause %q lacks %q", got, want)

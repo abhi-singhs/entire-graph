@@ -25,8 +25,9 @@ func TestGitMetadataConfigGuardRejectsCoreWorktreeUNCBeforeLookup(t *testing.T) 
 }
 
 func TestGitMetadataConfigGuardRejectsPromisorUNCBeforeLookup(t *testing.T) {
-	// Git before 2.45 ignores GIT_NO_LAZY_FETCH and can stat this UNC URL while
-	// starting a lazy fetch, so the preflight must refuse it without looking.
+	// A Git not proven to honour GIT_NO_LAZY_FETCH (2.45.0 included) can stat
+	// this UNC URL while starting a lazy fetch, so the preflight must refuse it
+	// without looking.
 	useGitLazyFetchGuard(t, gitBeforeLazyFetchGuard)
 	cases := []struct {
 		name   string

@@ -581,3 +581,56 @@ exec ` + strconv.Quote(realGit) + ` "$@"
 	}
 	fc.assertMissing(t, "after commands through the symlink")
 }
+
+// The real shape on an Entire checkout: origin is an ordinary remote and the
+// promisor is the checkpoint remote, named by its URL, so the config key is
+// remote.https://github.com/entireio/cli-checkpoints.git.promisor (dots,
+// slashes and a colon in the subsection). Detection and admission must not
+// depend on the promisor being origin.
+func TestPartialCloneWithAURLNamedCheckpointPromisor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the stand-in Git and spy are POSIX shell scripts")
+	}
+	const checkpoints = "https://github.com/entireio/cli-checkpoints.git"
+	urlNamed := func(t *testing.T) partialClone {
+		t.Helper()
+		fc := newPartialClone(t, false)
+		fixtureGit(t, fc.clone, "", "config", "--unset", "remote.origin.promisor")
+		fixtureGit(t, fc.clone, "", "config", "--unset", "remote.origin.partialclonefilter")
+		fixtureGit(t, fc.clone, "", "config", "remote."+checkpoints+".promisor", "true")
+		fixtureGit(t, fc.clone, "", "config", "remote."+checkpoints+".partialclonefilter", "blob:none")
+		if got := fixtureGit(t, fc.clone, "", "config", "--get-regexp", `^remote\..*\.promisor$`); got != "remote."+checkpoints+".promisor true" {
+			t.Fatalf("fixture promisor config = %q, want only the URL-named checkpoint remote", got)
+		}
+		return fc
+	}
+
+	t.Run("detected and refused on an unproven Git", func(t *testing.T) {
+		fc := urlNamed(t)
+		writeGitShim(t, "2.45.0", "")
+		cacheDir := t.TempDir()
+		_, err := runPartialCloneCommand(t, fc.clone, cacheDir, "index", "--repo", fc.clone, "--head", "--format", "json", "--cache-dir", cacheDir)
+		if err == nil || !strings.Contains(err.Error(), "declares a promisor remote (a partial clone)") {
+			t.Fatalf("index --head with a URL-named promisor on Git 2.45.0 = %v, want the promisor refusal", err)
+		}
+	})
+
+	t.Run("admitted offline without a fetch on a proven Git", func(t *testing.T) {
+		requireGitHonoursNoLazyFetch(t)
+		fc := urlNamed(t)
+		spyDir := t.TempDir()
+		spyLog := filepath.Join(t.TempDir(), "child-git.log")
+		if err := os.WriteFile(filepath.Join(spyDir, "git"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> "+strconv.Quote(spyLog)+"\nexit 1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("GIT_EXEC_PATH", spyDir)
+		response := indexPartialClone(t, fc.clone, t.TempDir())
+		if response.Counts.Files != 3 || len(response.PartialFailures) != 0 {
+			t.Fatalf("index counts = %#v, failures %#v; want all 3 HEAD files", response.Counts, response.PartialFailures)
+		}
+		if data, _ := os.ReadFile(spyLog); strings.TrimSpace(string(data)) != "" {
+			t.Fatalf("indexing started Git child commands (a lazy fetch from the checkpoint remote):\n%s", data)
+		}
+		fc.assertMissing(t, "after index")
+	})
+}

@@ -38,8 +38,8 @@ other is installation.
   structural settings Git needs; active `core.worktree` paths are checked by
   the same rooted preflight. Active partial-clone/promisor configuration is
   admitted only when the Git that runs in the repository is proven to honour
-  `GIT_NO_LAZY_FETCH`: Git 2.45.1 or newer, or 2.39.4, 2.40.2, 2.41.1, 2.42.2,
-  2.43.4 or 2.44.1 on an older release line (git/git@7b70e9efb18c). Every
+  `GIT_NO_LAZY_FETCH`: Git 2.45.1 or newer, or, on an older release line,
+  2.39.4+, 2.40.2+, 2.41.1+, 2.42.2+, 2.43.4+ or 2.44.1+ (git/git@7b70e9efb18c). Every
   provider Git subprocess sets `GIT_NO_LAZY_FETCH=1`, and those releases check
   it before starting any lazy fetch, so a missing promised object is a local
   read failure (reported as an unreadable file, or as a command error) and the

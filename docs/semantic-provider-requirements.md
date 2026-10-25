@@ -430,8 +430,8 @@ It also detects active partial-clone/promisor
 configuration: `extensions.partialClone`, a true `remote.*.promisor`, or any
 `remote.*.partialCloneFilter`. Such a repository is admitted only when the Git
 that runs in it is proven to honour the `GIT_NO_LAZY_FETCH=1` every provider
-subprocess sets: Git 2.45.1 or newer, or the 2.39.4, 2.40.2, 2.41.1, 2.42.2,
-2.43.4 and 2.44.1 backports of git/git@7b70e9efb18c, which check it in
+subprocess sets: Git 2.45.1 or newer, or the 2.39.4+, 2.40.2+, 2.41.1+,
+2.42.2+, 2.43.4+ and 2.44.1+ backport lines of git/git@7b70e9efb18c, which check it in
 `fetch_objects()` before any lazy fetch starts. A missing promised object then
 fails locally and no fetch process is started. Every other release, including
 2.45.0 (whose rename-detection prefetch ignores the variable), can start the
