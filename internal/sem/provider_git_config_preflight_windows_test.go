@@ -68,7 +68,7 @@ func TestGitMetadataConfigGuardRejectsPromisorUNCBeforeLookup(t *testing.T) {
 	}
 }
 
-// With Git 2.45 or newer the same configuration is admitted, and the preflight
+// On a Git proven to honour GIT_NO_LAZY_FETCH the same configuration is admitted, and the preflight
 // itself must still treat the UNC URL as inert config text: admission is a
 // version decision, never a lookup of the promisor URL.
 func TestGitMetadataConfigGuardAdmitsPromisorUNCWithoutLookupWhenLazyFetchIsDisabled(t *testing.T) {

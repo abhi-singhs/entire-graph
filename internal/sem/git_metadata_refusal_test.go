@@ -24,18 +24,18 @@ func writeRepoConfig(t *testing.T, body string) string {
 // unreadable repository metadata" -- it never says which of a dozen conditions
 // tripped. Each recognised cause must name itself.
 func TestGitMetadataRefusalNamesItsCause(t *testing.T) {
-	// Not parallel: a partial clone is a cause only on Git older than 2.45, so
-	// this stands in such a Git for its (parallel) subtests.
+	// Not parallel: a partial clone is a cause only on a Git not proven to honour
+	// GIT_NO_LAZY_FETCH, so this stands in such a Git for its (parallel) subtests.
 	useGitLazyFetchGuard(t, gitBeforeLazyFetchGuard)
 
 	for name, tc := range map[string]struct{ config, want string }{
 		"promisor remote": {
 			"[remote \"https://example.invalid/x.git\"]\n\tpromisor = true\n\tpartialclonefilter = blob:none\n",
-			"promisor remote (a partial clone), and the Git on PATH (2.44.0) predates Git 2.45",
+			"promisor remote (a partial clone), and lazy fetching cannot be proven disabled for the Git on PATH (2.45.0)",
 		},
 		"partial clone extension": {
 			"[extensions]\n\tpartialclone = origin\n",
-			"partial-clone extension, and the Git on PATH (2.44.0) predates Git 2.45",
+			"partial-clone extension, and lazy fetching cannot be proven disabled for the Git on PATH (2.45.0)",
 		},
 		"include": {
 			"[include]\n\tpath = ../other\n",

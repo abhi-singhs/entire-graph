@@ -18107,19 +18107,22 @@ func gitMetadataDirectoryPathsSafeWithResolver(resolver *sameVolumePathResolver,
 	if !gitMetadataTreesSafeWithResolver(resolver, trees) {
 		return false
 	}
-	// A partial clone is admitted only when the Git that will run honours
-	// GIT_NO_LAZY_FETCH, which every provider subprocess sets: from Git 2.45 a
-	// missing promised object is a local read failure and no fetch process is
-	// ever started. Older Git ignores the variable and spawns the fetch, which
-	// can inspect a local or UNC promisor URL before GIT_ALLOW_PROTOCOL denies
-	// the transport, so those versions keep the refusal. Asked last, so only a
-	// repository that passed every filesystem check pays for the version probe.
-	return !partialClone || gitLazyFetchGuard().Effective
+	// A partial clone is admitted only when the Git that will run here honours
+	// GIT_NO_LAZY_FETCH for every lazy fetch (see gitutil.LazyFetchGuard: Git
+	// 2.45.1+, or the 2.39.4-2.44.1 backports). With it, a missing promised
+	// object is a local read failure and no fetch process is ever started. Any
+	// other Git -- 2.45.0 included -- can still spawn the fetch, which may stat a
+	// local or UNC promisor URL before GIT_ALLOW_PROTOCOL denies the transport,
+	// so it keeps the refusal. The probe runs in the repository directory, where
+	// the provider's own Git commands run, and is asked last so only a
+	// repository that passed every filesystem check pays for it.
+	return !partialClone || gitLazyFetchGuard(resolver.baseAbs).Effective
 }
 
-// gitLazyFetchGuard reports whether the runtime Git honours GIT_NO_LAZY_FETCH.
-// It is a variable only so tests can stand in a Git older than 2.45;
-// production always uses gitutil.LazyFetchGuard.
+// gitLazyFetchGuard reports whether the Git that runs in dir honours
+// GIT_NO_LAZY_FETCH. It is a variable only so tests can stand in another Git;
+// production always uses gitutil.LazyFetchGuard, whose per-process cache gives
+// the safety decision and its diagnosis the same answer.
 var gitLazyFetchGuard = gitutil.LazyFetchGuard
 
 const (
@@ -18925,14 +18928,21 @@ func describeGitMetadataRefusal(repo string) string {
 		return "its Git config could not be parsed under Git's own config grammar, so it is refused rather than guessed at"
 	}
 	// A partial clone is a cause only when the predicate would refuse it, i.e.
-	// when the runtime Git does not honour GIT_NO_LAZY_FETCH. With Git 2.45 or
-	// newer the predicate admits it, so blaming it would hide the real cause.
-	partialCloneRefused := config.declaresPartialClone() && !gitLazyFetchGuard().Effective
+	// when the Git that runs here is not proven to honour GIT_NO_LAZY_FETCH.
+	// Otherwise the predicate admits it, and blaming it would hide the real
+	// cause. Ask once and use that answer for both the decision and the text;
+	// gitutil.LazyFetchGuard caches every outcome, so it is also the answer the
+	// predicate used.
+	guard := gitutil.LazyFetchGuardStatus{}
+	if config.declaresPartialClone() {
+		guard = gitLazyFetchGuard(repoAbs)
+	}
+	partialCloneRefused := config.declaresPartialClone() && !guard.Effective
 	switch {
 	case partialCloneRefused && config.hasPromisorRemote:
-		return partialCloneRefusalReason("declares a promisor remote (a partial clone)")
+		return partialCloneRefusalReason("declares a promisor remote (a partial clone)", guard)
 	case partialCloneRefused && config.hasPartialCloneExtension:
-		return partialCloneRefusalReason("enables the partial-clone extension")
+		return partialCloneRefusalReason("enables the partial-clone extension", guard)
 	case config.hasInclude:
 		return "its Git config uses include or includeIf, so the effective configuration is not knowable from this file alone"
 	case config.hasCoreWorktree && !gitCoreWorktreePathSafeWithResolver(resolver, gitDir, config.coreWorktree):
@@ -18948,15 +18958,19 @@ func describeGitMetadataRefusal(repo string) string {
 // what holds for every caller -- Git subprocesses are refused -- and leaves any
 // fallback to the caller, because `index --head` has none while query paths
 // fall back to a filesystem walk and report that in their own warning.
-func partialCloneRefusalReason(declaration string) string {
-	gitVersion := "the Git on PATH, whose version could not be determined,"
-	if version := gitLazyFetchGuard().Version; version != "" {
-		gitVersion = "the Git on PATH (" + version + ")"
+//
+// It claims only what is known: that lazy fetching cannot be proven disabled
+// for this Git. It does not say the Git is old (2.45.0 is newer than the 2.44.1
+// backport) or, for an unknown version, anything about the version at all.
+func partialCloneRefusalReason(declaration string, guard gitutil.LazyFetchGuardStatus) string {
+	gitVersion := "the Git on PATH, whose version could not be determined"
+	if guard.Version != "" {
+		gitVersion = "the Git on PATH (" + guard.Version + ")"
 	}
-	return "its Git config " + declaration + ", and " + gitVersion + " predates Git " +
-		gitutil.LazyFetchGuardMinimumVersion + ", so it ignores GIT_NO_LAZY_FETCH and could contact the promisor remote " +
-		"to fetch a missing object; Git subprocesses are refused for this repository. " +
-		"Git " + gitutil.LazyFetchGuardMinimumVersion + " or newer reads partial clones offline"
+	return "its Git config " + declaration + ", and lazy fetching cannot be proven disabled for " + gitVersion +
+		", so a Git command here could contact the promisor remote to fetch a missing object; " +
+		"Git subprocesses are refused for this repository. GIT_NO_LAZY_FETCH stops every lazy fetch in " +
+		gitutil.LazyFetchGuardRequirement
 }
 
 // diagnosableGitDirectory returns `<repo>/.git` when it is a directory this

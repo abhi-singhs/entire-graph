@@ -128,9 +128,11 @@ func RevParse(ctx context.Context, repo, rev string) (string, error) {
 // in that diff reads the parent's blobs. A partial clone usually lacks them, so
 // with lazy fetching disabled `show -s` fails ("unable to read <oid>") on any
 // HEAD that renames and edits a file. log with no diff option reads only the
-// commit object.
+// commit object. i18n.logOutputEncoding is pinned because a repository that
+// sets it to UTF-16 would otherwise re-encode the hex ids and make every
+// committed-tree command fail on "malformed" metadata.
 func HeadCommitAndTree(ctx context.Context, repo string) (string, string, error) {
-	out, err := run(ctx, repo, "git", "log", "-1", "--no-walk", "--no-show-signature", "--no-notes", "--format=%H%x00%T", "--end-of-options", "HEAD^{commit}")
+	out, err := run(ctx, repo, "git", "-c", "i18n.logOutputEncoding=UTF-8", "log", "-1", "--no-walk", "--no-show-signature", "--no-notes", "--format=%H%x00%T", "--end-of-options", "HEAD^{commit}")
 	if err != nil {
 		return "", "", err
 	}
@@ -2660,20 +2662,21 @@ func run(ctx context.Context, dir, name string, args ...string) (string, error) 
 
 const (
 	rawGitObjectsEnv = "GIT_NO_REPLACE_OBJECTS=1"
-	// noLazyFetchEnv is the guard that keeps a partial clone offline: from Git
-	// 2.45 (git/git@2c206fc) the promisor fetch path checks it before spawning
-	// `git fetch`, so a missing promised object is a local read failure and the
-	// promisor URL is never opened. This package's floor is Git 2.36
-	// (cat-file --batch-command), and older Git ignores the variable, so the
+	// noLazyFetchEnv is the guard that keeps a partial clone offline: in Git
+	// 2.45.1+ (and the 2.39.4-2.44.1 backports; git/git@7b70e9efb18c)
+	// promisor-remote.c fetch_objects() checks it before spawning `git fetch`,
+	// so a missing promised object is a local read failure and the promisor URL
+	// is never opened. This package's floor is Git 2.36 (cat-file
+	// --batch-command), and other releases -- 2.45.0 included, whose rename
+	// prefetch ignores the variable -- can still start the fetch, so the
 	// repository metadata preflight admits partial-clone/promisor configuration
-	// only when LazyFetchGuard reports Git 2.45 or newer.
+	// only when LazyFetchGuard proves the Git honours it.
 	noLazyFetchEnv = "GIT_NO_LAZY_FETCH=1"
 	// noTransportProtocolEnv is a second, independent no-egress guard for every
 	// transport and remote helper. It is not sufficient on its own for partial
-	// clones: Git before 2.45 starts the lazy fetch and can stat a local/UNC
-	// promisor URL before it applies the protocol allowlist. This tool never
-	// intentionally fetches, clones, or pushes, so blocking every protocol costs
-	// it nothing.
+	// clones: a Git that starts the lazy fetch can stat a local/UNC promisor URL
+	// before it applies the protocol allowlist. This tool never intentionally
+	// fetches, clones, or pushes, so blocking every protocol costs it nothing.
 	noTransportProtocolEnv = "GIT_ALLOW_PROTOCOL="
 	// Listing and object inspection are read-only. Disable optional lock and
 	// index-refresh writes even when repository configuration would request one.
@@ -2706,8 +2709,8 @@ const (
 // subprocess in this package, it disables replace refs: exact tree/object IDs
 // are the immutable snapshot boundary, regardless of later refs/replace edits.
 // It also disables lazy fetching. Production entrypoints admit a partial
-// clone only when the runtime Git honours that guard (2.45 or newer); the Git
-// 2.36 compatibility floor predates it.
+// clone only when LazyFetchGuard proves the runtime Git honours that guard;
+// the Git 2.36 compatibility floor predates it.
 func newGitCmdWithCallerLocale(ctx context.Context, dir string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
@@ -2891,8 +2894,8 @@ func gitSafeDirectoryValues(dir string) []string {
 // prints its "BAD" sentinel for a blob it cannot size, which callers already
 // classify as LimitedFileUnreadable rather than treating as an error.
 // Production metadata preflight admits active promisor configuration only when
-// the runtime Git honours GIT_NO_LAZY_FETCH (2.45 or newer), because older Git
-// can inspect a local/UNC URL before applying GIT_ALLOW_PROTOCOL; see
+// LazyFetchGuard proves the runtime Git honours GIT_NO_LAZY_FETCH, because any
+// other Git can inspect a local/UNC URL before applying GIT_ALLOW_PROTOCOL; see
 // noLazyFetchEnv and noTransportProtocolEnv.
 func newCmd(ctx context.Context, dir, name string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, name, args...)

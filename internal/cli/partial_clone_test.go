@@ -132,13 +132,14 @@ func (fc partialClone) assertMissing(t *testing.T, stage string) {
 	}
 }
 
-// requireGitHonoursNoLazyFetch skips on a Git older than 2.45, where the
-// provider refuses partial clones (TestIndexHeadRefusesPartialCloneOnGitBefore245
-// covers that branch with a stand-in Git).
+// requireGitHonoursNoLazyFetch skips on a Git not proven to honour
+// GIT_NO_LAZY_FETCH, where the provider refuses partial clones
+// (TestIndexHeadRefusesPartialCloneOnUnprovenGit covers that branch with a
+// stand-in Git).
 func requireGitHonoursNoLazyFetch(t *testing.T) {
 	t.Helper()
-	if status := gitutil.LazyFetchGuard(); !status.Effective {
-		t.Skipf("the Git on PATH (%q) predates Git %s and ignores GIT_NO_LAZY_FETCH", status.Version, gitutil.LazyFetchGuardMinimumVersion)
+	if status := gitutil.LazyFetchGuard(t.TempDir()); !status.Effective {
+		t.Skipf("the Git on PATH (%q) is not proven to honour GIT_NO_LAZY_FETCH; it needs %s", status.Version, gitutil.LazyFetchGuardRequirement)
 	}
 }
 
@@ -298,24 +299,25 @@ func writeGitShim(t *testing.T, version, log string) {
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
-// (c) On a Git that ignores GIT_NO_LAZY_FETCH the refusal stays, and its text
-// is true for index --head, which has no filesystem fallback.
-func TestIndexHeadRefusesPartialCloneOnGitBefore245(t *testing.T) {
+// (c) On a Git not proven to honour GIT_NO_LAZY_FETCH -- 2.45.0, whose rename
+// prefetch ignores it -- the refusal stays, and its text is true for
+// index --head, which has no filesystem fallback.
+func TestIndexHeadRefusesPartialCloneOnUnprovenGit(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the stand-in Git is a POSIX shell script")
 	}
 	fc := newPartialClone(t, false)
-	writeGitShim(t, "2.44.0", "")
+	writeGitShim(t, "2.45.0", "")
 
 	cacheDir := t.TempDir()
 	_, err := runPartialCloneCommand(t, fc.clone, cacheDir, "index", "--repo", fc.clone, "--head", "--format", "json", "--cache-dir", cacheDir)
 	if err == nil {
-		t.Fatal("index --head admitted a partial clone on Git 2.44, which ignores GIT_NO_LAZY_FETCH")
+		t.Fatal("index --head admitted a partial clone on Git 2.45.0, whose rename prefetch ignores GIT_NO_LAZY_FETCH")
 	}
 	message := err.Error()
 	for _, want := range []string{
 		"refuse Git subprocesses for unsafe or unreadable repository metadata",
-		"declares a promisor remote (a partial clone), and the Git on PATH (2.44.0) predates Git 2.45",
+		"declares a promisor remote (a partial clone), and lazy fetching cannot be proven disabled for the Git on PATH (2.45.0)",
 		"Git subprocesses are refused for this repository",
 	} {
 		if !strings.Contains(message, want) {
@@ -453,4 +455,64 @@ func gitSubcommand(argv string) string {
 		}
 	}
 	return ""
+}
+
+// The product-level form of the version table: whichever Git is on PATH, no
+// provider command may start a lazy fetch on a partial clone. HEAD here renames
+// and edits a file whose parent blob is withheld, so `log --name-only`
+// (co-change), `diff --find-renames` and rename detection all reach Git's
+// blob prefetch, the path Git 2.45.0 does not guard. A spy `git` in
+// GIT_EXEC_PATH records any child Git process. It always checks the Git on
+// PATH; ENTIRE_GRAPH_TEST_GITS (a PATH-list of executables) adds more, such as
+// source builds of 2.45.0 (must be refused) and 2.45.1 (admitted, no fetch).
+func TestNoProviderCommandStartsALazyFetchWhicheverGitIsOnPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the spy Git is a POSIX shell script")
+	}
+	gits := []string{""}
+	for _, extra := range filepath.SplitList(os.Getenv("ENTIRE_GRAPH_TEST_GITS")) {
+		if extra != "" {
+			gits = append(gits, extra)
+		}
+	}
+	spyDir := t.TempDir()
+	spyLog := filepath.Join(t.TempDir(), "child-git.log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + strconv.Quote(spyLog) + "\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(spyDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	basePath := os.Getenv("PATH")
+	for _, gitBinary := range gits {
+		label := "PATH"
+		path := basePath
+		if gitBinary != "" {
+			label = gitBinary
+			path = filepath.Dir(gitBinary) + string(os.PathListSeparator) + basePath
+		}
+		t.Run(filepath.Base(filepath.Dir(filepath.Dir(label)))+"-"+filepath.Base(label), func(t *testing.T) {
+			fc := newPartialClone(t, false)
+			t.Setenv("PATH", path)
+			t.Setenv("GIT_EXEC_PATH", spyDir)
+			_ = os.Remove(spyLog)
+			cacheDir := t.TempDir()
+			status := gitutil.LazyFetchGuard(fc.clone)
+			for _, args := range [][]string{
+				{"index", "--repo", fc.clone, "--head", "--format", "json", "--cache-dir", cacheDir},
+				{"query", "--repo", fc.clone, "--head", "--format", "json", "--cache-dir", cacheDir, "--query", "Alpha"},
+				{"diff", "--repo", fc.clone, "--base", "HEAD~1", "--head", "HEAD", "--json"},
+				{"commit", "--repo", fc.clone, "--json", "HEAD"},
+			} {
+				_, _ = runPartialCloneCommand(t, fc.clone, cacheDir, args...)
+			}
+			data, err := os.ReadFile(spyLog)
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			if log := strings.TrimSpace(string(data)); log != "" {
+				t.Fatalf("with Git %q on PATH (guard effective %v) provider commands started Git child commands (a lazy fetch):\n%s",
+					status.Version, status.Effective, log)
+			}
+			fc.assertMissing(t, "after provider commands")
+		})
+	}
 }
