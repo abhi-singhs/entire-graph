@@ -1,6 +1,7 @@
 package gitutil
 
 import (
+	"bytes"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -9,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -384,14 +384,52 @@ var launchFunctions = map[string]map[string]bool{
 // processCFunctions are the libc and Win32 entry points that create or replace
 // a process; cgo code (Go calls through C., preambles and C sources) may not
 // use them.
-var processCFunctions = map[string]bool{
-	"system": true, "popen": true, "fork": true, "vfork": true, "execl": true, "execlp": true,
-	"execle": true, "execv": true, "execve": true, "execvp": true, "execvpe": true, "fexecve": true,
-	"posix_spawn": true, "posix_spawnp": true, "WinExec": true, "CreateProcessA": true,
-	"CreateProcessW": true, "ShellExecuteA": true, "ShellExecuteW": true,
+var processCFunctionNames = []string{
+	"system", "popen", "fork", "vfork", "execl", "execlp", "execle", "execv", "execve", "execvp",
+	"execvpe", "fexecve", "posix_spawn", "posix_spawnp", "WinExec", "CreateProcess", "CreateProcessA",
+	"CreateProcessW", "CreateProcessAsUserA", "CreateProcessAsUserW", "ShellExecute", "ShellExecuteA",
+	"ShellExecuteW", "ShellExecuteExA", "ShellExecuteExW",
 }
 
-var processCFunctionCall = regexp.MustCompile(`\b(system|popen|fork|vfork|execl|execlp|execle|execv|execve|execvp|execvpe|fexecve|posix_spawnp?|WinExec|CreateProcess\w*|ShellExecute\w*)\s*\(`)
+var processCFunctions = func() map[string]bool {
+	names := make(map[string]bool, len(processCFunctionNames))
+	for _, name := range processCFunctionNames {
+		names[name] = true
+	}
+	return names
+}()
+
+// findProcessCFunctionCall returns the first process-creating C function called
+// in source (a name on an identifier boundary followed by optional blanks and
+// "("), or "". It uses bytes.Index rather than a regexp because the vendored
+// grammar sources are ~200 MB and a regexp pass takes minutes under -race.
+func findProcessCFunctionCall(source []byte) string {
+	identifier := func(c byte) bool {
+		return c == '_' || c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
+	}
+	for _, name := range processCFunctionNames {
+		needle := []byte(name)
+		for offset := 0; ; {
+			index := bytes.Index(source[offset:], needle)
+			if index < 0 {
+				break
+			}
+			start := offset + index
+			end := start + len(needle)
+			offset = end
+			if start > 0 && identifier(source[start-1]) {
+				continue
+			}
+			for end < len(source) && (source[end] == ' ' || source[end] == '\t') {
+				end++
+			}
+			if end < len(source) && source[end] == '(' {
+				return name
+			}
+		}
+	}
+	return ""
+}
 
 var cSourceExtensions = map[string]bool{".c": true, ".h": true, ".cc": true, ".cpp": true, ".m": true, ".mm": true}
 
@@ -549,8 +587,8 @@ func scanProcessLaunches(t *testing.T, root string, report func(string, ...any))
 			if err != nil {
 				return err
 			}
-			if match := processCFunctionCall.FindString(string(data)); match != "" {
-				report("%s: %s is C source that calls the process-creating C function %s", rel, rel, strings.TrimSpace(strings.TrimSuffix(match, "(")))
+			if match := findProcessCFunctionCall(data); match != "" {
+				report("%s: %s is C source that calls the process-creating C function %s", rel, rel, match)
 			}
 			return nil
 		}
@@ -597,8 +635,8 @@ func scanProcessLaunches(t *testing.T, root string, report func(string, ...any))
 						preamble += group.Text()
 					}
 				}
-				if match := processCFunctionCall.FindString(preamble); match != "" && !allowed("") {
-					report("%s: %s has a cgo preamble that calls the process-creating C function %s", fset.Position(importSpec.Pos()), rel, strings.TrimSpace(strings.TrimSuffix(match, "(")))
+				if match := findProcessCFunctionCall([]byte(preamble)); match != "" && !allowed("") {
+					report("%s: %s has a cgo preamble that calls the process-creating C function %s", fset.Position(importSpec.Pos()), rel, match)
 				}
 			}
 		}
