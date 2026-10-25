@@ -42,7 +42,9 @@ import (
 // v21 retires streams carrying DATA_FLOWS edges matched by another language's
 // expression patterns (a Python conditional pattern on a Go body and the
 // like); language-routed flow extraction no longer produces them.
-// v22 is #374's bump. v23 follows it and retires entries written before a failed
+// v22 retires streams carrying kind=tool symbols (and their HANDLES_TOOL edges)
+// fabricated from body text; tool boundaries now come from identifiers only.
+// v23 follows v22 and retires entries written before a failed
 // co-change history read was disclosed. Such an entry is keyed exactly as this
 // build keys the same failure (the history-unavailable scope and no pairs; the
 // reason is not, and need not be, in the key), so without the bump this build
@@ -383,6 +385,14 @@ func providerRecordsRepoRootField(root string) []byte {
 func (transaction *ProviderRecordsCacheTransaction) Store(spool *ProviderRecordsSpool, summary *SnapshotSummary, observed SnapshotHeader) error {
 	if transaction == nil || !transaction.enabled || spool == nil {
 		spool.Abandon()
+		return nil
+	}
+	if SnapshotTruncated(summary) {
+		// A truncated stream is not this tree's answer. The key is derived from
+		// the tree and the graph-shaping options only, so persisting a
+		// truncation would hand it to every later caller as the complete index.
+		// Not an error: persistence here is best effort by contract, and the
+		// caller already has the (correctly self-describing) records in hand.
 		return nil
 	}
 	if observed.SchemaVersion != SchemaVersion ||

@@ -430,12 +430,18 @@ required to read the selected repository, but the bounded metadata preflight
 rejects active `[include]` and `[includeIf]` sections before Git starts,
 including sections in `config.worktree` when `extensions.worktreeConfig`
 enables it. The same preflight parses and checks an active `core.worktree` path.
-It also rejects active partial-clone/promisor
+It also detects active partial-clone/promisor
 configuration: `extensions.partialClone`, a true `remote.*.promisor`, or any
-`remote.*.partialCloneFilter`. Git before 2.45 can inspect a local or UNC
-promisor URL before applying the transport deny-list, so partial clones are
-refused across the supported Git range rather than weakening no-egress on older
-clients.
+`remote.*.partialCloneFilter`. Such a repository is admitted only when the Git
+that runs in it is proven to honour the `GIT_NO_LAZY_FETCH=1` every provider
+subprocess sets: Git 2.45.1 or newer, or the 2.39.4+, 2.40.2+, 2.41.1+,
+2.42.2+, 2.43.4+ and 2.44.1+ backport lines of git/git@7b70e9efb18c, which check it in
+`fetch_objects()` before any lazy fetch starts. A missing promised object then
+fails locally and no fetch process is started. Every other release, including
+2.45.0 (whose rename-detection prefetch ignores the variable), can start the
+fetch and inspect a local or UNC promisor URL before applying the transport
+deny-list, so partial clones are refused on it rather than weakening no-egress.
+An unknown or unparseable Git version is refused.
 
 Command-scope configuration must set selected-path `safe.directory` entries,
 `core.fsmonitor=false`,
@@ -494,6 +500,24 @@ following bounds are enforced:
   overrides; negative removes it). Truncation is deterministic in sorted path
   order and always reported as `W_FILE_LIMIT`, naming the real count, the limit
   and the override.
+- **Cancellation** — a cancelled context, or a deadline on the caller's own
+  context, stops `snapshot`, `symbols` and `edges` cooperatively: the parse and
+  relation phases poll it, and so do the content reader they share, so work
+  stops within one in-flight file read or parse per worker. A stopped run
+  returns the context's error and never emits a summary record, so a consumer
+  can tell a stopped stream from a complete one, and nothing it produced is
+  cached or served to a later query.
+  When SIGINT/SIGTERM caused the cancellation the CLI exits with status 130/143;
+  a signal that races with a command that nevertheless completes keeps that
+  success, and an independent command error keeps its own status. There is no
+  wall-clock ceiling on indexing: a deadline that should bound a run belongs on
+  the caller's context or a supervisor, and its expiry is an error, not a
+  truncation.
+- **Truncated snapshots are never cached** — every cache writer (the record
+  cache's `ProviderRecordsCacheTransaction.Store` and all three search snapshot
+  writers) refuses a snapshot carrying `E_ANALYSIS_BUDGET_EXCEEDED`, and the
+  CLI says so on stderr. The checks live in the writers so a new call site
+  cannot reintroduce the hole.
 - **Git worktree discovery cap** — each index, eligible-worktree, or explicitly
   requested ignored-worktree listing accepts at most 1,000,000 raw
   NUL-delimited records and 256 MiB including delimiters. These listings must
@@ -581,9 +605,10 @@ reproduce every Git-only policy and excluded files can therefore be present.
 - relation support per profile (`relation_support_by_profile`): the relation
   types each indexing profile emits (`full`, `fast`, `syntax-only`).
 - heuristic relation types (`heuristic_relation_types`): relations such as
-  `HANDLES_ROUTE` and `HANDLES_TOOL` that are detected by file-path and body
-  patterns rather than per-language grammar, so they are not attributed to a
-  single language.
+  `HANDLES_ROUTE` and `HANDLES_TOOL` that are detected by file-path, body or
+  name patterns rather than per-language grammar, so they are not attributed
+  to a single language. (`HANDLES_TOOL` reads only the handler's name and
+  signature, never its body text.)
 - unsupported-but-detected language hints when available
 - whether optional local-only features are available
 - whether any feature would require network access
