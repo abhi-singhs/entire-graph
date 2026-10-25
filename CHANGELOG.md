@@ -30,6 +30,9 @@ auto-generated notes on
   `FILE_CHANGES_WITH` relation silently. The snapshot carries a
   `W_COCHANGE_HISTORY_UNAVAILABLE` warning with Git's reason, and `impact`
   reports co-change coupling as unknown instead of "No co-change coupling found".
+  The records cache version moves to v23, so an entry an earlier build wrote for
+  such a failure, keyed identically but carrying no warning, is rebuilt instead of
+  replayed.
 
 ## [0.5.0] - 2026-10-23
 

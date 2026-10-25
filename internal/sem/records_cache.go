@@ -42,7 +42,13 @@ import (
 // v21 retires streams carrying DATA_FLOWS edges matched by another language's
 // expression patterns (a Python conditional pattern on a Go body and the
 // like); language-routed flow extraction no longer produces them.
-const providerRecordsCacheVersion = "provider-records-v21-" + IdentityRevision
+// v22 is #374's bump. v23 follows it and retires entries written before a failed
+// co-change history read was disclosed. Such an entry is keyed exactly as this
+// build keys the same failure (the history-unavailable scope and no pairs; the
+// reason is not, and need not be, in the key), so without the bump this build
+// replays its summary, which lacks W_COCHANGE_HISTORY_UNAVAILABLE: the silent
+// drop the warning exists to end.
+const providerRecordsCacheVersion = "provider-records-v23-" + IdentityRevision
 
 // cachedProviderRecords is the on-disk envelope for a cached record stream. The
 // key alone is authoritative (sha256 over version+commit+tree+mode+profile+
@@ -102,12 +108,18 @@ func providerRecordsKey(absRepo, repositoryKey, providerVersion, commit, tree, m
 // address the entry a build at another schema would have written. Production
 // reaches it only through providerRecordsKey, which supplies SchemaVersion.
 func providerRecordsKeyForSchema(schemaVersion, absRepo, repositoryKey, providerVersion, commit, tree, mode string, options ProviderSnapshotOptions, contexts ...context.Context) (string, error) {
+	return providerRecordsKeyForVersions(providerRecordsCacheVersion, schemaVersion, absRepo, repositoryKey, providerVersion, commit, tree, mode, options, contexts...)
+}
+
+// providerRecordsKeyForVersions also takes the cache version explicitly, so a test
+// can address the entry an earlier build wrote for the same inputs.
+func providerRecordsKeyForVersions(cacheVersion, schemaVersion, absRepo, repositoryKey, providerVersion, commit, tree, mode string, options ProviderSnapshotOptions, contexts ...context.Context) (string, error) {
 	policy, err := cachePolicyForOptions(absRepo, options)
 	if err != nil {
 		return "", err
 	}
 	hash := sha256.New()
-	writeCacheKeyString(hash, "cache-version", providerRecordsCacheVersion)
+	writeCacheKeyString(hash, "cache-version", cacheVersion)
 	// The record bytes are replayed VERBATIM, so the schema that shaped them is
 	// part of the entry's ADDRESS, not just of its contents.
 	writeCacheKeyString(hash, "schema-version", schemaVersion)

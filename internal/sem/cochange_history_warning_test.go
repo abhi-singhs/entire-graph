@@ -1,6 +1,8 @@
 package sem
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -172,6 +174,26 @@ func TestSearchCacheCochangeWarningTracksTheHistoryRefresh(t *testing.T) {
 // does not have (what a blob:none partial clone of a history with inexact renames looks like). HEAD
 // itself is readable, so the snapshot builds; only the co-change read fails.
 func TestSnapshotWarnsWhenHistoryNeedsAMissingBlob(t *testing.T) {
+	repo, oldBlob := missingBlobHistoryRepo(t)
+	snapshot, err := BuildProviderSnapshotWithOptions(t.Context(), repo, "history-test", ProviderSnapshotOptions{Profile: ProfileFull})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Header.Commit == "" {
+		t.Fatalf("premise: HEAD must stay readable, warnings %#v", snapshot.Header.Warnings)
+	}
+	warnings := cochangeWarnings(snapshot.Header.Warnings)
+	if len(warnings) != 1 || !strings.Contains(warnings[0].Detail, oldBlob) {
+		t.Fatalf("history that needs a missing blob must be disclosed, naming it; got %#v", snapshot.Header.Warnings)
+	}
+}
+
+// missingBlobHistoryRepo commits history with an inexact rename, then removes the
+// pre-rename blob from the object store. HEAD stays readable; `git log
+// --name-only` fails with "unable to read <oid>". It returns the repository and
+// that blob's id.
+func missingBlobHistoryRepo(t *testing.T) (string, string) {
+	t.Helper()
 	repo := t.TempDir()
 	git(t, repo, "init", "-q")
 	git(t, repo, "config", "user.name", "Entire Graph Test")
@@ -215,17 +237,120 @@ func TestSnapshotWarnsWhenHistoryNeedsAMissingBlob(t *testing.T) {
 	if err := exec.Command("git", "-C", repo, "cat-file", "-e", oldBlob).Run(); err == nil {
 		t.Fatal("premise: the old blob must be missing")
 	}
+	return repo, oldBlob
+}
 
-	snapshot, err := BuildProviderSnapshotWithOptions(t.Context(), repo, "history-test", ProviderSnapshotOptions{Profile: ProfileFull})
+// recordsCacheVersionsBeforeCochangeWarning are the records-cache versions that
+// builds without W_COCHANGE_HISTORY_UNAVAILABLE wrote under: v21 on main before
+// it, and v22 from #374, which lands first.
+var recordsCacheVersionsBeforeCochangeWarning = []string{
+	"provider-records-v21-" + IdentityRevision,
+	"provider-records-v22-" + IdentityRevision,
+}
+
+// An older build keys a failed history read exactly as this one does (the
+// unavailable scope and no pairs; the reason is not in the key), so its entry,
+// whose summary has no warning, sits at this build's address unless the cache
+// version moved. Replaying it would bring back the silent drop.
+func TestRecordsCacheDoesNotReplayEntriesWrittenBeforeTheCochangeWarning(t *testing.T) {
+	repo, _ := missingBlobHistoryRepo(t)
+	commit, tree, err := resolveCommittedHEAD(t.Context(), repo)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Header.Commit == "" {
-		t.Fatalf("premise: HEAD must stay readable, warnings %#v", snapshot.Header.Warnings)
+	options := ProviderSnapshotOptions{Profile: ProfileFull}
+	const version, mode = "dev", "snapshot"
+
+	// What an older build produced for this tree: the same records, and a summary
+	// without the warning.
+	stale := func(transaction *ProviderRecordsCacheTransaction) ([]byte, SnapshotSummary, SnapshotHeader) {
+		t.Helper()
+		var stream bytes.Buffer
+		var summary SnapshotSummary
+		encoder := json.NewEncoder(&stream)
+		if err := StreamSnapshot(t.Context(), repo, version, transaction.Options(), func(record any) error {
+			if typed, ok := record.(SnapshotSummary); ok {
+				summary = typed
+				return nil
+			}
+			return encoder.Encode(record)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(cochangeWarnings(summary.Warnings)) != 1 {
+			t.Fatalf("premise: this build discloses the failed history read, got %#v", summary.Warnings)
+		}
+		summary.Warnings = withoutWarningCode(summary.Warnings, CochangeHistoryUnavailableCode)
+		header := SnapshotHeader{
+			SchemaVersion: SchemaVersion, Provider: ProviderName, ProviderVersion: version,
+			RepoKey: transaction.repositoryKey, Commit: commit, Tree: tree, Profile: string(transaction.options.Profile),
+		}
+		return stream.Bytes(), summary, header
 	}
-	warnings := cochangeWarnings(snapshot.Header.Warnings)
-	if len(warnings) != 1 || !strings.Contains(warnings[0].Detail, oldBlob) {
-		t.Fatalf("history that needs a missing blob must be disclosed, naming it; got %#v", snapshot.Header.Warnings)
+
+	// Control: at this build's own address, that entry WOULD replay silently. The
+	// cache version is the only thing keeping an older build's entry out.
+	controlDir := t.TempDir()
+	control, err := BeginProviderRecordsCache(t.Context(), repo, version, commit, tree, mode, controlDir, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, summary, header := stale(control)
+	spool, err := spoolRecords(control, records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Store(spool, &summary, header); err != nil {
+		t.Fatal(err)
+	}
+	if _, replayed, hit := control.Load(); !hit || len(cochangeWarnings(replayed.Warnings)) != 0 {
+		t.Fatalf("control: a warning-less entry at the current address must replay (hit=%v)", hit)
+	}
+
+	cacheDir := t.TempDir()
+	current, err := BeginProviderRecordsCache(t.Context(), repo, version, commit, tree, mode, cacheDir, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, previous := range recordsCacheVersionsBeforeCochangeWarning {
+		key, err := providerRecordsKeyForVersions(previous, SchemaVersion, current.absRepo, current.repositoryKey,
+			version, commit, tree, mode, current.options, t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		older := *current
+		if older.entry, err = newCacheEntry(cacheDir, "records", previous, key); err != nil {
+			t.Fatal(err)
+		}
+		if older.streamEntry, err = newCacheStreamEntry(cacheDir, "records", previous, key); err != nil {
+			t.Fatal(err)
+		}
+		spool, err := spoolRecords(&older, records)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := older.Store(spool, &summary, header); err != nil {
+			t.Fatal(err)
+		}
+		rewriteCachedJSON(t, filepath.Join(older.entry.root, older.entry.relative), func(object map[string]any) {
+			object["cache_version"] = previous
+		})
+	}
+	if _, replayed, hit := current.Load(); hit {
+		t.Fatalf("replayed an entry written before the co-change warning existed; warnings %#v", replayed.Warnings)
+	}
+	// On the miss the build runs, and the warning appears.
+	var warnings []ProviderWarning
+	if err := StreamSnapshot(t.Context(), repo, version, current.Options(), func(record any) error {
+		if typed, ok := record.(SnapshotSummary); ok {
+			warnings = typed.Warnings
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(cochangeWarnings(warnings)) != 1 {
+		t.Fatalf("the rebuild after the miss must disclose the failed history read, got %#v", warnings)
 	}
 }
 
