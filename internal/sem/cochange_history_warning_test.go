@@ -3,6 +3,7 @@ package sem
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -363,4 +364,121 @@ func gitOutput(t *testing.T, repo string, args ...string) string {
 		t.Fatalf("git %v: %v", args, err)
 	}
 	return string(out)
+}
+
+// searchCacheVersionsBeforeCochangeWarning are the search-cache versions that
+// builds without W_COCHANGE_HISTORY_UNAVAILABLE wrote under: v26 on main before
+// it, and v27 from #374, which lands first.
+var searchCacheVersionsBeforeCochangeWarning = []string{
+	"search-snapshot-v26-" + IdentityRevision,
+	"search-snapshot-v27-" + IdentityRevision,
+}
+
+// `graph store` and `graph context` serve the persisted search entry and its
+// sqlite sidecar without building, so unlike a query they never re-read history.
+// An entry an older build persisted for a tree whose history is unreadable has no
+// co-change warning in its header; this build must not hand it to them.
+func TestStoreAndContextDoNotServeEntriesWrittenBeforeTheCochangeWarning(t *testing.T) {
+	t.Setenv(searchStoreEnv, "1")
+	repo, _ := missingBlobHistoryRepo(t)
+	options := ProviderSnapshotOptions{Profile: ProfileFull}
+	const version = "dev"
+
+	// staleEntry is what an older build persisted: this tree's entry with no
+	// co-change warning in its header, under cacheVersion.
+	staleEntry := func(cacheDir string) (cachedSearchSnapshot, cacheEntry) {
+		t.Helper()
+		built, _, err := PreindexProviderSnapshot(t.Context(), repo, version, options, cacheDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(cochangeWarnings(built.Header.Warnings)) != 1 {
+			t.Fatalf("premise: this build discloses the failed history read, got %#v", built.Header.Warnings)
+		}
+		key, err := searchSnapshotKey(repo, built.Header.RepoKey, version, built.Header.Tree, options, t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry, err := newCacheEntry(cacheDir, "search", searchSnapshotCacheVersion, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cached, err := readSearchSnapshot(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cached.Snapshot.Header.Warnings = withoutWarningCode(cached.Snapshot.Header.Warnings, CochangeHistoryUnavailableCode)
+		return cached, entry
+	}
+	writeEntryAndStore := func(entry cacheEntry, cached cachedSearchSnapshot) {
+		t.Helper()
+		if err := writeSearchSnapshot(entry, cached); err != nil {
+			t.Fatal(err)
+		}
+		digest, err := entry.digest()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeSearchStoreSidecar(t.Context(), entry, digest.String(), &cached); err != nil {
+			t.Fatal(err)
+		}
+	}
+	headerCochangeWarnings := func(header json.RawMessage) int {
+		t.Helper()
+		var decoded SnapshotHeader
+		if err := json.Unmarshal(header, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		return len(cochangeWarnings(decoded.Warnings))
+	}
+
+	// Control: at this build's own address, a warning-less entry IS served by
+	// store and context. The cache version is the only thing keeping an older
+	// build's entry out.
+	controlDir := t.TempDir()
+	stale, current := staleEntry(controlDir)
+	writeEntryAndStore(current, stale)
+	described, err := DescribeSearchStore(t.Context(), repo, version, controlDir, options)
+	if err != nil || headerCochangeWarnings(described.Header) != 0 {
+		t.Fatalf("control: a warning-less entry at the current address must be served (err=%v)", err)
+	}
+
+	cacheDir := t.TempDir()
+	stale, current = staleEntry(cacheDir)
+	// Only the older builds' entries remain: what a cache looks like on the first
+	// run of this build.
+	for _, path := range []string{current.relative, searchStoreEntryFor(current).relative} {
+		if err := os.Remove(filepath.Join(current.root, path)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, previous := range searchCacheVersionsBeforeCochangeWarning {
+		key, err := searchSnapshotKeyForVersions(previous, SchemaVersion, repo, stale.Snapshot.Header.RepoKey,
+			version, stale.Snapshot.Header.Tree, options, t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		older, err := newCacheEntry(cacheDir, "search", previous, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		previousCached := stale
+		previousCached.CacheVersion = previous
+		writeEntryAndStore(older, previousCached)
+	}
+	if served, err := DescribeSearchStore(t.Context(), repo, version, cacheDir, options); !errors.Is(err, ErrSearchStoreMissing) {
+		t.Fatalf("graph store served an entry written before the co-change warning existed (err=%v, co-change warnings=%d)",
+			err, headerCochangeWarnings(served.Header))
+	}
+	if _, err := LoadSearchStoreContext(t.Context(), repo, version, cacheDir, "B", options, 5, 5, 5); !errors.Is(err, ErrSearchStoreMissing) {
+		t.Fatalf("graph context served an entry written before the co-change warning existed (err=%v)", err)
+	}
+	// The next build persists a fresh entry, and the store then carries the warning.
+	if _, _, err := PreindexProviderSnapshot(t.Context(), repo, version, options, cacheDir); err != nil {
+		t.Fatal(err)
+	}
+	rebuilt, err := DescribeSearchStore(t.Context(), repo, version, cacheDir, options)
+	if err != nil || headerCochangeWarnings(rebuilt.Header) != 1 {
+		t.Fatalf("the rebuilt store must disclose the failed history read (err=%v)", err)
+	}
 }

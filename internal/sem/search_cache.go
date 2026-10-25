@@ -44,7 +44,14 @@ import (
 // v25 retires entries before unresolved route placement and Go 1.22 method patterns.
 // v26 retires entries carrying DATA_FLOWS edges matched by another language's
 // expression patterns; language-routed flow extraction no longer produces them.
-const searchSnapshotCacheVersion = "search-snapshot-v26-" + IdentityRevision
+// v27 is #374's bump. v28 follows it and retires entries written before a failed
+// co-change history read was disclosed. The query path never serves such an entry
+// (its history refresh fails, which is a miss), but `graph store` and `graph
+// context` read the persisted entry and its sqlite sidecar without building, so a
+// pre-disclosure entry would hand them a header without
+// W_COCHANGE_HISTORY_UNAVAILABLE. The sidecar sits beside the entry under this
+// version's directory, so the bump orphans stale stores as well.
+const searchSnapshotCacheVersion = "search-snapshot-v28-" + IdentityRevision
 
 type cachedSymbolByteRange struct {
 	Start int `json:"start"`
@@ -1169,6 +1176,12 @@ func searchSnapshotKey(absRepo, repositoryKey, providerVersion, tree string, opt
 // validity check catches the wrong answer; it cannot stop the mutual eviction
 // that produced it, because by then the entry has already been replaced.
 func searchSnapshotKeyForSchema(schemaVersion, absRepo, repositoryKey, providerVersion, tree string, options ProviderSnapshotOptions, contexts ...context.Context) (string, error) {
+	return searchSnapshotKeyForVersions(searchSnapshotCacheVersion, schemaVersion, absRepo, repositoryKey, providerVersion, tree, options, contexts...)
+}
+
+// searchSnapshotKeyForVersions also takes the cache version explicitly, so a test
+// can address the entry an earlier build wrote for the same tree.
+func searchSnapshotKeyForVersions(cacheVersion, schemaVersion, absRepo, repositoryKey, providerVersion, tree string, options ProviderSnapshotOptions, contexts ...context.Context) (string, error) {
 	if options.Worktree {
 		return "", errors.New("working-tree snapshots cannot have persistent cache keys")
 	}
@@ -1177,7 +1190,7 @@ func searchSnapshotKeyForSchema(schemaVersion, absRepo, repositoryKey, providerV
 		return "", err
 	}
 	hash := sha256.New()
-	writeCacheKeyString(hash, "cache-version", searchSnapshotCacheVersion)
+	writeCacheKeyString(hash, "cache-version", cacheVersion)
 	writeCacheKeyString(hash, "schema-version", schemaVersion)
 	// No checkout path: the entry is content-addressed by the tree, so every
 	// worktree and clone of one repository at one tree shares it, and the loader

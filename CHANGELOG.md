@@ -32,7 +32,9 @@ auto-generated notes on
   reports co-change coupling as unknown instead of "No co-change coupling found".
   The records cache version moves to v23, so an entry an earlier build wrote for
   such a failure, keyed identically but carrying no warning, is rebuilt instead of
-  replayed.
+  replayed. The search cache version moves to v28 for the same reason: `graph
+  store` and `graph context` serve the persisted entry and its sqlite store without
+  building, so an earlier build's warning-less entry is retired rather than served.
 
 ## [0.5.0] - 2026-10-23
 
