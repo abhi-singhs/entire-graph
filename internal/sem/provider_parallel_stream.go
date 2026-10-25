@@ -13,20 +13,21 @@ import (
 // measured at ~31% of snapshot CPU in runtime.pthread_cond_signal. Batching
 // divides the handoffs by the batch size; the consumer still sees records in
 // exactly the order the worker produced them, so output bytes are unchanged.
-// The bound on admitted-but-unconsumed records per worker is
-// (providerStreamBufferBatches+1)*providerStreamBatchRecords plus the batch
-// being filled — a few MB across eight workers, the backpressure the old
-// 32-record buffer existed to provide, at a size that no longer starves the
-// producers between consumer wakeups.
+// Each admitted item holds at most providerStreamBufferBatches batches in its
+// channel; each active worker holds at most one more, and the consumer holds
+// one. The lookahead window is bounded independently of repository size.
 const (
 	providerStreamBatchRecords  = 256
-	providerStreamBufferBatches = 2
+	providerStreamBufferBatches = 8
+	providerStreamLookahead     = 4
 )
 
 // runIndexedStreamingPipeline preserves index order without retaining an entire
-// item's output. At most workers items are admitted, each with a bounded batch
-// buffer. A slow consumer or earlier item backpressures the producers. Results
-// contain only metadata needed after that item's stream has been consumed.
+// item's output. A bounded window of items is admitted, each with a bounded
+// batch buffer, and at most workers process callbacks run at once. Workers can
+// move on as soon as an item finishes, without waiting for its output to be
+// consumed in index order. A slow consumer still backpressures the producers.
+// Results contain only metadata needed after that item's stream is consumed.
 func runIndexedStreamingPipeline[T, R any](
 	ctx context.Context,
 	count, workers int,
@@ -45,50 +46,72 @@ func runIndexedStreamingPipeline[T, R any](
 		group.Wait()
 	}()
 	type slot struct {
+		index   int
 		batches chan []T
 		result  R
 	}
-	start := func(index int) *slot {
-		out := &slot{batches: make(chan []T, providerStreamBufferBatches)}
+	window := min(count, workers*providerStreamLookahead)
+	jobs := make(chan *slot, window)
+	defer close(jobs)
+	for range workers {
 		group.Go(func() {
-			defer close(out.batches)
-			// The batch allocates lazily on first append: many files emit
-			// nothing, and the final flush would otherwise leave a dead
-			// replacement buffer behind on every file. No per-record
-			// cancellation check: that was the last per-record acquisition of
-			// the shared context mutex in this hot path, and flush's select
-			// already observes cancellation once per batch, which is as often
-			// as anything downstream can act on it.
-			var batch []T
-			flush := func() {
-				if len(batch) == 0 {
+			for {
+				if workerCtx.Err() != nil {
 					return
 				}
+				var out *slot
 				select {
-				case out.batches <- batch:
 				case <-workerCtx.Done():
+					return
+				case job, ok := <-jobs:
+					if !ok {
+						return
+					}
+					out = job
 				}
-				batch = nil
+				// The batch allocates lazily on first append: many files emit
+				// nothing, and the final flush would otherwise leave a dead
+				// replacement buffer behind on every file. No per-record
+				// cancellation check: that was the last per-record acquisition of
+				// the shared context mutex in this hot path, and flush's select
+				// already observes cancellation once per batch, which is as often
+				// as anything downstream can act on it.
+				var batch []T
+				flush := func() {
+					if len(batch) == 0 {
+						return
+					}
+					select {
+					case out.batches <- batch:
+					case <-workerCtx.Done():
+					}
+					batch = nil
+				}
+				out.result = process(workerCtx, out.index, func(value T) {
+					if batch == nil {
+						batch = make([]T, 0, providerStreamBatchRecords)
+					}
+					batch = append(batch, value)
+					if len(batch) == providerStreamBatchRecords {
+						flush()
+					}
+				})
+				flush()
+				close(out.batches)
 			}
-			out.result = process(workerCtx, index, func(value T) {
-				if batch == nil {
-					batch = make([]T, 0, providerStreamBatchRecords)
-				}
-				batch = append(batch, value)
-				if len(batch) == providerStreamBatchRecords {
-					flush()
-				}
-			})
-			flush()
 		})
+	}
+	start := func(index int) *slot {
+		out := &slot{index: index, batches: make(chan []T, providerStreamBufferBatches)}
+		jobs <- out
 		return out
 	}
-	slots := make([]*slot, workers)
-	for i := range workers {
+	slots := make([]*slot, window)
+	for i := range window {
 		slots[i] = start(i)
 	}
 	for index := range count {
-		out := slots[index%workers]
+		out := slots[index%window]
 		for {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -113,10 +136,10 @@ func runIndexedStreamingPipeline[T, R any](
 			}
 		}
 	next:
-		if next := index + workers; next < count {
-			slots[index%workers] = start(next)
+		if next := index + window; next < count {
+			slots[index%window] = start(next)
 		} else {
-			slots[index%workers] = nil
+			slots[index%window] = nil
 		}
 	}
 	return ctx.Err()
