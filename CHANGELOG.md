@@ -22,6 +22,8 @@ auto-generated notes on
   (`ancestor_commit`, `ancestor_tree`, `commits_behind`, `changed_files`,
   `excluded_records`). Without the flag the output is unchanged. `graph store` stays
   exact and now refuses a store whose recorded tree differs from its key's.
+  `capabilities --json` advertises it as
+  `optional_local_only_features.context_allow_ancestor: true`.
 
 ## [0.5.0] - 2026-10-23
 

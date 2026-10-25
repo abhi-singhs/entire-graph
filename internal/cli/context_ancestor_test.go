@@ -268,3 +268,22 @@ func TestContextAllowAncestorFlagIsBounded(t *testing.T) {
 		t.Fatalf("default --allow-ancestor = %d, %v; the fallback must be opt-in", flags.AllowAncestor, err)
 	}
 }
+
+// Consumers feature-detect the fallback from `capabilities --json` before
+// passing --allow-ancestor: a flat boolean in optional_local_only_features,
+// whose absence (any older provider) means unsupported.
+func TestCapabilitiesAdvertiseContextAllowAncestor(t *testing.T) {
+	var out bytes.Buffer
+	if err := runCapabilities(Options{Stdout: &out}, []string{"--json"}); err != nil {
+		t.Fatal(err)
+	}
+	var report struct {
+		Optional map[string]json.RawMessage `json:"optional_local_only_features"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatalf("%v: %s", err, out.String())
+	}
+	if got := string(report.Optional["context_allow_ancestor"]); got != "true" {
+		t.Fatalf("optional_local_only_features.context_allow_ancestor = %q, want the flat boolean true: %s", got, out.String())
+	}
+}

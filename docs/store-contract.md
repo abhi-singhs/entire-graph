@@ -52,6 +52,10 @@ therefore watch three inputs: the HEAD tree, the provider version from
 
 ## Ancestor fallback for `graph context`
 
+Feature-detect it first: `entire graph capabilities --json` reports
+`"context_allow_ancestor": true` in `optional_local_only_features`. The key is a
+flat boolean; a provider without it does not support the flag.
+
 `graph context --allow-ancestor N` (N from 1 to 5, default 0 = off) serves an
 exact miss from an ancestor commit's store instead of returning
 `store_unavailable`. Without the flag, and whenever the exact store exists, the
