@@ -603,6 +603,9 @@ type profileSpec struct {
 	relations       map[string]bool
 	includeEvidence bool
 	callResolution  string // "full" | "shallow" | "none"
+	// shareRelationFacts changes execution only, never emitted records. Keep
+	// the reference path available for differential tests of the full profile.
+	shareRelationFacts bool
 }
 
 func (s profileSpec) emits(relationType string) bool { return s.relations[relationType] }
@@ -695,7 +698,7 @@ func resolveProfile(p Profile) profileSpec {
 	case ProfileFast:
 		return profileSpec{name: ProfileFast, relations: relationTypeSet("DEFINES", "CONTAINS", "IMPORTS", "CALLS", "CONSTRUCTS", "HANDLES_ROUTE", "HANDLES_TOOL", "CONFIGURES", "RESOURCE_DEPENDS_ON"), includeEvidence: false, callResolution: "shallow"}
 	default:
-		return profileSpec{name: ProfileFull, relations: relationTypeSet(relationTypes...), includeEvidence: true, callResolution: "full"}
+		return profileSpec{name: ProfileFull, relations: relationTypeSet(relationTypes...), includeEvidence: true, callResolution: "full", shareRelationFacts: true}
 	}
 }
 
@@ -5979,7 +5982,7 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 			// symbol none of them look at both still cost nothing.
 			var body symbolBody
 			if callableSymbol && (needsAsyncCalls || needsDataFlow || needsFields || spec.callResolution == "full") {
-				body = newSymbolBody(block)
+				body = newRelationSymbolBody(block, file.Language, spec)
 			}
 			if needsAsyncCalls && callableSymbol {
 				for _, name := range asyncCallNames(body) {
@@ -6044,18 +6047,30 @@ func forEachRelation(ctx context.Context, repoKey string, files []FileRecord, re
 				// paid for. Revisit if a corpus shows it is not rare.
 				edgeOrder := []string{}
 				flowsByEdge := map[string]*RelationRecord{}
+				// Every lookup here has the same caller,
+				// imports and resolution mode. Multiple evidence items for one
+				// callee can therefore share its resolved targets (including misses).
+				var flowTargets map[string][]resolvedCallTarget
+				if body.facts != nil {
+					flowTargets = map[string][]resolvedCallTarget{}
+				}
 				for _, flow := range returnFlowCalls(body, symbolFlowParameterNames(from), flowSyntaxFor(file.Language)) {
 					if flow.Name == from.Name {
 						continue
 					}
-					inputs := pythonCallImportBinding(flow.Name, from, file.Language, pythonBareScopes, symbolsByShortName, importsByName, file.Path, manifestImports, knownFiles, readContent)
-					var targets []resolvedCallTarget
-					if file.Language != "Python" || inputs.genericAllowed {
-						targets = resolveCallTargetsWithRawImport(flow.Name, from, sharedTypeCandidates(from, symbolsByShortName[flow.Name]), inputs.rawCandidates, inputs.rawImportModuleSets, currentFileSymbols, inputs.imports, true)
-					}
-					if file.Language == "Python" && pythonBareScopes != nil && pythonBareScopes.complete {
-						aliasTargets, _, _ := resolvePythonAliasImportTargets(flow.Name, from, pythonBareScopes.importContexts(from, flow.Name), symbolsByShortName, file.Path, manifestImports, knownFiles, readContent)
-						targets = unionResolvedCallTargets(targets, aliasTargets)
+					targets, cached := flowTargets[flow.Name]
+					if !cached {
+						inputs := pythonCallImportBinding(flow.Name, from, file.Language, pythonBareScopes, symbolsByShortName, importsByName, file.Path, manifestImports, knownFiles, readContent)
+						if file.Language != "Python" || inputs.genericAllowed {
+							targets = resolveCallTargetsWithRawImport(flow.Name, from, sharedTypeCandidates(from, symbolsByShortName[flow.Name]), inputs.rawCandidates, inputs.rawImportModuleSets, currentFileSymbols, inputs.imports, true)
+						}
+						if file.Language == "Python" && pythonBareScopes != nil && pythonBareScopes.complete {
+							aliasTargets, _, _ := resolvePythonAliasImportTargets(flow.Name, from, pythonBareScopes.importContexts(from, flow.Name), symbolsByShortName, file.Path, manifestImports, knownFiles, readContent)
+							targets = unionResolvedCallTargets(targets, aliasTargets)
+						}
+						if flowTargets != nil {
+							flowTargets[flow.Name] = targets
+						}
 					}
 					for _, to := range targets {
 						if flow.Direction == "caller_to_callee" && to.Resolution == "name_only" {
