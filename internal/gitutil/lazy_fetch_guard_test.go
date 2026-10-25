@@ -789,3 +789,20 @@ func TestHistoryReadsIgnoreRepositoryLogOutputEncoding(t *testing.T) {
 		t.Fatalf("FindCommitWithCheckpoint with a UTF-16 log output encoding = %q, %v; want %q", got, err, want)
 	}
 }
+
+func TestFindProcessCFunctionCallMatchesWholeCallsOnly(t *testing.T) {
+	t.Parallel()
+	for source, want := range map[string]string{
+		`system("git fetch");`:            "system",
+		"r = popen\t(cmd, \"r\");":        "popen",
+		"pid_t p = fork();":               "fork",
+		"subsystem(x); my_fork(); a.b":    "",
+		"systematic(1); forked (2);":      "",
+		`"system" is a keyword`:           "",
+		"ShellExecuteW(h, 0, f, 0, 0, 1)": "ShellExecuteW",
+	} {
+		if got := findProcessCFunctionCall([]byte(source)); got != want {
+			t.Errorf("findProcessCFunctionCall(%q) = %q, want %q", source, got, want)
+		}
+	}
+}
