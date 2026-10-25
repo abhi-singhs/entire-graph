@@ -2627,7 +2627,7 @@ func preselectSearchFiles(
 			// content pass reads. Including them makes this set a genuine superset of every file
 			// containing a term; a NUL-containing file among them is still inspected and skipped
 			// by the scorer, exactly as on the cold path.
-			matches, grepErr = gitutil.GrepTreePathsIncludingBinary(ctx, source.absRepo, source.commit, grepPatterns)
+			matches, grepErr = gitutil.GrepTreePathsIncludingBinaryInFiles(ctx, source.absRepo, source.commit, grepPatterns, source.paths)
 			matchesEveryTermFile = true
 		}
 		if grepErr == nil {
@@ -5034,11 +5034,17 @@ func committedUsageFileSelector(
 	if !useHead || deep {
 		return nil
 	}
+	// These are the same eligible files used to filter the postings below. Give
+	// Git the inventory up front so ignored blobs are never searched.
+	paths := make([]string, 0, len(languages))
+	for path := range languages {
+		paths = append(paths, path)
+	}
 	return func(ctx context.Context, identifiers []string) ([]string, bool) {
 		if !searchTermsSafeForGitGrep(identifiers) {
 			return nil, false
 		}
-		matches, err := gitutil.GrepTreePaths(ctx, repo, treeish, identifiers)
+		matches, err := gitutil.GrepTreePathsInFiles(ctx, repo, treeish, identifiers, paths)
 		if err != nil {
 			return nil, false
 		}
