@@ -516,3 +516,68 @@ func TestNoProviderCommandStartsALazyFetchWhicheverGitIsOnPath(t *testing.T) {
 		})
 	}
 }
+
+// The provider runs Git at the --repo path as given. Here that path is
+// evil/link -> real clone, and evil/.tool-versions pins an "old" Git through
+// an asdf-style shim that walks up from $PWD. The shim's old Git is simulated
+// faithfully: it reports 2.44.0 and runs the real Git with GIT_NO_LAZY_FETCH
+// removed, i.e. a Git that ignores the variable. If the version probe ran at
+// the symlink's target it would see the unpinned Git, admit the clone, and the
+// commands at evil/link would start a lazy fetch (caught by the GIT_EXEC_PATH
+// spy). Probing where the commands run sees 2.44.0 and refuses.
+func TestPartialCloneThroughASymlinkIsProbedWhereItsCommandsRun(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the shim and spy are POSIX shell scripts")
+	}
+	fc := newPartialClone(t, false)
+	evil := t.TempDir()
+	link := filepath.Join(evil, "link")
+	if err := os.Symlink(fc.clone, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(evil, ".tool-versions"), []byte("git 2.44.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shimDir := t.TempDir()
+	shim := `#!/bin/sh
+d="$PWD"; old=
+while :; do
+  if grep -q '^git 2.44.0' "$d/.tool-versions" 2>/dev/null; then old=1; break; fi
+  [ "$d" = / ] && break; d=$(dirname "$d")
+done
+if [ -n "$old" ]; then
+  [ "$1" = version ] && { echo 'git version 2.44.0'; exit 0; }
+  exec env -u GIT_NO_LAZY_FETCH ` + strconv.Quote(realGit) + ` "$@"
+fi
+exec ` + strconv.Quote(realGit) + ` "$@"
+`
+	if err := os.WriteFile(filepath.Join(shimDir, "git"), []byte(shim), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	spyDir := t.TempDir()
+	spyLog := filepath.Join(t.TempDir(), "child-git.log")
+	if err := os.WriteFile(filepath.Join(spyDir, "git"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> "+strconv.Quote(spyLog)+"\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GIT_EXEC_PATH", spyDir)
+
+	cacheDir := t.TempDir()
+	_, indexErr := runPartialCloneCommand(t, link, cacheDir, "index", "--repo", link, "--head", "--format", "json", "--cache-dir", cacheDir)
+	_, _ = runPartialCloneCommand(t, link, cacheDir, "query", "--repo", link, "--head", "--format", "json", "--cache-dir", cacheDir, "--query", "Alpha")
+	data, err := os.ReadFile(spyLog)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if log := strings.TrimSpace(string(data)); log != "" {
+		t.Fatalf("the pinned old Git started a lazy fetch through %s; the probe vouched for a different Git:\n%s", link, log)
+	}
+	if indexErr == nil || !strings.Contains(indexErr.Error(), "cannot be proven disabled for the Git on PATH (2.44.0)") {
+		t.Fatalf("index --head through the symlink = %v, want the refusal naming the pinned Git 2.44.0", indexErr)
+	}
+	fc.assertMissing(t, "after commands through the symlink")
+}

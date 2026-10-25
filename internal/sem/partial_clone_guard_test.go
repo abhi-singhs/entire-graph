@@ -181,3 +181,40 @@ func TestPartialCloneRefusalAndDiagnosisShareOneProbe(t *testing.T) {
 		t.Fatalf("diagnosis of a refusal caused by a failed probe = %q; it re-probed instead of explaining the refusal", got)
 	}
 }
+
+// Repository discovery may move metadata checks to the physical path of a
+// symlinked --repo, but the provider's Git commands still run at the path as
+// given, so the version probe must too (a shim keyed on PWD sees that path).
+func TestGitMetadataGuardProbesTheGivenPathOfASymlinkedRepository(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation needs privileges on Windows")
+	}
+	var probedDirs []string
+	previous := gitLazyFetchGuard
+	gitLazyFetchGuard = func(dir string) gitutil.LazyFetchGuardStatus {
+		probedDirs = append(probedDirs, dir)
+		return gitWithLazyFetchGuard
+	}
+	t.Cleanup(func() { gitLazyFetchGuard = previous })
+
+	real, gitDir := gitConfigPreflightFixture(t)
+	if err := os.WriteFile(filepath.Join(gitDir, "config"), []byte(partialCloneConfigs["remote named by its own URL"]), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	evil := t.TempDir()
+	link := filepath.Join(evil, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	if !gitMetadataSafeForSubprocess(link) {
+		t.Fatal("symlinked partial clone was refused although the stand-in Git honours GIT_NO_LAZY_FETCH")
+	}
+	if len(probedDirs) == 0 {
+		t.Fatal("the guard never probed Git for the partial clone")
+	}
+	for _, dir := range probedDirs {
+		if dir != link {
+			t.Fatalf("the guard probed Git in %q, want exactly the given path %q, where the commands run", dir, link)
+		}
+	}
+}

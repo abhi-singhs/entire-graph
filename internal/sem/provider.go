@@ -15701,6 +15701,12 @@ type sameVolumePathResolver struct {
 	anchor       pathTraversalAnchor
 	root         *os.Root
 	mounts       pathMountGuard
+	// commandDir is the directory string the provider's Git commands run in:
+	// the absolute, unresolved --repo path. It equals baseAbs except when
+	// repository discovery swaps in a resolver rooted at the physical path; the
+	// lazy-fetch version probe must still run at the logical path (and PWD) the
+	// commands use, because a version-manager shim selects Git by that path.
+	commandDir string
 }
 
 func newSameVolumePathResolver(base string) (*sameVolumePathResolver, error) {
@@ -15721,7 +15727,7 @@ func newSameVolumePathResolver(base string) (*sameVolumePathResolver, error) {
 		_ = root.Close()
 		return nil, err
 	}
-	return &sameVolumePathResolver{baseAbs: baseAbs, baseResolved: resolvedBase, anchor: anchor, root: root, mounts: mounts}, nil
+	return &sameVolumePathResolver{baseAbs: baseAbs, baseResolved: resolvedBase, anchor: anchor, root: root, mounts: mounts, commandDir: baseAbs}, nil
 }
 
 func (r *sameVolumePathResolver) Close() error {
@@ -17355,6 +17361,7 @@ func gitMetadataSafeForSubprocess(repo string) bool {
 		return false
 	}
 	defer resolver.Close()
+	commandDir := resolver.commandDir
 	resolvedDiscoveryRoot := false
 	resolveDiscoveryRoot := func() (*sameVolumePathResolver, string, error) {
 		repoHandle, resolvedRepo, resolveErr := resolver.open(repoAbs)
@@ -17369,6 +17376,8 @@ func gitMetadataSafeForSubprocess(repo string) bool {
 		if physicalErr != nil {
 			return nil, "", physicalErr
 		}
+		// Metadata checks move to the physical path; Git commands do not.
+		physicalResolver.commandDir = commandDir
 		return physicalResolver, resolvedRepo, nil
 	}
 	for dir := repoAbs; ; {
@@ -18116,7 +18125,7 @@ func gitMetadataDirectoryPathsSafeWithResolver(resolver *sameVolumePathResolver,
 	// so it keeps the refusal. The probe runs in the repository directory, where
 	// the provider's own Git commands run, and is asked last so only a
 	// repository that passed every filesystem check pays for it.
-	return !partialClone || gitLazyFetchGuard(resolver.baseAbs).Effective
+	return !partialClone || gitLazyFetchGuard(resolver.commandDir).Effective
 }
 
 // gitLazyFetchGuard reports whether the Git that runs in dir honours

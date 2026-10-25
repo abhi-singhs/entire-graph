@@ -59,11 +59,13 @@ type LazyFetchGuardStatus struct {
 }
 
 // lazyFetchGuardKey keys the probe cache. Production Git commands run with the
-// repository as their working directory, and a version-manager shim (asdf,
-// mise) can pick a different Git per directory, so the probe runs in the same
-// directory and the result is keyed by it. A different PATH resolution, or a
-// binary replaced in place (an upgrade or a downgrade), is a different Git and
-// is probed again.
+// repository path as their working directory (and PWD), and a version-manager
+// shim (asdf, mise) can pick a different Git by that path, so the probe runs in
+// exactly the same directory string and the result is keyed by it. The key is
+// deliberately not symlink-resolved: two spellings of one directory can sit
+// under different .tool-versions files, so an answer for real/repo must not be
+// reused for link/repo. A different PATH resolution, or a binary replaced in
+// place (an upgrade or a downgrade), is a different Git and is probed again.
 type lazyFetchGuardKey struct {
 	dir     string
 	path    string
@@ -78,8 +80,9 @@ const lazyFetchGuardProbeTimeout = 10 * time.Second
 // LazyFetchGuard reports whether the Git that production subprocesses will run
 // in dir honours GIT_NO_LAZY_FETCH.
 //
-// It runs `git version` in dir with the same sanitized environment as every
-// other provider subprocess. `git version` is a builtin that performs no
+// dir must be the directory string the provider's Git commands use. It runs
+// `git version` there with the same sanitized environment as every other
+// provider subprocess. `git version` is a builtin that performs no
 // repository discovery and reads no repository configuration, so it can be
 // asked while a repository's metadata is still being checked; running it in
 // dir only makes a directory-sensitive shim answer for the Git it will really
@@ -98,7 +101,7 @@ func LazyFetchGuard(dir string) LazyFetchGuardStatus {
 	if err != nil {
 		return LazyFetchGuardStatus{}
 	}
-	key := lazyFetchGuardKey{dir: lazyFetchGuardDir(dir), path: path, size: info.Size(), modTime: info.ModTime().UnixNano()}
+	key := lazyFetchGuardKey{dir: lazyFetchGuardCommandDir(dir), path: path, size: info.Size(), modTime: info.ModTime().UnixNano()}
 	if cached, ok := lazyFetchGuardCache.Load(key); ok {
 		return cached.(LazyFetchGuardStatus)
 	}
@@ -114,14 +117,13 @@ func LazyFetchGuard(dir string) LazyFetchGuardStatus {
 	return actual.(LazyFetchGuardStatus)
 }
 
-// lazyFetchGuardDir canonicalizes the probe directory so a repository reached
-// through a symlink and through its physical path shares one cached answer.
-func lazyFetchGuardDir(dir string) string {
+// lazyFetchGuardCommandDir spells the probe directory the way os/exec spells a
+// command's PWD: filepath.Abs, which is lexical. It must never resolve
+// symlinks, or the probe would run at the physical path while the commands run
+// at the logical one, and a shim keyed on PWD would answer for a different Git.
+func lazyFetchGuardCommandDir(dir string) string {
 	if abs, err := filepath.Abs(dir); err == nil {
-		dir = abs
-	}
-	if physical, err := filepath.EvalSymlinks(dir); err == nil {
-		dir = physical
+		return abs
 	}
 	return filepath.Clean(dir)
 }

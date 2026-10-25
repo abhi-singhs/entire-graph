@@ -139,6 +139,49 @@ func TestLazyFetchGuardProbesInTheRepositoryDirectory(t *testing.T) {
 	}
 }
 
+// A shim like asdf walks up from $PWD, the logical path. The provider runs Git
+// at the --repo path as given, so the probe must run at that same string: a
+// repository reached as evil/link -> real/repo, with evil/.tool-versions
+// pinning an old Git, runs the old Git, and probing at the physical real/repo
+// would vouch for the wrong one.
+func TestLazyFetchGuardProbesTheLogicalPathNotTheSymlinkTarget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake Git is a POSIX shell script")
+	}
+	base := t.TempDir()
+	real := filepath.Join(base, "real", "repo")
+	evil := filepath.Join(base, "evil")
+	for _, dir := range []string{real, evil} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(evil, ".tool-versions"), []byte("git 2.44.0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(evil, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", writeFakeGit(t, `d="$PWD"; v=2.54.0
+while :; do
+  if grep -q '^git 2.44.0' "$d/.tool-versions" 2>/dev/null; then v=2.44.0; break; fi
+  [ "$d" = / ] && break; d=$(dirname "$d")
+done
+echo "git version $v"
+`))
+	if got := LazyFetchGuard(link); got.Version != "2.44.0" || got.Effective {
+		t.Fatalf("probe for %s (a symlink under a directory pinning Git 2.44.0) = %+v; it asked about the symlink target", link, got)
+	}
+	if got := LazyFetchGuard(real); got.Version != "2.54.0" {
+		t.Fatalf("probe for the physical path %s = %+v, want Git 2.54.0", real, got)
+	}
+	// The logical answer must not leak into the physical path's cache entry or back.
+	if got := LazyFetchGuard(link); got.Version != "2.44.0" {
+		t.Fatalf("second probe for %s = %+v, want the cached 2.44.0 answer for that spelling", link, got)
+	}
+}
+
 // A failed probe is cached like a successful one, so the safety decision and
 // the diagnosis that explains it cannot see different answers.
 func TestLazyFetchGuardCachesAFailedProbe(t *testing.T) {
