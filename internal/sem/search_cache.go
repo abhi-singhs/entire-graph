@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -274,17 +275,25 @@ func loadOrBuildSearchSnapshotPersisting(
 	if options.Profile == "" {
 		options.Profile = ProfileFull
 	}
+	// uncached is every route that builds what options asks for without the
+	// cache. None of them is a complete build published under the lock, so a
+	// selection that assumed one (coldCompletePolicy.required) is refused here.
+	uncached := func() (ProviderSnapshot, bool, error) {
+		if options.coldComplete.required {
+			return ProviderSnapshot{}, false, errColdCompleteUnavailable
+		}
+		snapshot, buildErr := BuildProviderSnapshotWithOptions(ctx, repo, providerVersion, options)
+		return snapshot, false, buildErr
+	}
 	if disableCache || cacheDir == "" {
-		snapshot, err := BuildProviderSnapshotWithOptions(ctx, repo, providerVersion, options)
-		return snapshot, false, err
+		return uncached()
 	}
 	absRepo, err := filepath.Abs(repo)
 	if err != nil {
 		return ProviderSnapshot{}, false, err
 	}
 	if !worktreeSnapshotCacheable(ctx, absRepo, options) {
-		snapshot, buildErr := BuildProviderSnapshotWithOptions(ctx, repo, providerVersion, options)
-		return snapshot, false, buildErr
+		return uncached()
 	}
 	capturedOptions, captureErr := ensureProviderCachePolicy(absRepo, options)
 	if captureErr != nil {
@@ -292,14 +301,12 @@ func loadOrBuildSearchSnapshotPersisting(
 		// can safely consume. Preserve cache/no-cache behavior parity by taking
 		// the existing uncached build path; ordinary input errors still surface
 		// from that build.
-		snapshot, buildErr := BuildProviderSnapshotWithOptions(ctx, repo, providerVersion, options)
-		return snapshot, false, buildErr
+		return uncached()
 	}
 	options = capturedOptions
 	commit, tree, headErr := resolveCommittedHEAD(ctx, absRepo)
 	if headErr != nil {
-		snapshot, buildErr := BuildProviderSnapshotWithOptions(ctx, repo, providerVersion, options)
-		return snapshot, false, buildErr
+		return uncached()
 	}
 	repositoryKey := repoKey(ctx, absRepo)
 	// A selective snapshot is DERIVED from the complete one for the same tree, so
@@ -378,11 +385,9 @@ func loadOrBuildSearchSnapshotPersisting(
 				// discard the result and take the ordinary build path below.
 				return ProviderSnapshot{}, false
 			}
-			// Persisting the exact selective view makes repeated identical queries
-			// a direct cache hit. As with ordinary search caching, this is best effort.
-			if generationKnown {
-				_ = writeSearchSnapshot(entry, newCachedSearchSnapshotFrom(providerVersion, commit, tree, derivedFrom, options, selective, ctx))
-			}
+			// The view is not persisted. Writing it cost a warm query 0.5-0.7s,
+			// more than deriving it again (0.2-0.3s), and only a query with this
+			// exact selection could ever read it back.
 			if options.onCompleteDerivation != nil {
 				options.onCompleteDerivation(full.Header)
 			}
@@ -474,6 +479,13 @@ func loadOrBuildSearchSnapshotPersisting(
 			}
 		}
 	}
+	// A selection that assumed the cold-complete build is served only from a
+	// complete snapshot: from the cache above, or built and published under the
+	// lock (above for a selective view, below for a complete one). Building the
+	// selection itself would parse every file the uncapped grep matched.
+	if options.coldComplete.required && (len(options.OnlyFiles) > 0 || !persistBuilt || !generationKnown) {
+		return ProviderSnapshot{}, false, errColdCompleteUnavailable
+	}
 	// A complete query that missed builds exactly the artifact a concurrent cold
 	// query on the same tree is building, so it takes the same lock and re-checks
 	// the entry once it holds it.
@@ -493,9 +505,15 @@ func loadOrBuildSearchSnapshotPersisting(
 	}
 	snapshot, err := BuildProviderSnapshotWithOptions(ctx, repo, providerVersion, options)
 	if err != nil {
+		if options.coldComplete.required && ctx.Err() == nil {
+			return ProviderSnapshot{}, false, errColdCompleteUnavailable
+		}
 		return ProviderSnapshot{}, false, err
 	}
 	if err := validateBuiltSearchSnapshot(snapshot, repositoryKey, providerVersion, tree, options); err != nil {
+		if options.coldComplete.required {
+			return ProviderSnapshot{}, false, errColdCompleteUnavailable
+		}
 		return ProviderSnapshot{}, false, fmt.Errorf(
 			"search snapshot provenance changed while building from commit %q tree %q: %w",
 			commit, tree, err,
@@ -531,7 +549,7 @@ var coldCompleteSnapshotMaxFiles = 3000
 // selective build then reports it.
 func completeSnapshotAffordableOnColdQuery(ctx context.Context, absRepo string, options ProviderSnapshotOptions) bool {
 	if known := options.coldComplete.sourceFiles; known > 0 {
-		return known <= coldCompleteSnapshotMaxFiles
+		return coldCompleteSnapshotFits(known)
 	}
 	source, err := prepareSource(ctx, absRepo, options)
 	if err != nil {
@@ -540,7 +558,21 @@ func completeSnapshotAffordableOnColdQuery(ctx context.Context, absRepo string, 
 	if source.close != nil {
 		defer source.close()
 	}
-	return len(source.paths) <= coldCompleteSnapshotMaxFiles
+	return coldCompleteSnapshotFits(len(source.paths))
+}
+
+// errColdCompleteUnavailable is how the snapshot loader refuses a selection that
+// assumed the cold-complete build (coldCompletePolicy.required) when no complete
+// snapshot can serve it: the cache generation is unreadable, the cache policy
+// cannot be captured, HEAD does not resolve, or the complete build failed or did
+// not validate. The search then selects again with the bounded content scan, so
+// the fallback builds exactly what it built before the warm route existed.
+var errColdCompleteUnavailable = errors.New("no complete snapshot for a cold-complete selection")
+
+// coldCompleteSnapshotFits is the corpus-size bound on the cold-complete build. Cold
+// preselection asks it too, so it takes the warm route only where that build can follow.
+func coldCompleteSnapshotFits(sourceFiles int) bool {
+	return sourceFiles <= coldCompleteSnapshotMaxFiles
 }
 
 // loadOrDeriveSelectiveSearchSnapshot serves a selective query from an
@@ -1357,18 +1389,8 @@ func loadCachedSearchSnapshot(
 			// history edges disappeared. Fall back through the ordinary build.
 			return cachedSearchSnapshot{}, false
 		}
-		refreshed := make([]RelationRecord, 0, len(cached.Snapshot.Relations))
-		for _, relation := range cached.Snapshot.Relations {
-			if relation.Type != "FILE_CHANGES_WITH" {
-				refreshed = append(refreshed, relation)
-			}
-		}
 		history := fileChangesWithRelations(ctx, absRepo, commit, repositoryKey, cached.Snapshot.Files, &capturedFileCochanges{pairs: cochanges})
-		refreshed = append(refreshed, history...)
-		sort.Slice(refreshed, func(i, j int) bool {
-			left, right := refreshed[i], refreshed[j]
-			return left.Type+left.FromID+left.ToID < right.Type+right.FromID+right.ToID
-		})
+		refreshed := spliceFileChangesWithRelations(cached.Snapshot.Relations, history)
 		cached.Snapshot.Relations = refreshed
 		cached.Snapshot.Header.Stats.Relations = len(refreshed)
 		counts := make(map[string]int, len(cached.Snapshot.Header.Completeness.Relations))
@@ -1383,6 +1405,86 @@ func loadCachedSearchSnapshot(
 		cached.Snapshot.Header.Completeness.Relations = counts
 	}
 	return cached, true
+}
+
+// spliceFileChangesWithRelations returns relations, which are in snapshot order
+// (sorted by the concatenation Type+FromID+ToID), with every FILE_CHANGES_WITH
+// record replaced by history, in exactly the order re-sorting them all gives.
+//
+// Re-sorting every relation on every full-profile hit cost more than the
+// history lookup it served. It is also unnecessary: the history records share
+// one type, and no other type is a prefix of FILE_CHANGES_WITH or has it as a
+// prefix, so every other record orders against them on its type alone and they
+// form one contiguous block. Replacing that block with the history, sorted by
+// the same key, is the full sort's answer; an unchanged block needs no work.
+//
+// The key is the concatenation itself, never a (Type, FromID, ToID) tuple: the
+// two disagree when one ID is a prefix of another (…:Foo and …:FooBar), and the
+// snapshot bytes follow the concatenation. Keys are unique (dedupeRelations
+// keeps one record per edge, and history has one record per file pair), so the
+// sorted order is unique too. Where the block argument does not hold, a type
+// related to FILE_CHANGES_WITH by prefix or a block that is not contiguous, this
+// falls back to the full re-sort.
+func spliceFileChangesWithRelations(relations, history []RelationRecord) []RelationRecord {
+	const historyType = "FILE_CHANGES_WITH"
+	resort := func() []RelationRecord {
+		refreshed := make([]RelationRecord, 0, len(relations))
+		for _, relation := range relations {
+			if relation.Type != historyType {
+				refreshed = append(refreshed, relation)
+			}
+		}
+		refreshed = append(refreshed, history...)
+		sort.Slice(refreshed, func(i, j int) bool {
+			left, right := refreshed[i], refreshed[j]
+			return left.Type+left.FromID+left.ToID < right.Type+right.FromID+right.ToID
+		})
+		return refreshed
+	}
+	keys := make([]string, len(history))
+	order := make([]int, len(history))
+	for index, relation := range history {
+		keys[index] = relation.Type + relation.FromID + relation.ToID
+		order[index] = index
+	}
+	sort.Slice(order, func(i, j int) bool { return keys[order[i]] < keys[order[j]] })
+	sorted := make([]RelationRecord, len(history))
+	for position, index := range order {
+		sorted[position] = history[index]
+	}
+	start, end, insert := -1, -1, len(relations)
+	for index := range relations {
+		kind := relations[index].Type
+		if kind == historyType {
+			if start < 0 {
+				start = index
+			} else if end != index {
+				return resort()
+			}
+			end = index + 1
+			continue
+		}
+		if strings.HasPrefix(historyType, kind) || strings.HasPrefix(kind, historyType) {
+			return resort()
+		}
+		if kind > historyType && insert == len(relations) {
+			insert = index
+		}
+	}
+	if start < 0 {
+		start, end = insert, insert
+	}
+	unchanged := relations != nil && end-start == len(sorted)
+	for offset := 0; unchanged && offset < len(sorted); offset++ {
+		unchanged = reflect.DeepEqual(relations[start+offset], sorted[offset])
+	}
+	if unchanged {
+		return relations
+	}
+	refreshed := make([]RelationRecord, 0, len(relations)-(end-start)+len(sorted))
+	refreshed = append(refreshed, relations[:start]...)
+	refreshed = append(refreshed, sorted...)
+	return append(refreshed, relations[end:]...)
 }
 
 // rebindCachedSearchSnapshot adopts an entry, which may have been written from

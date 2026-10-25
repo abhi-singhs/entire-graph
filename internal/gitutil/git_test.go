@@ -2391,8 +2391,8 @@ func TestNewCmdPinsSubprocessLocaleToC(t *testing.T) {
 		t.Fatalf("effective GIT_NO_LAZY_FETCH=%q, want 1: a partial clone's promisor remote must never be contacted by this no-egress provider", noLazyFetch)
 	}
 	if allowProtocol != "" {
-		t.Fatalf("effective GIT_ALLOW_PROTOCOL=%q, want empty: GIT_NO_LAZY_FETCH is unrecognized before Git 2.45,"+
-			" so every transport must independently be denied regardless of the inherited environment", allowProtocol)
+		t.Fatalf("effective GIT_ALLOW_PROTOCOL=%q, want empty: some Git releases (2.45.0 and those without the 2.39.4+ ... 2.45.1"+
+			" backports) do not honour GIT_NO_LAZY_FETCH on every lazy fetch, so every transport must independently be denied regardless of the inherited environment", allowProtocol)
 	}
 	if optionalLocks != "0" {
 		t.Fatalf("effective GIT_OPTIONAL_LOCKS=%q, want 0 for read-only provider subprocesses", optionalLocks)
@@ -3072,7 +3072,7 @@ func TestGrepIndexPatternLinesKeepsContextAndCase(t *testing.T) {
 	}
 }
 
-func TestGrepTreePatternLinesPinsCommittedContent(t *testing.T) {
+func TestGrepTreePatternFilesPinsCommittedContent(t *testing.T) {
 	repo := t.TempDir()
 	git(t, repo, "init")
 	git(t, repo, "config", "user.name", "Entire Graph Test")
@@ -3085,19 +3085,19 @@ func TestGrepTreePatternLinesPinsCommittedContent(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(repo, "source.go"), []byte("func Other() {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	var matches []GrepMatch
-	err := GrepTreePatternLines(t.Context(), repo, "HEAD", []string{"readInt"}, func(match GrepMatch) error { matches = append(matches, match); return nil })
+	var paths []string
+	err := GrepTreePatternFiles(t.Context(), repo, "HEAD", []string{"readInt"}, nil, func(path string) error { paths = append(paths, path); return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(matches) != 1 || matches[0].Path != "source.go" || matches[0].Text != "func readInt() {}" {
-		t.Fatalf("committed stream lost content or path: %#v", matches)
+	if len(paths) != 1 || paths[0] != "source.go" {
+		t.Fatalf("committed stream lost content or path: %#v", paths)
 	}
 }
 
-func TestGrepTreePatternLinesRejectsInvalidTreeish(t *testing.T) {
+func TestGrepTreePatternFilesRejectsInvalidTreeish(t *testing.T) {
 	for _, treeish := range []string{"", "--help", "HEAD\x00other"} {
-		if err := GrepTreePatternLines(t.Context(), t.TempDir(), treeish, []string{"needle"}, func(GrepMatch) error { return nil }); err == nil {
+		if err := GrepTreePatternFiles(t.Context(), t.TempDir(), treeish, []string{"needle"}, nil, func(string) error { return nil }); err == nil {
 			t.Errorf("accepted invalid treeish %q", treeish)
 		}
 	}
