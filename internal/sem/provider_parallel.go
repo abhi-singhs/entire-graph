@@ -296,9 +296,9 @@ func processProviderFile(
 	result.file = &file
 	result.parsed = true
 	result.symbols = entitySymbols(sc.key, path, parsedLanguage, entities)
-	// syntheticBoundarySymbols rescans file content once per already-parsed
-	// symbol (route/tool/workflow boundary detection), which is superlinear in
-	// files with very large symbol counts. stop is polled inside its loop, so
+	// syntheticBoundarySymbols visits every already-parsed symbol
+	// (route/tool/workflow boundary detection), which grows with a file's
+	// symbol count. stop is polled inside its loop, so
 	// a cancellation landing mid-scan is caught within one poll stride rather
 	// than only after the whole pass finishes. A stop here drops the file whole,
 	// like the post-parse check above.

@@ -168,10 +168,12 @@ func TestTF142R12SyntheticBoundarySymbolsUnbudgetedAreUnchanged(t *testing.T) {
 	t.Parallel()
 	symbol := SymbolRecord{
 		RecordType: "symbol", Kind: "function", Language: "Go",
-		FilePath: "pkg.go", Name: "Tool", QualifiedName: "Tool",
+		FilePath: "pkg.go", Name: "searchToolHandler", QualifiedName: "searchToolHandler",
 		StartLine: 1, EndLine: 3,
 	}
-	content := "func Tool(schema string) {\n  execute(schema)\n}\n"
+	// The name, not the body, makes this a tool handler (looksLikeToolHandler
+	// reads identifiers only).
+	content := "func searchToolHandler(schema string) {\n  execute(schema)\n}\n"
 	got, truncated := syntheticBoundarySymbols("gh/example/repo", "pkg.go", "Go", content, []SymbolRecord{symbol}, nil)
 	if truncated {
 		t.Fatal("a nil stop predicate reported truncation")
