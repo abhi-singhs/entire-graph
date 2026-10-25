@@ -158,7 +158,9 @@ func FindCommitWithCheckpoint(ctx context.Context, repo, checkpointID string) (s
 	// --all includes detached HEADs from every linked worktree because a
 	// checkpoint commit can be reachable only from one of them. --ignore-missing
 	// keeps an unrelated invalid worktree HEAD from breaking the whole lookup.
-	out, err := run(ctx, repo, "git", "log", "--ignore-missing", "--all", "--format=%H", "-n", "1", "--grep=Entire-Checkpoint: "+checkpointID)
+	// i18n.logOutputEncoding is pinned for the same reason as HeadCommitAndTree:
+	// a UTF-16 setting would re-encode the hex id.
+	out, err := run(ctx, repo, "git", "-c", "i18n.logOutputEncoding=UTF-8", "log", "--ignore-missing", "--all", "--format=%H", "-n", "1", "--grep=Entire-Checkpoint: "+checkpointID)
 	if err != nil {
 		return "", err
 	}
@@ -1246,8 +1248,10 @@ func FileCochanges(ctx context.Context, repo, revision string, maxCommits int) (
 	// blows up memory: one 10k-file commit alone produces ~50M pair keys (multi-GB).
 	// Real feature/fix commits touch a handful of related files and stay well under.
 	const maxFilesPerCommit = 50
+	// i18n.logOutputEncoding is pinned so a UTF-16 repository setting cannot
+	// re-encode the marker and silently drop every co-change pair.
 	out, err := run(
-		ctx, repo, "git", "log", "--no-relative", "--ignore-submodules=none",
+		ctx, repo, "git", "-c", "i18n.logOutputEncoding=UTF-8", "log", "--no-relative", "--ignore-submodules=none",
 		"-z", "--name-only", "--pretty=format:"+marker,
 		"-n", strconv.Itoa(maxCommits), revision, "--",
 	)

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -380,6 +381,27 @@ var launchFunctions = map[string]map[string]bool{
 	"golang.org/x/sys/windows": {"CreateProcess": true, "CreateProcessAsUser": true, "ShellExecute": true},
 }
 
+// processCFunctions are the libc and Win32 entry points that create or replace
+// a process; cgo code (Go calls through C., preambles and C sources) may not
+// use them.
+var processCFunctions = map[string]bool{
+	"system": true, "popen": true, "fork": true, "vfork": true, "execl": true, "execlp": true,
+	"execle": true, "execv": true, "execve": true, "execvp": true, "execvpe": true, "fexecve": true,
+	"posix_spawn": true, "posix_spawnp": true, "WinExec": true, "CreateProcessA": true,
+	"CreateProcessW": true, "ShellExecuteA": true, "ShellExecuteW": true,
+}
+
+var processCFunctionCall = regexp.MustCompile(`\b(system|popen|fork|vfork|execl|execlp|execle|execv|execve|execvp|execvpe|fexecve|posix_spawnp?|WinExec|CreateProcess\w*|ShellExecute\w*)\s*\(`)
+
+var cSourceExtensions = map[string]bool{".c": true, ".h": true, ".cc": true, ".cpp": true, ".m": true, ".mm": true}
+
+// launchSyscallNumbers are raw system-call numbers that create or replace a
+// process, so syscall.Syscall(SYS_EXECVE, ...) cannot bypass launchFunctions.
+var launchSyscallNumbers = map[string]bool{
+	"SYS_EXECVE": true, "SYS_EXECVEAT": true, "SYS_FORK": true, "SYS_VFORK": true,
+	"SYS_CLONE": true, "SYS_CLONE3": true, "SYS_POSIX_SPAWN": true, "SYS_POSIX_SPAWNP": true,
+}
+
 // TestEveryGitSubprocessIsBuiltByTheGuardedConstructors is the static half of
 // the no-egress argument for partial clones: GIT_NO_LAZY_FETCH and
 // GIT_ALLOW_PROTOCOL protect a command only if it was built by newCmd or
@@ -433,6 +455,12 @@ func run(...any) error { return nil }
 
 var program = "git"
 var _ = ex.Cmd{}
+
+var zero ex.Cmd
+
+type wrapped struct{ ex.Cmd }
+
+func pointerIsFine(c *ex.Cmd) *ex.Cmd { return c }
 `
 	if err := os.MkdirAll(filepath.Join(root, "internal", "gitutil"), 0o755); err != nil {
 		t.Fatal(err)
@@ -440,11 +468,29 @@ var _ = ex.Cmd{}
 	if err := os.WriteFile(filepath.Join(root, "internal", "gitutil", "evasion.go"), []byte(evasion), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// Packages the go tool still compiles even though they sit in bin/, plus a
+	// raw execve and a cgo file.
+	rawExec := "package helper\n\nimport (\n\t\"syscall\"\n\t\"unsafe\"\n)\n\nfunc spawn(p *byte) { syscall.Syscall(syscall.SYS_EXECVE, uintptr(unsafe.Pointer(p)), 0, 0) }\n"
+	cgo := "package helper\n\n// #include <stdlib.h>\n// static void run(void) { system(\"git fetch\"); }\nimport \"C\"\n\nfunc shell() { C.system(nil) }\n"
+	if err := os.MkdirAll(filepath.Join(root, "bin", "helper"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cSource := "#include <spawn.h>\nint go_spawn(pid_t *p, char **a) { return posix_spawn(p, a[0], 0, 0, a, 0); }\n"
+	for name, body := range map[string]string{"raw.go": rawExec, "cgo.go": cgo, "spawn.c": cSource} {
+		if err := os.WriteFile(filepath.Join(root, "bin", "helper", name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var found []string
 	scanProcessLaunches(t, root, func(format string, args ...any) {
 		found = append(found, strings.TrimSpace(strings.SplitN(fmt.Sprintf(format, args...), ": ", 2)[1]))
 	})
 	joined := strings.Join(found, "\n")
+	for _, entry := range found {
+		if strings.Contains(entry, "pointerIsFine") {
+			t.Errorf("scan flagged a *exec.Cmd parameter, which only a constructor can produce: %s", entry)
+		}
+	}
 	for _, want := range []string{
 		"package-level declaration references os/exec.CommandContext",
 		"fetch references os/exec.Command",
@@ -452,6 +498,11 @@ var _ = ex.Cmd{}
 		"indirect uses newCmd as a value",
 		"indirect calls run with a program other than the literal \"git\"",
 		"package-level declaration builds an exec.Cmd literal",
+		"package-level declaration uses exec.Cmd as a value type",
+		"spawn references the process-creating system call syscall.SYS_EXECVE",
+		"shell calls the process-creating C function system through cgo",
+		"bin/helper/cgo.go has a cgo preamble that calls the process-creating C function system",
+		"bin/helper/spawn.c is C source that calls the process-creating C function posix_spawn",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("scan missed %q; it reported:\n%s", want, joined)
@@ -480,12 +531,11 @@ func scanProcessLaunches(t *testing.T, root string, report func(string, ...any))
 		}
 		if entry.IsDir() {
 			name := entry.Name()
-			if path != root && (strings.HasPrefix(name, ".") || name == "testdata" || name == "node_modules" || name == "bin") {
+			// testdata and dot-directories are ignored by the go tool; bin/ and
+			// node_modules/ are not, so an imported package there still compiles.
+			if path != root && (strings.HasPrefix(name, ".") || name == "testdata") {
 				return filepath.SkipDir
 			}
-			return nil
-		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 		rel, err := filepath.Rel(root, path)
@@ -493,8 +543,22 @@ func scanProcessLaunches(t *testing.T, root string, report func(string, ...any))
 			return err
 		}
 		rel = filepath.ToSlash(rel)
+		if cSourceExtensions[filepath.Ext(path)] {
+			// cgo compiles these into the binary; none may start a process.
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			if match := processCFunctionCall.FindString(string(data)); match != "" {
+				report("%s: %s is C source that calls the process-creating C function %s", rel, rel, strings.TrimSpace(strings.TrimSuffix(match, "(")))
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
 		fset := token.NewFileSet()
-		file, err := parser.ParseFile(fset, path, nil, 0)
+		file, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
 		if err != nil {
 			return err
 		}
@@ -516,6 +580,28 @@ func scanProcessLaunches(t *testing.T, root string, report func(string, ...any))
 			}
 			imports[name] = importPath
 		}
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.IMPORT {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				importSpec := spec.(*ast.ImportSpec)
+				if importSpec.Path.Value != `"C"` {
+					continue
+				}
+				// The cgo preamble is C compiled into this package.
+				preamble := ""
+				for _, group := range []*ast.CommentGroup{gen.Doc, importSpec.Doc} {
+					if group != nil {
+						preamble += group.Text()
+					}
+				}
+				if match := processCFunctionCall.FindString(preamble); match != "" && !allowed("") {
+					report("%s: %s has a cgo preamble that calls the process-creating C function %s", fset.Position(importSpec.Pos()), rel, strings.TrimSpace(strings.TrimSuffix(match, "(")))
+				}
+			}
+		}
 		isGitutil := strings.HasPrefix(rel, "internal/gitutil/")
 		for _, decl := range file.Decls {
 			function := ""
@@ -530,6 +616,7 @@ func scanProcessLaunches(t *testing.T, root string, report func(string, ...any))
 			}
 			calledWrappers := map[*ast.Ident]bool{}
 			selectedNames := map[*ast.Ident]bool{} // x.Name: a field or method, never a wrapper
+			pointerToCmd := map[*ast.SelectorExpr]bool{}
 			isExecCmd := func(expr ast.Expr) bool {
 				selector, ok := expr.(*ast.SelectorExpr)
 				if !ok {
@@ -540,6 +627,10 @@ func scanProcessLaunches(t *testing.T, root string, report func(string, ...any))
 			}
 			ast.Inspect(body, func(node ast.Node) bool {
 				switch node := node.(type) {
+				case *ast.StarExpr:
+					if isExecCmd(node.X) {
+						pointerToCmd[node.X.(*ast.SelectorExpr)] = true // *exec.Cmd only comes from a constructor
+					}
 				case *ast.SelectorExpr:
 					selectedNames[node.Sel] = true
 					pkg, ok := node.X.(*ast.Ident)
@@ -552,6 +643,18 @@ func scanProcessLaunches(t *testing.T, root string, report func(string, ...any))
 						if !allowed(function) {
 							report("%s: %s references %s.%s outside the guarded Git constructors", fset.Position(node.Pos()), where, importPath, node.Sel.Name)
 						}
+					}
+					if (importPath == "syscall" || importPath == "golang.org/x/sys/unix") && launchSyscallNumbers[node.Sel.Name] && !allowed(function) {
+						report("%s: %s references the process-creating system call %s.%s", fset.Position(node.Pos()), where, importPath, node.Sel.Name)
+					}
+					if importPath == "C" && processCFunctions[node.Sel.Name] && !allowed(function) {
+						report("%s: %s calls the process-creating C function %s through cgo", fset.Position(node.Pos()), where, node.Sel.Name)
+					}
+					if isExecCmd(node) && !pointerToCmd[node] && !allowed(function) {
+						// A zero exec.Cmd value (a variable, an embedded field, a
+						// reflect.New of its type) can be filled in and started
+						// without any constructor; only *exec.Cmd is safe to name.
+						report("%s: %s uses exec.Cmd as a value type; only *exec.Cmd from newCmd is allowed", fset.Position(node.Pos()), where)
 					}
 				case *ast.CompositeLit:
 					if isExecCmd(node.Type) {
@@ -613,5 +716,38 @@ func TestHeadCommitAndTreeIgnoresRepositoryLogOutputEncoding(t *testing.T) {
 	}
 	if commit != gitOutput(t, repo, "rev-parse", "HEAD") || tree != gitOutput(t, repo, "rev-parse", "HEAD^{tree}") {
 		t.Fatalf("HeadCommitAndTree = %q/%q, want HEAD's commit and tree", commit, tree)
+	}
+}
+
+// Co-change and checkpoint lookup read `git log` output too; a UTF-16
+// i18n.logOutputEncoding must not re-encode it into silence.
+func TestHistoryReadsIgnoreRepositoryLogOutputEncoding(t *testing.T) {
+	t.Parallel()
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	commit := func(message string) {
+		t.Helper()
+		git(t, repo, "add", ".")
+		git(t, repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", message)
+	}
+	write(t, repo, "a.go", "package p\n")
+	write(t, repo, "b.go", "package p\n")
+	commit("one")
+	write(t, repo, "a.go", "package p\n\nvar A = 1\n")
+	write(t, repo, "b.go", "package p\n\nvar B = 1\n")
+	commit("two\n\nEntire-Checkpoint: abc123def456")
+	want := gitOutput(t, repo, "rev-parse", "HEAD")
+	git(t, repo, "config", "i18n.logOutputEncoding", "UTF-16")
+
+	pairs, err := FileCochanges(t.Context(), repo, "HEAD", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pairs) != 1 || pairs[0].Left != "a.go" || pairs[0].Right != "b.go" {
+		t.Fatalf("FileCochanges with a UTF-16 log output encoding = %#v, want the a.go/b.go pair", pairs)
+	}
+	got, err := FindCommitWithCheckpoint(t.Context(), repo, "abc123def456")
+	if err != nil || got != want {
+		t.Fatalf("FindCommitWithCheckpoint with a UTF-16 log output encoding = %q, %v; want %q", got, err, want)
 	}
 }
