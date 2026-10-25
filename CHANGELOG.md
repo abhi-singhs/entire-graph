@@ -12,6 +12,17 @@ auto-generated notes on
 
 ## [Unreleased]
 
+### Added
+
+- `graph context --allow-ancestor N` (opt-in, N at most 5) answers an exact store
+  miss after a new commit from the newest of the N nearest first-parent ancestors
+  that has a store under the same provider version and ignore policy, when the
+  complete list of changed paths is at most 5% of its indexed files. Records in
+  changed files are withheld and the response carries a typed `stale` block
+  (`ancestor_commit`, `ancestor_tree`, `commits_behind`, `changed_files`,
+  `excluded_records`). Without the flag the output is unchanged. `graph store` stays
+  exact and now refuses a store whose recorded tree differs from its key's.
+
 ## [0.5.0] - 2026-10-23
 
 ### Removed
