@@ -908,6 +908,11 @@ func GrepFixedStringPaths(ctx context.Context, repo, treeish, pattern string) ([
 }
 
 func grepTreePaths(ctx context.Context, repo, treeish string, patterns []string, textOnly, caseSensitive bool) ([]string, error) {
+	return grepTreePathsWithFiles(ctx, repo, treeish, patterns, textOnly, caseSensitive, nil)
+}
+
+// files is nil for the whole tree; scoped callers must never pass an empty batch.
+func grepTreePathsWithFiles(ctx context.Context, repo, treeish string, patterns []string, textOnly, caseSensitive bool, files []string) ([]string, error) {
 	if strings.HasPrefix(treeish, "-") || strings.ContainsRune(treeish, '\x00') {
 		return nil, fmt.Errorf("invalid git grep treeish %q", treeish)
 	}
@@ -948,6 +953,9 @@ func grepTreePaths(ctx context.Context, repo, treeish string, patterns []string,
 		args = append(args, treeish)
 	}
 	args = append(args, "--")
+	for _, path := range files {
+		args = append(args, ":(literal)"+path)
+	}
 	cmd := newGitCmdWithCallerLocale(ctx, repo, args...)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
