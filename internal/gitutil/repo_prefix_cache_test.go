@@ -101,6 +101,26 @@ exec "$REAL_GIT" "$@"
 	if got := strings.Count(string(log), "spawn"); got != 2 {
 		t.Fatalf("rev-parse --show-prefix spawned %d times across 5 per-blob reads, want 2 (once per directory)", got)
 	}
+
+	// A relative repo argument names whatever directory the cwd makes it, so
+	// the cache must key on the directory, not the spelling: "." from sub must
+	// resolve sub's own prefix, not a "." entry minted at the root. leaf.txt
+	// resolving at all proves it — with the root's empty prefix the lookup
+	// would miss and report the blob absent.
+	t.Chdir(repo)
+	found, err = ScanBlobLinesAtRev(ctx, ".", "HEAD", "root.txt", func(line string) bool {
+		return line == "beta"
+	})
+	if err != nil || !found {
+		t.Fatalf("ScanBlobLinesAtRev(\".\" at root) = %v, %v, want found", found, err)
+	}
+	t.Chdir(sub)
+	found, err = ScanBlobLinesAtRev(ctx, ".", "HEAD", "leaf.txt", func(line string) bool {
+		return line == "delta"
+	})
+	if err != nil || !found {
+		t.Fatalf("ScanBlobLinesAtRev(\".\" at sub) = %v, %v, want sub's own prefix", found, err)
+	}
 }
 
 // BenchmarkScanBlobLinesAtRevSameRepo measures the per-blob cost of the
