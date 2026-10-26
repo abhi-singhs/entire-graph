@@ -102,22 +102,28 @@ func RepoCommandRoot(ctx context.Context, cwd string) (string, error) {
 // `rev-parse --show-prefix` per blob for an answer that is constant per
 // directory — doubling the subprocess count of exactly the loops those
 // fallbacks serve. Failures are not cached, so a cancelled or broken first
-// call stays retryable.
-// ponytail: process-lifetime cache keyed by the directory argument — a
-// directory whose enclosing repository layout changes mid-process would be
-// served the old prefix; add explicit invalidation if a long-lived consumer
-// ever needs that.
+// call stays retryable. Entries are keyed by the absolute, cleaned directory,
+// never the argument's spelling: a relative repo (".") names different
+// directories as the process cwd changes, and a spelling-keyed entry would
+// silently serve one directory's prefix for another.
+// ponytail: process-lifetime cache — a directory whose enclosing repository
+// layout changes mid-process would be served the old prefix; add explicit
+// invalidation if a long-lived consumer ever needs that.
 var repoPrefixCache sync.Map
 
 func repoTreePath(ctx context.Context, repo, path string) (string, error) {
-	if prefix, ok := repoPrefixCache.Load(repo); ok {
+	key, err := filepath.Abs(repo)
+	if err != nil {
+		return "", err
+	}
+	if prefix, ok := repoPrefixCache.Load(key); ok {
 		return prefix.(string) + path, nil
 	}
 	prefix, err := RepoPrefix(ctx, repo)
 	if err != nil {
 		return "", err
 	}
-	repoPrefixCache.Store(repo, prefix)
+	repoPrefixCache.Store(key, prefix)
 	return prefix + path, nil
 }
 
