@@ -6791,7 +6791,13 @@ func entityFromNode(ctx context.Context, node *sitter.Node, src []byte, language
 	if language == "Julia" {
 		if sig := juliaSignature(node, src); sig != "" {
 			entity.Signature = sig
-			entity.Fingerprint = hash(normalize(entityFingerprintSource(Entity{Name: name, Signature: sig}, block)))
+			// Header-only Jaccard similarity can exceed the rename threshold
+			// for unrelated functions with long, identical parameter types.
+			entity.similaritySource = block
+			// The single-line fingerprint fallback reads Signature. Give it the
+			// full definition so unrelated bodies with the same parameters do
+			// not become perfect rename matches after the header-only cut.
+			entity.Fingerprint = hash(normalize(entityFingerprintSource(Entity{Name: name, Signature: block}, block)))
 		}
 	}
 	// Dart declaration heads (function/method/getter/setter signatures) keep the
