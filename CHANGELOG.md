@@ -10,19 +10,104 @@ here. Releases before 0.5.0 have no hand-written entry: their contents are the
 auto-generated notes on
 [the releases page](https://github.com/entireio/entire-graph/releases).
 
-## [0.5.0] - unreleased
+## [Unreleased]
 
 ### Added
+
+- `graph context --allow-ancestor N` (opt-in, N at most 5) answers an exact store
+  miss after a new commit from the newest of the N nearest first-parent ancestors
+  that has a store under the same provider version and ignore policy, when the
+  complete list of changed paths is at most 5% of its indexed files. Records in
+  changed files are withheld and the response carries a typed `stale` block
+  (`ancestor_commit`, `ancestor_tree`, `commits_behind`, `changed_files`,
+  `excluded_records`). Without the flag the output is unchanged. `graph store` stays
+  exact and now refuses a store whose recorded tree differs from its key's.
+  `capabilities --json` advertises it as
+  `optional_local_only_features.context_allow_ancestor: true`.
+
+### Changed
+
+- `neighbors` (with `--direction in` or `both`) and `impact` on a Go function or
+  method now disclose that references to it as a value are not modelled: being
+  assigned to a variable, passed as an argument, or stored in a struct field or
+  map creates no edge, so code that reaches the function only that way is missing
+  from its callers. JSON carries a `W_VALUE_REFERENCES_UNMODELLED` warning, and
+  agent and text output print one line beside the callers with a `grep` the
+  reader can run to find those references. A degenerate `impact` ("no callers")
+  keeps its marker line and prints the disclosure after it.
+
+### Fixed
+
+- Partial clones (`--filter=blob:none`, or any repository with a promisor
+  remote) are no longer refused outright when the Git that runs in them is
+  2.45.1 or newer (or, on an older release line, 2.39.4+, 2.40.2+, 2.41.1+,
+  2.42.2+, 2.43.4+ or 2.44.1+).
+  `index --head` used to fail on them and every query rebuilt an uncached
+  working-tree snapshot; now `index --head`, `query --head`, `impact`,
+  `neighbors`, `def`, `context`, `store`, `health` and `snapshot` read the
+  committed tree and reuse its cache. Every Git subprocess sets
+  `GIT_NO_LAZY_FETCH=1`, which those releases honour for every lazy fetch, so
+  the promisor remote is never contacted. What still needs a blob the clone
+  lacks fails or degrades instead of fetching it: a missing HEAD file is
+  reported as an unreadable file (`E_FILE_READ`); `diff` and `commit` fail
+  when rename detection needs a missing blob (for example
+  `commit HEAD` on a commit that renames and edits a file); and co-change
+  (`FILE_CHANGES_WITH`) relations are omitted when history needs one. On any
+  other Git, including 2.45.0, the refusal stays, and its message now says
+  lazy fetching cannot be proven disabled for that Git instead of promising a
+  fallback that `index --head` does not have.
+- Committed-tree commands no longer fail with "malformed HEAD commit/tree
+  metadata" in a repository that sets `i18n.logOutputEncoding` to UTF-16.
+- Synthetic `kind=tool` symbols are no longer fabricated from a function's body
+  text. A function whose comments or string literals said "tool" next to
+  "schema", "handler" or "execute" got a second definition of its own name, so
+  `def`, `neighbors` and `impact` on that name came back ambiguous (84 such
+  symbols across four of our own repositories, one of them a real tool
+  handler). Tool boundaries are now decided from the symbol's name and
+  signature: a function, method or type whose name pairs "tool" with handle,
+  handler, execute, executor, invoke or dispatch, or whose signature takes an
+  MCP `CallToolRequest`. Cached snapshots from earlier builds are retired.
+- A co-change history read that fails (for example on a partial clone whose
+  history needs a missing blob for rename detection) no longer drops every
+  `FILE_CHANGES_WITH` relation silently. The snapshot carries a
+  `W_COCHANGE_HISTORY_UNAVAILABLE` warning with Git's reason, and `impact`
+  reports co-change coupling as unknown instead of "No co-change coupling found".
+  The records cache version moves to v23, so an entry an earlier build wrote for
+  such a failure, keyed identically but carrying no warning, is rebuilt instead of
+  replayed. The search cache version moves to v28 for the same reason: `graph
+  store` and `graph context` serve the persisted entry and its sqlite store without
+  building, so an earlier build's warning-less entry is retired rather than served.
+
+## [0.5.0] - 2026-10-23
+
+### Removed
+
+- The `init-agents` command, renamed to `setup` to match `entire brain setup`.
+  The behavior is unchanged: `setup` installs the agent guide and managed
+  `AGENTS.md`/`CLAUDE.md` blocks, `--strict` / `--normal` save the guidance
+  mode and a bare re-run inherits the saved one, and `--no-claude-hook` skips
+  the Claude Code hook. It also now warns up front, before any write, when the
+  target repository is nested inside another one and no explicit `--repo` was
+  given; a git-tracked home directory does not count as an outer repository.
+  Running `init-agents` fails with a pointer to `setup`. `agent-guide` remains
+  the read-only preview.
+
+### Added
+
+- `graph store` resolves the current committed-tree search store without building
+  it, exposing a versioned read-only SQL projection for Brain code inspection.
+  Brain can reuse Graph's database instead of maintaining a second copy.
 
 - Added an experimental SCIP snapshot export, and versioned persisted diff and analyze output with schema-major enforcement, cache-validity binding, and a wire-shape regression freeze.
 - Added a `graph health` command with per-source-file health accounting, and made `graph query` the canonical search command with support for trailing free-text queries.
 - Added a persistent strict agent guidance mode, with Graph and Brain agent instructions coordinated to stay consistent.
 - Added nightly LoCoMo benchmark CI for the entire-graph arm, authenticated via OIDC with no stored credentials.
-- `init-agents` now registers a Claude Code `SubagentStart` hook (`entire graph hook claude-subagent-start`) in the per-user `.claude/settings.local.json`, merged into existing settings and added once, so Explore and Plan subagents, which do not load `CLAUDE.md`, are told to use the graph. `--no-claude-hook` skips it.
+- `setup` (then `init-agents`) now registers a Claude Code `SubagentStart` hook (`entire graph hook claude-subagent-start`) in the per-user `.claude/settings.local.json`, merged into existing settings and added once, so Explore and Plan subagents, which do not load `CLAUDE.md`, are told to use the graph. `--no-claude-hook` skips it.
 - Added a `NOTICES` file to every release archive, covering the third-party parser sources and Go modules statically linked into the binary.
 
 ### Changed
 
+- `setup` now renders one settled row per phase (agent instructions, Claude hook) in the Entire CLI style — an outcome glyph, the phase, and what happened — colored at a terminal and plain under a pipe, matching `entire brain setup`.
 - `graph diff`, `commit`, and `checkpoint` now reject a subdirectory passed to `--repo` instead of returning root-wide changes that disagree with subdirectory-scoped snapshots.
 - `graph query --format agent` with no `--max-context-bytes` now uses the smallest of 4 KiB, 8 KiB or 16 KiB that still shows both the first printed block and the best-ranked result exactly as an unbounded render does, and 24 KiB only when none does. An explicit budget is honoured exactly. Every candidate render keeps the exact-name answer, VERIFY block, declaration rows and session-replay rules of an explicit budget; an exact-identifier query is still rendered at the 24 KiB ceiling.
 - Under a binding budget, agent-format search now keeps every ranked location with its rank, name and score, and shares the remaining bytes towards the head of the ranking, passing any share a result cannot use on to the others. The top hit no longer degrades to a bare `path:line *` to fit one more body line.

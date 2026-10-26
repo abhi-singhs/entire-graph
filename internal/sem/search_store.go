@@ -32,7 +32,11 @@ import (
 // searchStoreVersion follows the same rules as the other cache versions: bump
 // it whenever the stored shape or the producer's rules change. The store is a
 // derived sibling of the search snapshot entry and shares its key.
-const searchStoreVersion = "search-store-sqlite-v1"
+// v2 adds the relations_from/relations_to indexes with their first reader
+// (the store context query's fan-out); v1 entries lack them and are rebuilt.
+// v3 adds the versioned read-only projection used by Brain inspection.
+// v4 fixes the file content identity projection to use the indexed Git blob.
+const searchStoreVersion = "search-store-sqlite-v4"
 
 // searchStoreEnv gates the READ path while the store rolls out: the artifact
 // is written beside complete JSON entries, but it is only served when the
@@ -90,14 +94,35 @@ CREATE TABLE relations (
 	evidence_dropped INTEGER NOT NULL,
 	extra TEXT
 );
+CREATE INDEX relations_from ON relations(from_id);
+CREATE INDEX relations_to ON relations(to_id);
 CREATE TABLE unmerged_data_flow_edges (from_id TEXT NOT NULL, to_id TEXT NOT NULL);
+-- Versioned read-only projection for consumers. These views contain no copy
+-- of the graph; indexes on the underlying endpoint/id columns still apply.
+CREATE VIEW brain_symbols_v1 AS SELECT id, kind, name, qualified_name, file_path,
+ coalesce(json_extract(record,'$.start_line'),0) start_line,
+ coalesce(json_extract(record,'$.end_line'),0) end_line,
+ coalesce(json_extract(record,'$.signature'),'') signature,
+ coalesce(json_extract(record,'$.language'),'') language,
+ coalesce(json_extract(record,'$.stable_id_version'),'') stable_id_version FROM symbols;
+CREATE VIEW brain_relations_v1 AS SELECT rowid id, from_id, to_id, type, confidence, reason,
+ coalesce(json_extract(extra,'$.warning_codes'),'[]') warning_codes FROM relations;
+CREATE VIEW brain_files_v1 AS SELECT path,
+ coalesce(json_extract(record,'$.blob'),'') blob,
+ CASE WHEN coalesce(json_extract(record,'$.blob'),'') = '' THEN ''
+ ELSE 'git-blob:' || json_extract(record,'$.blob') END content_hash,
+ coalesce(json_extract(record,'$.language'),'') language FROM files;
+CREATE VIEW brain_reverse_relations_v1 AS SELECT to_id, from_id, type FROM relations;
+CREATE VIEW brain_symbol_fts_v1 AS SELECT id,
+ name || ' ' || qualified_name || ' ' || coalesce(json_extract(record,'$.signature'),'') || ' ' || file_path || ' ' || kind || ' ' || coalesce(json_extract(record,'$.language'),'') text FROM symbols;
+
 `
 
-// No secondary indexes yet, deliberately: the full load below reads rows in
-// rowid order and nothing selects by name, path, or endpoint. Each index is
-// one line plus a version bump away, and lands with the first reader that
-// needs it — building six B-trees on every snapshot persist for a speculative
-// consumer was the cost without the benefit.
+// Secondary indexes land WITH their first reader, never speculatively: the
+// relation endpoint indexes serve the store context query's fan-out
+// (searchStoreRelationsForIDs). The symbol name/path columns stay unindexed —
+// their reader scans with Go-side scoring, and a B-tree cannot serve the
+// substring match it does.
 
 // searchStoreRelationExtra carries the two composite RelationRecord fields.
 // WarningCodes is deliberately NOT omitempty: production relations always
@@ -611,8 +636,17 @@ func searchStoreEntryFor(entry cacheEntry) cacheEntry {
 // ANY failure it removes both the temporary and any previous sidecar: the
 // invariant readers rely on is that a sidecar present on disk was written by
 // the same call that wrote the current entry (the digest check backstops the
-// crash window between the two renames).
+// crash window between the two renames). A successful publish then trims the
+// sidecars of the same repository and scope to the newest few
+// (search_store_retention.go); the gz entries are never trimmed.
 func writeSearchStoreSidecar(ctx context.Context, entry cacheEntry, entryDigest string, cache *cachedSearchSnapshot) error {
+	if !searchStoreEnabled() {
+		// The write is gated by the same flag as the read: with no reader, an
+		// unconditional sidecar taxed every complete persist with the build
+		// plus ~144MB per cache variant. Enabling the flag costs one rebuild
+		// (`graph index`, or the next cold build) instead.
+		return nil
+	}
 	directory, err := openCacheEntryDirectory(entry)
 	if err != nil {
 		return err
@@ -640,16 +674,64 @@ func writeSearchStoreSidecar(ctx context.Context, entry cacheEntry, entryDigest 
 	if err := temporary.Close(); err != nil {
 		return err
 	}
-	temporaryPath := filepath.Join(entry.root, filepath.Dir(entry.relative), temporaryName)
+	directoryPath := filepath.Join(entry.root, filepath.Dir(entry.relative))
+	temporaryPath := filepath.Join(directoryPath, temporaryName)
 	if err := buildSearchStore(ctx, temporaryPath, entryDigest, cache); err != nil {
 		return err
 	}
+	if beforeSearchStorePublish != nil {
+		beforeSearchStorePublish()
+	}
+	// Publish and trim under one hold of the retention lock, so no eviction
+	// pass in another process can list, then remove, a name this rename has
+	// just replaced. Without the lock the store is still published; only the
+	// eviction is skipped (see search_store_retention.go).
+	retention, retain := newSearchStoreRetention(ctx, store, cache)
+	var lock *completeBuildLock
+	if retain {
+		lock = acquireSearchStoreRetentionLock(ctx, directory)
+	}
+	defer lock.release()
 	if err := directory.Rename(temporaryName, filepath.Base(store.relative)); err != nil {
 		return err
 	}
 	removeTemporary = false
 	succeeded = true
+	if afterSearchStorePublish != nil {
+		afterSearchStorePublish()
+	}
+	if lock != nil {
+		// Best effort, like the sidecar itself: the publish has succeeded, and a
+		// store that could not be trimmed now is trimmed by a later publish.
+		_, _ = evictSearchStoreSidecars(ctx, directory, directoryPath, retention)
+	}
 	return nil
+}
+
+// repairSearchStoreSidecarForEntry builds the sidecar for an ALREADY-persisted
+// entry when it is missing or does not match the entry. The explicit prebuild
+// needs this: a gz entry persisted by a run without the store flag (a plain
+// query, or an index before the operator opted in) would otherwise make
+// `entire graph index` with the flag a cache-hit no-op that never creates the
+// store its own degradation message tells the operator to build. The sidecar
+// is built from the raw persisted bytes, not from the request-bound snapshot
+// in memory, so it mirrors the entry exactly as the fidelity contract demands.
+func repairSearchStoreSidecarForEntry(ctx context.Context, entry cacheEntry) error {
+	if !searchStoreEnabled() {
+		return nil
+	}
+	if _, ok := loadSearchStoreForEntry(ctx, entry); ok {
+		return nil
+	}
+	digest, err := entry.digest()
+	if err != nil {
+		return err
+	}
+	raw, err := readSearchSnapshot(entry)
+	if err != nil {
+		return err
+	}
+	return writeSearchStoreSidecar(ctx, entry, digest.String(), &raw)
 }
 
 // loadSearchStoreForEntry serves the entry's snapshot from the sqlite sidecar
